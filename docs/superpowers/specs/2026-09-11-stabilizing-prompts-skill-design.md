@@ -10,8 +10,8 @@ Agent 在一次业务流程中可能多次调用 LLM。即使单次调用正确�
 
 - 弱模型是固定压力测试模型，不是调参对象；
 - 一次只调优一个 `.md` Prompt；
-- `bootstrap` 和 `tune` 必须在专用 Git worktree 中运行；
-- 评测复用工程现有 Prompt 渲染和结构化输出 Schema；
+- `tune`（包括首次初始化阶段）必须在同一个专用 Git worktree 和调优周期中连续运行；
+- 评测复用工程现有 Prompt 渲染、消息组装和 Pydantic 结构化输出 Schema；
 - 正确性优先于一致性，稳定错误不算通过；
 - 测试预期在模型运行前由用户确认；
 - 开发集、验证集和验收集职责分离，验收集每个周期只执行一次终验；
@@ -26,7 +26,7 @@ Agent 在一次业务流程中可能多次调用 LLM。即使单次调用正确�
 目标 Prompt 必须同时满足：
 
 1. 位于 Python Git 工程内，且是单个 `.md` 文件；
-2. 存在可定位或可由用户明确指定的结构化输出 Schema；
+2. 存在可定位或可由用户明确指定的生产 Pydantic `BaseModel` 结构化输出 Schema；
 3. 输出具有确定的业务真值；
 4. 结果能够通过代码断言判定正确或错误；
 5. 工程中存在足够的调用链、业务代码、文档、测试或领域数据供 Codex 建立业务契约；
@@ -49,10 +49,10 @@ Agent 在一次业务流程中可能多次调用 LLM。即使单次调用正确�
 
 ## 3. Skill 安装与组成
 
-Skill 作为个人级 Codex Skill 安装在：
+Skill 作为个人级 Codex Skill 安装在 `$CODEX_HOME/skills`；未设置 `CODEX_HOME` 时使用 `~/.codex/skills`：
 
 ```text
-C:\Users\kgcda\.agents\skills\stabilizing-prompts\
+~/.codex/skills/stabilizing-prompts/
 ├── SKILL.md
 ├── agents\
 │   └── openai.yaml
@@ -72,35 +72,37 @@ C:\Users\kgcda\.agents\skills\stabilizing-prompts\
     └── worktree-lifecycle.md
 ```
 
-`SKILL.md` 只保留触发条件、核心约束、三种运行模式和对 supporting resources 的按需路由。确定性执行、数据校验和指标计算进入 `scripts/`；详细格式和方法进入 `references/`。
+`SKILL.md` 只保留触发条件、核心约束、两种用户运行模式、`tune` 的内部初始化阶段和对 supporting resources 的按需路由。确定性执行、数据校验和指标计算进入 `scripts/`；详细格式和方法进入 `references/`。
 
 建议的 Skill 描述为：
 
 ```yaml
-description: Use when a Python repository-backed Markdown prompt with structured output is inconsistent across repeated model calls or needs a deterministic local-model regression suite.
+description: Use when a Python repository-backed Markdown prompt with Pydantic structured output is inconsistent across repeated model calls or needs a deterministic local-model regression suite.
 ```
 
-Skill 保持默认的隐式发现能力，也允许用户通过 `$stabilizing-prompts` 显式调用。
+Skill 保持默认的隐式发现能力，也允许用户通过 `$stabilizing-prompts` 显式调用。发布验证必须证明 Codex 能从上述个人 Skill 目录隐式发现并显式调用它。
 
 ## 4. 固定测试模型
 
-`scripts/local_model_client.py` 内固定以下连接信息：
+`scripts/local_model_client.py` 使用 `langchain_openai.ChatOpenAI`，并固定以下连接与调用信息：
 
-- Chat Completions URL：`http://192.168.168.230:8000/v1/chat/completions`
-- 模型：`dbirks/Qwen3.8-27B-W4A16-AutoRound`
-- Authorization Token：使用用户提供的局域网固定值，直接写入该个人 Skill 的客户端代码。
+- `base_url`：`http://192.168.168.230:8000/v1`，由 `ChatOpenAI` 调用其 `/chat/completions` 路径；
+- 模型：`dbirks/Qwen3.8-27B-W4A16-AutoRound`；
+- Authorization Token：使用用户提供的局域网固定值，直接写入该个人 Skill 的客户端代码；
+- `temperature=0.0`；
+- `extra_body={"enable_thinking": False, "enable_reasoning": False, "enable_search": False}`；
 - 单次请求超时：30 秒；
-- 传输层失败最多重试 2 次，即每个调用槽位最多 3 次传输尝试。
+- `max_retries=2`，即每个调用槽位最多 3 次传输尝试。
 
 客户端不得：
 
 - 自动切换地址、模型或提供商；
 - 自动尝试其他 Token；
 - 从项目 `eval-config.yaml` 覆盖模型、地址、Token、超时或重试次数；
-- 搜索或调整 `temperature`、`top_p` 等模型参数；
+- 搜索或调整 `temperature`、`top_p`、seed 等模型参数；`temperature` 只能使用固定值 `0.0`，其他采样参数不得发送；
 - 在命令、异常、日志、报告或目标工程文件中输出 Authorization 头或 Token。
 
-默认请求不添加示例调用中不存在的采样参数。若未来需要固定附加参数，必须作为显式设计变更完成，而不是由调优循环自行决定。同一基线与候选对比必须使用完全相同的请求配置。
+固定客户端不得从项目配置或候选循环继承采样参数。参数的固定值或明确省略都属于请求契约；manifest 记录移除 Authorization Token 后的固定客户端配置，并明确记录未发送的采样字段。同一基线与候选对比必须使用完全相同的客户端和结构化调用配置。
 
 开始评测前执行一次连接、模型身份和最小结构检查。服务返回的模型身份与固定模型不一致时明确报告并停止，不得寻找替代模型。
 
@@ -146,10 +148,10 @@ src/agent-a/prompts/classify.md
 
 ### 5.1 Worktree 与交付边界
 
-`bootstrap` 和 `tune` 为每个调优周期创建专用 worktree 和内部调优分支。周期开始前：
+`tune` 为每个调优周期创建一个专用 worktree 和内部调优分支。首次运行缺少有效评测资产时，`tune` 在该 worktree 中先完成内部初始化阶段，再于同一连续流程、同一 worktree 和同一周期中直接进入基线与候选调优；初始化阶段不是可单独退出后再恢复的用户运行模式。周期开始前：
 
 - 允许原工作区存在无关的未提交修改；
-- 目标 Prompt、生产 Schema、渲染器、关键消息组装文件和自定义判定器必须与当前 `HEAD` 一致；
+- 目标 Prompt、生产 Pydantic Schema、渲染器和关键消息组装文件必须与当前 `HEAD` 一致；
 - Skill 不自动 stash、不复制相关脏文件，也不替用户创建临时提交；
 - 已确认的契约、三套数据集、适配器和配置先在 worktree 中提交，再建立基线。
 
@@ -172,11 +174,11 @@ target_prompt: <repository-relative-path-to-prompt.md>
 Skill 在执行前验证：
 
 - 当前目录属于 Git 仓库；
-- 工程是可由已确认 Python 命令运行的 Python 工程；
+- 工程是可由已确认 Python 命令运行、并可导入 `langchain_openai.ChatOpenAI` 和生产 Pydantic Schema 的 Python 工程；
 - Prompt 位于仓库内且扩展名为 `.md`；
 - 本轮只有一个目标 Prompt；
 - 可以定位其加载和渲染逻辑；
-- 可以定位真实结构化输出 Schema；
+- 可以定位真实的 Pydantic `BaseModel` 结构化输出 Schema；
 - 可以识别调用方式和下游消费路径；
 - 可以识别影响评测的关键依赖文件及其 Git 状态。
 
@@ -186,7 +188,7 @@ Skill 在执行前验证：
 
 Skill 不从 Prompt 文案单独推导正确答案。它按以下优先级收集证据：
 
-1. 结构化输出 Schema、枚举和字段约束；
+1. 生产 Pydantic 结构化输出 Schema、枚举和字段约束；
 2. Prompt 调用处及下游业务分支；
 3. 工程业务文档和设计规格；
 4. 现有测试、样例、故障用例和领域数据；
@@ -214,7 +216,7 @@ Skill 生成 `prompt-contract.yaml`，至少包含：
 
 - 业务契约摘要；
 - 数据集覆盖矩阵；
-- 每个案例的输入、期望字段和依据；
+- 每个案例的输入、完整预期对象和依据；
 - 开发集、验证集与验收集的划分；
 - 自动探测到的候选 Python 命令及最终选择；
 - 默认重复次数、通过阈值和停止条件。
@@ -251,11 +253,13 @@ input:
   variables: {}
   context: {}
 expect:
-  fields: {}
+  output: {}
 priority: normal
 dimensions: []
 rationale: why-this-result-is-correct
 ```
+
+`expect.output` 必须给出生产 Pydantic Schema 的完整预期对象，不支持只声明部分字段。案例在任何模型调用前通过同一个生产 Schema 的 `model_validate` 预验证；验证失败属于评测资产 `setup_error`，必须修正并重新确认案例。
 
 ### 8.2 开发集、验证集与验收集
 
@@ -279,33 +283,29 @@ V1 只支持 Python 工程。Skill 自动探测 `.venv`、uv、Poetry 或工程�
 
 - 工程现有的 Prompt 文件加载；
 - 工程现有的模板渲染；
-- 工程现有的结构化输出 Schema；
-- 工程现有的 structured output、function calling 或 `response_format` 调用语义；
+- 工程现有的 Pydantic Schema 和 `with_structured_output(..., method="function_calling")` 调用语义；
 - 对评测结果有影响且可安全复用的消息组装逻辑。
 
-适配器只替换模型客户端，使请求发送到固定局域网接口。它不得复制一套简化 Prompt、重新声明 Schema、修改生产配置或绕过关键消息上下文。
+适配器只把生产消息组装和生产 Pydantic Schema 暴露给通用 runner。runner 使用固定 `ChatOpenAI`，通过 `with_structured_output(ProductionSchema, method="function_calling", include_raw=True)` 向局域网接口发起评测。适配器不得复制一套简化 Prompt、重新声明 Schema、修改生产配置或绕过关键消息上下文。
 
 适配器提供以下最小接口：
 
 ```python
 def prepare_call(prompt_path, case) -> dict:
-    """复用生产加载、渲染和消息组装，返回本次调用所需信息。"""
-
-def parse_response(raw_response, prepared_call):
-    """复用生产 Schema，将原始响应解析为结构化值。"""
+    """复用生产加载、渲染和消息组装，返回消息与生产 Pydantic Schema。"""
 ```
 
-`prepare_call` 返回消息、生产 Schema 或 `response_format`，以及生产调用需要的非采样参数；模型、地址、Token、超时和重试仍由固定客户端控制。`parse_response` 必须调用生产 Schema，不得复制 Schema。需要复杂业务判断时，适配器可以额外提供 `check_result(parsed, case) -> list[dict]`。
+`prepare_call` 返回 `messages` 和 `schema`；`schema` 必须是生产 Pydantic `BaseModel` 类型。模型、地址、Token、`temperature=0.0`、关闭 thinking/reasoning/search、超时、重试和 `include_raw=True` 均由固定客户端与通用 runner 控制。`include_raw=True` 只保留 LangChain 的原始消息与解析错误，不改变发给模型的 function calling 请求。V1 不支持 `parse_response`、`check_result`、部分字段断言、数值容差、无序集合特殊比较或多个合法预期。
 
-通用 runner 负责调用槽位、固定客户端调用、原始响应保存、错误分类和默认字段比较。适配器 smoke test 必须证明原 Prompt 能通过该边界完成一次真实渲染、调用和解析。
+通用 runner 负责调用槽位、固定 `ChatOpenAI` 调用、原始 `AIMessage` 保存、错误分类和完整 Pydantic 对象比较。适配器 smoke test 必须证明原 Prompt 能通过该边界完成一次真实渲染、function calling 和生产 Schema 实例化。
 
 如果工程调用链无法注入候选 Prompt 或固定客户端，Skill 可以在评测目录生成最薄的兼容层，但必须继续直接导入生产渲染器和 Schema。无法等价复现时应停止并说明差异，不能给出通过结论。
 
 ## 10. 确定性断言与评分
 
-Skill 不使用 LLM Judge。所有结果先通过生产 Schema 解析，再用默认字段比较或项目自定义确定性判定器评分。
+Skill 不使用 LLM Judge。案例的完整 `expect.output` 先由生产 Pydantic Schema 构造为预期对象；模型结果由 `ChatOpenAI.with_structured_output` 构造后，从 `include_raw=True` 返回值的 `parsed` 字段取得同一 Pydantic 类型的实际对象。两者直接进行完整对象相等比较。
 
-默认 scorer 只递归精确比较案例 `expect.fields` 中声明的字段，并输出具体字段路径、期望值和脱敏后的实际值。类型、必填、可空和结构约束由生产 Schema 负责，不另建断言 DSL。需要无序集合、数值容差、跨字段关系或多个合法答案时，由适配器的可选 `check_result` 处理。自定义判定器必须是确定性、无网络、无 LLM、无副作用的纯函数，并返回结构化失败原因。
+字段集合、类型、默认值、别名、必填、可空和结构约束全部由生产 Schema 决定，不另建断言 DSL。V1 不允许省略字段规避评分，也不提供自定义判定器。对象不相等时，scorer 读取两个 Pydantic 对象的字段生成具体字段路径、期望值和实际值差异；字段展开只用于报告，不改变对象相等这一评分依据。
 
 错误分成两层：
 
@@ -313,16 +313,16 @@ Skill 不使用 LLM Judge。所有结果先通过生产 Schema 解析，再用�
 
 1. `setup_error`：适配器导入、Prompt 渲染、Schema 定位或配置错误，暂停运行；
 2. `transport_error`：连接失败、30 秒超时、HTTP 408、429 或 5xx，对应槽位最多重试 2 次；
-3. `protocol_error`：服务响应不符合 Chat Completions 外层协议，暂停运行。
+3. `protocol_error`：`ChatOpenAI` 明确报告服务响应不符合 Chat Completions 外层协议，暂停运行。
 
 参与 Prompt 评分：
 
-1. `parse_error`：存在有效模型响应，但目标结构化载荷缺失或无法解码；
-2. `schema_error`：载荷已解码，但不符合生产 Schema；
-3. `business_error`：Schema 合法但业务断言失败；
-4. `pass`：所有断言通过。
+1. `parse_error`：调用未抛出明确的基础设施异常，但返回 `None`、缺少结构化 function call、目标载荷缺失或载荷无法解码；
+2. `schema_error`：结构化载荷存在且可解码，但 `with_structured_output` 无法用生产 Pydantic Schema 构造对象；
+3. `business_error`：实际与预期均为同一生产 Pydantic 类型，但完整对象不相等；
+4. `pass`：实际与预期 Pydantic 对象完全相等。
 
-整个 HTTP 响应或协议 envelope 为 `None` 时是 `protocol_error`。`message.content` 为 `None` 但合法结果位于 `tool_calls` 或 function arguments 时正常提取；不存在预期载荷时是带 `missing_payload` 或 `null_output` 原因的 `parse_error`。JSON `null` 交给生产 Schema 判断。拒答或截断作为 `parse_error` 的细分原因记录。
+错误分类以明确证据为准：只有客户端抛出的连接、超时、指定 HTTP 状态或外层协议异常才排除 Prompt 评分。`ainvoke` 正常结束却返回 `None` 时记为 `parse_error: null_output`；存在原始 `AIMessage` 但没有预期 function call 时记为 `parse_error: missing_payload`；拒答、截断或不可解码载荷记录为 `parse_error` 的对应细分原因。`parsing_error` 为 JSON 解码错误、缺失载荷错误，或 Pydantic `ValidationError` 中的 `json_invalid` 时归为 `parse_error`；其他 Pydantic `ValidationError` 归为 `schema_error`，不得匹配异常文本分类。`message.content` 为 `None` 但 `tool_calls` 中存在可由生产 Schema 构造的结果时正常评分。
 
 同一案例的多次结果中只要存在非 `pass`，该案例就不是完全稳定案例。错误类别应保留，不能统一折叠为失败。
 
@@ -365,55 +365,49 @@ stability_regression_count
 - `critical` 案例在所有阶段必须全部通过；
 - 普通案例在开发集和验证集中至少 4/5 通过，在最终验收中至少 9/10 通过；
 - 基线中完全稳定的案例不得退化；
-- 候选的 `run_accuracy` 和 `stable_case_rate` 必须同时不低于基线，且至少一项严格提高，除非基线已满足全部目标；
+- 候选的 `run_accuracy` 和 `stable_case_rate` 必须同时不低于基线，且至少一项严格提高；
 - `regression_count` 必须为 0；
 - `stability_regression_count` 必须为 0；
 - 任一失败必须能够追溯到案例、重复序号、错误分类和原始响应。
 
-这些次数和阈值是本 Skill 的实用门禁，不代表统计显著性保证。每个 Prompt 可以在 `eval-config.yaml` 中声明更严格的重复次数或阈值。降低默认门禁必须在契约确认阶段由用户明确批准，调优循环不能自行降低。模型、地址、Token、30 秒超时和 2 次重试不属于项目配置项。
+这些次数和阈值是本 Skill 的实用门禁，不代表统计显著性保证。每个 Prompt 可以在 `eval-config.yaml` 中声明更严格的重复次数或阈值。降低默认门禁必须在契约确认阶段由用户明确批准，调优循环不能自行降低。模型、地址、Token、`temperature=0.0`、关闭 thinking/reasoning/search、30 秒超时和 2 次重试不属于项目配置项。
 
-每次运行还生成不可变 manifest，至少记录周期 ID、worktree 基准提交、Prompt、契约、配置、案例、适配器和 Skill 执行脚本哈希、实际 Python 命令和版本、固定客户端报告的非敏感模型身份、调用槽位计划及开始、恢复和完成时间。基线与候选比较时，除 Prompt 哈希和运行时间外，其他影响结果的字段必须兼容，否则拒绝比较并要求建立新基线。
+每次运行还生成不可变 manifest，至少记录周期 ID、worktree 基准提交、Prompt、契约、配置、案例、适配器和 Skill 执行脚本哈希、实际 Python 命令和版本、固定客户端报告的模型身份、移除 Authorization Token 后的固定 `ChatOpenAI` 与结构化调用配置、明确省略的采样字段、调用槽位计划及开始、恢复和完成时间。基线与候选比较时，除 Prompt 哈希和运行时间外，其他影响结果的字段必须兼容，否则拒绝比较并要求建立新基线。
 
-## 12. 三种运行模式
+## 12. 两种用户运行模式
 
-### 12.1 `bootstrap`
+### 12.1 `tune`
 
-用于首次建立评测资产：
+用于在一个专用 worktree 和调优周期中连续建立或复用评测资产、建立基线并自动产生候选 Prompt。缺少有效评测资产时，`tune` 先执行内部初始化阶段；该阶段不是可独立调用或退出后再由另一次 `tune` 恢复的用户模式。
 
-1. 验证 Python Git 工程中的单个 `.md` Prompt；
-2. 追踪渲染、Schema、调用、下游业务和关键依赖；
-3. 验证相关文件 Git 状态并创建专用 worktree；
-4. 生成业务契约、开发集、验证集、验收集和覆盖矩阵；
-5. 探测 Python 命令并生成或验证项目适配器；
-6. 向用户展示契约、三套案例、执行命令、重复次数和门禁并等待确认；
-7. 确认后执行连接、模型身份和适配器真实 smoke test，只使用开发案例，不接触验收结果；
-8. 提交已确认且通过 smoke test 的评测资产，建立评测周期；
-9. 只对原 Prompt 运行开发集和验证集基线；
-10. 保存基线摘要和失败聚类，验收集暂不运行。
+完整流程：
 
-### 12.2 `tune`
-
-用于自动产生候选 Prompt：
-
-1. 读取已确认的契约、数据集和基线；
-2. 读取 `optimization-history.yaml`，按错误类别和业务维度聚类失败；
-3. 一次选择一个有证据的失败簇；
-4. 从原 Prompt 或上一候选生成最小修改候选；
-5. 将候选写入 `.runtime/`，不覆盖原 Prompt；
-6. 重跑受影响的开发案例；
-7. 通过后重跑完整开发集；
-8. 只有完整开发集不退化时才运行验证集；
-9. 根据验证结果选择最终候选并冻结哈希；
-10. 在同一最终评测活动中，分别对原 Prompt 和冻结候选运行验收集；
-11. 终验失败时结束本周期，不得根据结果继续修改本周期候选；经用户再次确认后，只能将已确认评测资产和新增失败历史同步回原工作区；
-12. 终验通过后请求用户确认是否交付最终 Prompt；
-13. 确认后在 worktree 中替换生产 Prompt，更新契约中的当前 Prompt 哈希，提交最终结果，并将可交付资产补丁同步回原工作区。
+1. 验证 Python Git 工程中的单个 `.md` Prompt、相关文件 Git 状态并创建专用 worktree；
+2. 追踪渲染、生产 Pydantic Schema、`ChatOpenAI` 结构化调用、下游业务和关键依赖；
+3. 若缺少有效评测资产，生成业务契约、开发集、验证集、验收集和覆盖矩阵；
+4. 探测 Python 命令并生成或验证项目适配器；
+5. 向用户展示契约、三套完整 Pydantic 预期、执行命令、重复次数和门禁并等待确认；
+6. 确认后执行连接、模型身份和适配器真实 smoke test，只使用开发案例，不接触验收结果；
+7. 提交已确认且通过 smoke test 的评测资产，建立评测周期；
+8. 对原 Prompt 运行开发集和验证集基线并保存摘要和失败聚类，验收集暂不运行；
+9. 若开发集和验证集的所有计划调用均为 `pass`，以 `no_change_needed` 结束，不生成候选、不运行验收集；
+10. 若用户掌握基线未复现的真实故障，停止调优，补充有证据的案例并重新执行确认和基线；
+11. 读取 `optimization-history.yaml`，按错误类别和业务维度聚类失败；
+12. 一次选择一个有证据的失败簇，从原 Prompt 或上一候选生成最小修改候选；
+13. 将候选写入 `.runtime/`，不覆盖原 Prompt；
+14. 重跑受影响的开发案例，通过后重跑完整开发集；
+15. 只有完整开发集不退化时才运行验证集；
+16. 根据验证结果选择满足门禁且至少一个核心指标严格改善的最终候选并冻结哈希；
+17. 在同一最终评测活动中，分别对原 Prompt 和冻结候选运行验收集；
+18. 终验失败时结束本周期，不得根据结果继续修改本周期候选；经用户再次确认后，只能将已确认评测资产和新增失败历史同步回原工作区；
+19. 终验通过后请求用户确认是否交付最终 Prompt；
+20. 确认后在 worktree 中替换生产 Prompt，更新契约中的当前 Prompt 哈希，提交最终结果，并将可交付资产补丁同步回原工作区。
 
 默认最多进行 5 轮候选迭代。连续两轮没有指标改善、出现业务契约冲突、适配器失真、模型不可用或达到最大轮数时停止并报告，不能无限循环。
 
 交付生产 Prompt 是独立的最终用户确认动作。同步前后通过候选哈希、worktree 提交和补丁内容证明落盘内容就是已经终验的候选，不在同步后重新打开本周期调优。
 
-### 12.3 `verify`
+### 12.2 `verify`
 
 用于只读验证：
 
@@ -436,7 +430,7 @@ stability_regression_count
 - 在修改 Prompt 前生成并确认业务场景；
 - 使用原 Prompt 运行固定模型的开发集和验证集；
 - 观察并保存真实失败和不稳定输出；
-- 若基线没有暴露待解决问题，不为假设性问题修改 Prompt。
+- 若开发集和验证集的所有计划调用均通过，以 `no_change_needed` 结束，不为假设性问题修改 Prompt，也不运行验收集；若用户掌握未被复现的真实故障，先补充并重新确认案例，再重新建立基线。
 
 ### 最小修正
 
@@ -459,7 +453,7 @@ stability_regression_count
 
 - 仓库、Prompt 相对路径和 Prompt 哈希；
 - 运行模式、时间和固定模型名；
-- 请求参数的非敏感摘要；
+- 不含 Authorization Token 的完整固定请求配置；
 - 数据集版本或哈希；
 - 每个案例的重复次数、通过次数和错误分类；
 - Schema 合法率、单次正确率、完全稳定案例率；
@@ -469,17 +463,17 @@ stability_regression_count
 - 停止原因；
 - 是否达到交付门禁。
 
-报告不得包含 Token、Authorization 头或未经必要脱敏的其他凭据。
+报告不得包含 Token 或 Authorization 头。个人使用场景中的业务输入、完整 Pydantic 预期、模型输出和字段差异可以原样保存，以支持失败追溯。
 
 `reports/` 中的原始响应和完整运行报告只保留在 worktree，不提交、不默认同步。可交付的 `optimization-history.yaml` 按周期追加以下精简信息：
 
 - 周期、基线 Prompt、数据集、配置和 manifest 哈希；
-- 失败簇、案例 ID、错误分类和脱敏后的字段差异；
+- 失败簇、案例 ID、错误分类和字段差异；
 - 每轮修改意图、指标变化、修复与回归案例和淘汰原因；
 - 最终停止原因和尚未解决的问题；
 - 经用户确认、应在下一周期转入开发集的真实故障。
 
-`optimization-history.yaml` 不保存中间候选全文、原始响应、Token 或未脱敏数据。新周期必须读取历史记录以避免重复无效策略，但当前已确认的契约和案例始终是业务真值来源。基础设施故障只进入运行报告，不作为 Prompt 优化经验。
+`optimization-history.yaml` 不保存中间候选全文、原始响应或 Token。新周期必须读取历史记录以避免重复无效策略，但当前已确认的契约和案例始终是业务真值来源。基础设施故障只进入运行报告，不作为 Prompt 优化经验。
 
 ## 15. 错误处理
 
@@ -511,19 +505,19 @@ stability_regression_count
 
 - `prompt-id` 生成和路径碰撞；
 - 三套案例的 ID、语义族和格式校验；
-- 默认字段递归比较和自定义判定器边界；
-- `None`、解析失败、Schema 失败和业务失败分类；
+- 完整生产 Pydantic 对象相等比较和字段差异报告；
+- 正常调用返回 `None`、结构化载荷缺失、解析失败、Schema 失败和业务失败分类；
 - 30 秒超时、最多 2 次重试、固定调用槽位中断与恢复；
 - manifest 兼容性和两类回归计算；
-- Token、Authorization 和敏感字段脱敏；
+- Token 和 Authorization 不进入任何输出；
 - worktree 创建、补丁预检、冲突停止和同步恢复；
 - 中间候选不会进入提交或同步资产。
 
 测试 transport 不能通过项目配置进入生产运行路径。生产客户端仍只允许固定局域网模型。
 
-Python 工程集成测试在隔离的临时仓库中验证生产渲染器和 Schema 导入、Python 命令确认、相关与无关脏文件处理、`bootstrap → tune → final sync`、未暂存未提交的同步结果，以及 `verify` 不修改规范资产。
+Python 工程集成测试在隔离的临时仓库中验证生产渲染器和 Pydantic Schema 导入、Python 命令确认、相关与无关脏文件处理、`tune` 内部初始化阶段连续进入候选调优和最终同步、未暂存未提交的同步结果，以及 `verify` 不修改规范资产。
 
-发布前必须使用固定局域网模型完成至少一次端到端 smoke test，确认模型身份、structured output 兼容性、超时、响应规范化、基线与候选请求一致性和凭据脱敏。日常离线测试不依赖局域网服务。
+发布前必须使用固定局域网模型完成至少一次端到端 smoke test，确认模型身份、`temperature=0.0`、关闭 thinking/reasoning/search、Pydantic function calling、`include_raw=True`、超时、`None` 结果分类、基线与候选请求一致性，以及 Token 不进入输出。日常离线测试不依赖局域网服务。
 
 Codex 行为前向测试使用现实请求，且不给评测者预期答案、已知缺陷或建议修复。至少覆盖：
 
@@ -531,6 +525,7 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 - 一个包含多个 Prompt、要求只处理指定文件的工程；
 - 一个业务证据冲突、必须暂停的工程；
 - 一个开放式输出 Prompt、必须拒绝自动调优的工程；
+- 一个开发集和验证集基线完全通过、必须以 `no_change_needed` 结束且不运行验收集的工程；
 - 一个候选提高局部分数但引入回归、必须拒绝交付的工程；
 - 一个终验失败、必须结束周期的工程；
 - 一个终验失败后只同步已确认评测资产和失败历史、不交付候选的工程；
@@ -546,13 +541,13 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 | 位置 | 职责 | 不得承担 |
 |---|---|---|
 | 个人 Skill `SKILL.md` | 触发、决策、工作流和门禁 | 项目业务规则、Token 回显、具体 Prompt 内容 |
-| `scripts/local_model_client.py` | 固定局域网调用、30 秒超时、2 次重试和响应规范化 | 项目配置覆盖、模型选择、参数搜索、报告业务结论 |
-| 通用 runner/scorer | 固定槽位、恢复执行、默认字段比较、指标和基线比较 | 推断业务真值、修改验收预期、实现通用断言语言 |
+| `scripts/local_model_client.py` | 固定 `ChatOpenAI`、`temperature=0.0`、关闭 thinking/reasoning/search、30 秒超时和 2 次重试 | 项目配置覆盖、模型选择、参数搜索、报告业务结论 |
+| 通用 runner/scorer | Pydantic function calling、固定槽位、恢复执行、完整对象比较、错误分类、指标和基线比较 | 推断业务真值、修改验收预期、实现通用断言语言 |
 | `scripts/manage_worktree.py` | 隔离 worktree、同步补丁预检和哈希校验 | 自动合并、覆盖用户修改、提交原工作区 |
 | 项目 `prompt-contract.yaml` | 已确认业务契约和证据 | 模型生成的未经确认结论 |
 | 项目三套数据集 | 输入、预期、优先级、维度和语义族 | 调优中自动迁就候选、跨集合放置近邻案例 |
-| 项目 `adapter.py` | 复用生产渲染和 Schema，可选提供纯函数判定器 | 复制简化 Prompt、重定义 Schema、选择模型 |
-| `optimization-history.yaml` | 精简、脱敏、可复用的失败知识 | 中间候选全文、原始响应、基础设施故障 |
+| 项目 `adapter.py` | 复用生产渲染和消息组装，返回生产 Pydantic Schema | 解析模型响应、自定义判定、复制或重定义 Schema、选择模型 |
+| `optimization-history.yaml` | 精简、可复用的失败知识 | 中间候选全文、原始响应、Token、基础设施故障 |
 | `.runtime/` | 临时候选、调用槽位状态和缓存 | 提交或同步到原工作区 |
 | `reports/` | 原始运行和对比证据 | 凭据、Authorization 头 |
 
@@ -560,26 +555,26 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 
 设计实现完成必须满足：
 
-1. Skill 可在不同 Python Git 仓库中对任意单个 `.md` 结构化 Prompt 启动，不包含任何具体 Agent 的业务字段；
+1. Skill 可从 `$CODEX_HOME/skills` 被 Codex 隐式发现和显式调用，并在不同 Python Git 仓库中对任意单个 `.md` Pydantic 结构化 Prompt 启动，不包含任何具体 Agent 的业务字段；
 2. 每个仓库只建立一个 `.prompt-evals/`，每个 Prompt 建立一个稳定 `prompt-id` 子目录；
 3. Skill 能从真实工程调用链生成有证据的业务契约和确定性测试集；
 4. 用户确认契约和案例前不调用本地模型；
-5. `bootstrap` 和 `tune` 在专用 worktree 中运行，允许无关脏文件但拒绝未提交的关键依赖；
-6. 评测通过已确认的 Python 环境和最小适配器复用生产 Prompt 渲染与 Schema；
-7. 模型地址、名称、Token、30 秒超时和 2 次重试固定在个人 Skill 客户端中，且 Token 不出现在日志、报告或目标工程；
+5. `tune` 在同一专用 worktree 和周期中连续完成必要的内部初始化、基线和候选调优，允许无关脏文件但拒绝未提交的关键依赖；
+6. 评测通过已确认的 Python 环境和最小适配器复用生产 Prompt 渲染、消息组装和 Pydantic Schema；
+7. 模型地址、名称、Token、`temperature=0.0`、关闭 thinking/reasoning/search、30 秒超时和 2 次重试固定在个人 Skill 客户端中，且 Token 不出现在日志、异常、manifest、报告或目标工程；
 8. 原 Prompt、候选 Prompt 使用相同固定请求行为和兼容 manifest；
 9. 开发集、验证集和验收集隔离，验收结果不反馈到本周期；
-10. 正确性、Schema 合法性、稳定性、门禁回归和完全稳定性回归分别计量；
+10. 案例完整预期与模型结果均由同一生产 Pydantic Schema 构造，并以完整对象相等判定正确性；Schema 合法性、稳定性、门禁回归和完全稳定性回归分别计量；
 11. 传输失败不计入 Prompt 指标，固定槽位可恢复补齐，未完成时不形成结论；
 12. Skill 不使用 LLM Judge，不处理无法确定判分的 Prompt；
-13. 自动调优只写临时候选，未经用户最终确认不在 worktree 中替换生产 Prompt；
+13. 正常完成但返回 `None` 的模型调用计为 `parse_error`；自动调优只写临时候选，未经用户最终确认不在 worktree 中替换生产 Prompt；
 14. 最终只把白名单资产安全同步到原工作区，并保持未暂存、未提交；
 15. 冻结验收集不得在调优循环中自动修改或重复用于同周期调优；
 16. `optimization-history.yaml` 保留必要失败知识，但不包含中间候选全文或原始响应；
 17. 模型不可用、契约冲突、回归、无改善、终验失败或同步冲突时能按明确停止条件退出；
 18. 失败周期未经再次确认不修改原工作区；确认后也只能同步已确认评测资产和新增失败历史；
 19. 开启新周期前，上一周期同步的评测资产必须已经由用户提交到目标仓库；
-20. Skill 自身通过 `quick_validate.py`、离线脚本测试、临时工程集成测试、真实局域网 smoke test 和 Codex 行为前向测试。
+20. 开发集和验证集基线完全通过时以 `no_change_needed` 结束，不生成候选、不运行验收集；Skill 自身通过 `quick_validate.py`、离线脚本测试、临时工程集成测试、真实局域网 smoke test 和 Codex 行为前向测试。
 
 ## 19. 明确决策
 
@@ -587,16 +582,16 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 - 百科可作为首个真实验证工程，但其字段、路径和规则不得进入 Skill 本体；
 - V1 专门面向 Python Git 工程，不设计跨语言适配器协议；
 - 所有目标 Prompt 都是单独的 `.md` 文件；
-- 所有目标调用都采用结构化输出；
+- 所有目标调用都使用生产 Pydantic Schema 和 `ChatOpenAI.with_structured_output(..., method="function_calling")`；
 - 一次只处理一个 Prompt；
-- 允许生成项目专属适配器，且必须复用工程现有渲染和 Schema；
-- 固定局域网模型不由 Skill 调整；
+- 允许生成项目专属适配器，且必须复用工程现有渲染、消息组装和 Pydantic Schema；适配器不解析响应或提供自定义判定器；
+- 固定局域网模型不由 Skill 调整，`temperature=0.0` 且 thinking/reasoning/search 始终关闭；
 - 局域网 Token 经用户明确授权直接写入个人 Skill 代码；
-- 模型连接、30 秒超时和 2 次重试不能由项目配置覆盖；
+- 模型连接、固定模型参数、30 秒超时和 2 次重试不能由项目配置覆盖；
 - 业务契约、三套数据集、Python 命令和门禁必须在基线运行前由用户确认；
 - Skill 可以自动迭代临时候选，但不持久化或交付中间候选；
 - 最终验收每周期只运行一次，失败后继续调优必须建立新周期和新验收集；
 - 终验失败不交付候选或生产 Prompt 修改；经用户再次确认后，可以同步已确认评测资产和新增失败历史；
-- `bootstrap` 和 `tune` 使用专用 worktree，`verify` 默认直接在当前工作区只读运行；
+- `bootstrap` 只作为 `tune` 的内部初始化阶段，并在同一 worktree 和周期中连续进入候选调优；`verify` 默认直接在当前工作区只读运行；
 - 最终成果同步回原工作区但不暂存、不提交，冲突时不自动合并；
 - 每个工程使用根目录 `.prompt-evals/`，每个 Prompt 使用“可读 slug + 12 位路径哈希”的独立子目录。
