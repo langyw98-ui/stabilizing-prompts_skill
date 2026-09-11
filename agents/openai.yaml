@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stabilizing Prompts"
+  short_description: "Stabilize one repository-backed structured-output Markdown prompt"
+  default_prompt: "Use $stabilizing-prompts on the repository-relative Markdown prompt path provided."
