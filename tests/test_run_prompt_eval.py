@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import httpx
 import openai
 import pytest
+import yaml
 from langchain_core.messages import AIMessage
 from pydantic import BaseModel, Field
 
@@ -475,6 +476,168 @@ def test_cli_uses_task3_validation_and_canonical_expected_alias(tmp_path: Path, 
 
     assert exit_code == 0
     assert json.loads((eval_root / "run.json").read_text(encoding="utf-8"))["results"]["dev-1:0:" + hashlib.sha256(prompt.read_bytes()).hexdigest()]["kind"] == "pass"
+    assert "status" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("dataset", ["dev", "validation"])
+def test_cli_loads_selected_non_acceptance_split_without_acceptance_file(
+    dataset: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("prompt\n", encoding="utf-8")
+    (eval_root / "adapter.py").write_text(
+        "from pydantic import BaseModel\n"
+        "class ProductionDecision(BaseModel):\n"
+        "    action: str\n"
+        "    reason: str\n"
+        "def prepare_call(prompt_path, case):\n"
+        "    return {'messages': [], 'schema': ProductionDecision}\n",
+        encoding="utf-8",
+    )
+    case_id = f"{dataset}-only"
+    (eval_root / f"{dataset}-cases.yaml").write_text(
+        yaml.safe_dump(
+            [
+                {
+                    "id": case_id,
+                    "semantic_family": f"family-{dataset}",
+                    "source": ["production.py"],
+                    "input": {"variables": {"split": dataset}, "context": {}},
+                    "expect": {"output": {"action": "accept", "reason": "matched"}},
+                    "priority": "normal",
+                    "dimensions": ["routing"],
+                    "rationale": "production evidence determines the expected decision",
+                }
+            ],
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class Client:
+        schema: type[BaseModel] | None = None
+
+        def with_structured_output(self, schema: type[BaseModel], **_kwargs: object) -> "Client":
+            self.schema = schema
+            return self
+
+        def invoke(self, _messages: object) -> object:
+            assert self.schema is not None
+            return {
+                "raw": AIMessage(content="", tool_calls=[]),
+                "parsed": self.schema(action="accept", reason="matched"),
+                "parsing_error": None,
+            }
+
+    client = Client()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("scripts.run_prompt_eval.build_client", lambda _path=None: client)
+    manifest_path = eval_root / "run.json"
+    try:
+        exit_code = main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--prompt",
+                str(prompt),
+                "--dataset",
+                dataset,
+                "--repeats",
+                "1",
+                "--manifest",
+                str(manifest_path),
+            ]
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert exit_code == 0
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert payload["dataset"] == dataset
+    assert list(payload["case_data"]) == [case_id]
+    assert payload["results"][f"{case_id}:0:{hashlib.sha256(prompt.read_bytes()).hexdigest()}"]["kind"] == "pass"
+    assert "status" in capsys.readouterr().out
+
+
+def test_cli_acceptance_loads_acceptance_split_without_unrelated_splits(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("prompt\n", encoding="utf-8")
+    (eval_root / "adapter.py").write_text(
+        "from pydantic import BaseModel\n"
+        "class ProductionDecision(BaseModel):\n"
+        "    action: str\n"
+        "    reason: str\n"
+        "def prepare_call(prompt_path, case):\n"
+        "    return {'messages': [], 'schema': ProductionDecision}\n",
+        encoding="utf-8",
+    )
+    case_id = "acceptance-only"
+    (eval_root / "acceptance-cases.yaml").write_text(
+        yaml.safe_dump(
+            [
+                {
+                    "id": case_id,
+                    "semantic_family": "family-acceptance",
+                    "source": ["production.py"],
+                    "input": {"variables": {"split": "acceptance"}, "context": {}},
+                    "expect": {"output": {"action": "accept", "reason": "matched"}},
+                    "priority": "normal",
+                    "dimensions": ["routing"],
+                    "rationale": "production evidence determines the expected decision",
+                }
+            ],
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class Client:
+        schema: type[BaseModel] | None = None
+
+        def with_structured_output(self, schema: type[BaseModel], **_kwargs: object) -> "Client":
+            self.schema = schema
+            return self
+
+        def invoke(self, _messages: object) -> object:
+            assert self.schema is not None
+            return {
+                "raw": AIMessage(content="", tool_calls=[]),
+                "parsed": self.schema(action="accept", reason="matched"),
+                "parsing_error": None,
+            }
+
+    client = Client()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("scripts.run_prompt_eval.build_client", lambda _path=None: client)
+    manifest_path = eval_root / "run.json"
+    try:
+        exit_code = main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--prompt",
+                str(prompt),
+                "--dataset",
+                "acceptance",
+                "--repeats",
+                "1",
+                "--manifest",
+                str(manifest_path),
+            ]
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert exit_code == 0
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert payload["dataset"] == "acceptance"
+    assert list(payload["case_data"]) == [case_id]
     assert "status" in capsys.readouterr().out
 
 

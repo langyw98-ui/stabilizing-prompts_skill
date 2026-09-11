@@ -267,6 +267,52 @@ def _parse_split(
     return tuple(parsed)
 
 
+def load_case_split(
+    path: Path, schema: type[_SchemaT], split: str
+) -> tuple[ValidatedCase, ...]:
+    """Load and validate one split without touching the other case files.
+
+    ``load_case_suite`` remains the strict three-split loader used when the
+    complete evaluation asset is being checked.  Runner invocations for a
+    single dataset, especially read-only development/validation verification,
+    use this narrower entry point so an unrelated acceptance file is neither
+    required nor read.
+    """
+
+    try:
+        is_schema = isinstance(schema, type) and issubclass(schema, BaseModel)
+    except TypeError:
+        is_schema = False
+    if not is_schema:
+        raise CaseSetupError("schema must be a Pydantic BaseModel subclass")
+
+    if not isinstance(split, str):
+        raise CaseSetupError("case split name must be a string")
+    normalized_split = _SPLIT_ALIASES.get(split.strip().casefold())
+    if normalized_split is None:
+        raise CaseSetupError(
+            f"unknown case split {split!r}; expected dev, validation, acceptance"
+        )
+
+    try:
+        split_path = Path(path)
+    except (TypeError, ValueError) as exc:
+        raise CaseSetupError(
+            f"{normalized_split} case path is invalid: {exc}"
+        ) from exc
+
+    parsed = _parse_split(split_path, normalized_split, schema)
+    seen_ids: set[str] = set()
+    for validated in parsed:
+        case_id = validated.case.id
+        if case_id in seen_ids:
+            raise CaseSetupError(
+                f"duplicate case id {case_id!r} in {normalized_split}"
+            )
+        seen_ids.add(case_id)
+    return parsed
+
+
 def load_case_suite(
     paths: object, schema: type[_SchemaT]
 ) -> CaseSuite:
@@ -392,5 +438,6 @@ __all__ = [
     "EvalCase",
     "ValidatedCase",
     "dataset_hash",
+    "load_case_split",
     "load_case_suite",
 ]

@@ -34,10 +34,15 @@ try:  # The module is also useful when executed as a script from the Skill root.
         safe_client_config,
         safe_error,
     )
-    from scripts.validate_cases import CaseSetupError, EvalCase, ValidatedCase, load_case_suite
+    from scripts.validate_cases import (
+        CaseSetupError,
+        EvalCase,
+        ValidatedCase,
+        load_case_split,
+    )
 except ModuleNotFoundError:  # pragma: no cover - direct-script compatibility
     from local_model_client import build_client, redact_secret, safe_client_config, safe_error
-    from validate_cases import CaseSetupError, EvalCase, ValidatedCase, load_case_suite
+    from validate_cases import CaseSetupError, EvalCase, ValidatedCase, load_case_split
 
 
 NON_SCORING_KINDS = frozenset({"setup_error", "transport_error", "protocol_error"})
@@ -1357,15 +1362,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.dataset == "external":
                 cases = _validated_external_cases(raw_cases, schema)
             else:
-                suite = load_case_suite(
-                    {
-                        "dev": args.eval_root / "dev-cases.yaml",
-                        "validation": args.eval_root / "validation-cases.yaml",
-                        "acceptance": args.eval_root / "acceptance-cases.yaml",
-                    },
-                    schema,
+                cases = list(
+                    load_case_split(dataset_path, schema, args.dataset)
                 )
-                cases = list(suite[args.dataset])
         except Exception as error:
             result = _record_setup_failure(
                 provisional, safe_error(error), args.manifest
