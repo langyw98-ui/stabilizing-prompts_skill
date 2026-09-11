@@ -76,6 +76,11 @@ Skill 作为个人级 Codex Skill 安装在 `$CODEX_HOME/skills`；未设置 `CO
 
 `SKILL.md` 只保留触发条件、核心约束、两种用户运行模式、`tune` 的内部初始化阶段和对 supporting resources 的按需路由。确定性执行、数据校验和指标计算进入 `scripts/`；详细格式和方法进入 `references/`。
 
+局域网凭据不属于受跟踪的 Skill 源码。Skill 根目录可以由用户手动建立
+`.local/model-credentials.json`，并且根目录 `.gitignore` 必须精确排除该文件。
+安装 Skill 时不得隐式复制该文件；没有该文件时由固定客户端报告非计分的
+`setup_error`。
+
 建议的 Skill 描述为：
 
 ```yaml
@@ -90,7 +95,7 @@ Skill 保持默认的隐式发现能力，也允许用户通过 `$stabilizing-pr
 
 - `base_url`：`http://192.168.168.230:8000/v1`，由 `ChatOpenAI` 调用其 `/chat/completions` 路径；
 - 模型：`dbirks/Qwen3.8-27B-W4A16-AutoRound`；
-- Authorization Token：使用用户提供的局域网固定值，直接写入该个人 Skill 的客户端代码；
+- Authorization Token：只从 Skill 根目录 `.local/model-credentials.json` 读取；该文件的 JSON 对象只能包含一个非空字符串字段 `authorization_token`，且文件不可跟踪；
 - `temperature=0.0`；
 - `extra_body={"enable_thinking": False, "enable_reasoning": False, "enable_search": False}`；
 - 单次请求超时：30 秒；
@@ -104,7 +109,7 @@ Skill 保持默认的隐式发现能力，也允许用户通过 `$stabilizing-pr
 - 搜索或调整 `temperature`、`top_p`、seed 等模型参数；`temperature` 只能使用固定值 `0.0`，其他采样参数不得发送；
 - 在命令、异常、日志、报告或目标工程文件中输出 Authorization 头或 Token。
 
-固定客户端不得从项目配置或候选循环继承采样参数。参数的固定值或明确省略都属于请求契约；manifest 记录移除 Authorization Token 后的固定客户端配置，并明确记录未发送的采样字段。同一基线与候选对比必须使用完全相同的客户端和结构化调用配置。
+固定客户端不得从项目配置或候选循环继承采样参数。模型端点、模型名称、超时、重试次数和生成参数全部固定于受跟踪代码，项目配置不能覆盖。参数的固定值或明确省略都属于请求契约；manifest 记录移除 Authorization Token 后的固定客户端配置，并明确记录未发送的采样字段。同一基线与候选对比必须使用完全相同的客户端和结构化调用配置。凭据文件缺失、不可读、JSON 畸形、字段为空或包含额外字段时，停止并记录非计分的 `setup_error`。
 
 开始评测前执行一次连接、模型身份和最小结构检查。服务返回的模型身份与固定模型不一致时明确报告并停止，不得寻找替代模型。
 
@@ -577,7 +582,7 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 4. 用户确认契约和案例前不调用本地模型；
 5. `tune` 在同一专用 worktree 和周期中连续完成必要的内部初始化、基线和候选调优，允许无关脏文件但拒绝未提交的关键依赖；
 6. 评测固定通过 Conda `kds` 环境和最小适配器复用生产 Prompt 渲染、消息组装和 Pydantic Schema，不探测或切换其他 Python 环境；
-7. 模型地址、名称、Token、`temperature=0.0`、关闭 thinking/reasoning/search、30 秒超时和 2 次重试固定在个人 Skill 客户端中，且 Token 不出现在日志、异常、manifest、报告或目标工程；
+7. 模型地址、名称、`temperature=0.0`、关闭 thinking/reasoning/search、30 秒超时和 2 次重试固定在受跟踪的个人 Skill 客户端中；Token 只从 Skill 根目录 `.local/model-credentials.json` 读取，且不出现在日志、异常、manifest、报告或目标工程；
 8. 原 Prompt、候选 Prompt 使用相同固定请求行为和兼容 manifest；
 9. 开发集、验证集和验收集隔离，验收结果不反馈到本周期；
 10. 案例完整预期与模型结果均由同一生产 Pydantic Schema 构造，并以完整对象相等判定正确性；Schema 合法性、稳定性、门禁回归和完全稳定性回归分别计量；严格改善只用于验证集候选选择，验收集只要求达标且相对原 Prompt 无回归；
@@ -603,7 +608,7 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 - 一次只处理一个 Prompt；
 - 允许生成项目专属适配器，且必须复用工程现有渲染、消息组装和 Pydantic Schema；适配器不解析响应或提供自定义判定器；
 - 固定局域网模型不由 Skill 调整，`temperature=0.0` 且 thinking/reasoning/search 始终关闭；
-- 局域网 Token 经用户明确授权直接写入个人 Skill 代码；
+- 局域网 Token 只能由用户手动放入个人 Skill 根目录 `.local/model-credentials.json`；该文件只允许非空字符串字段 `authorization_token`，由根目录 `.gitignore` 精确排除。测试只能使用临时路径中的 sentinel，Token 不得进入测试、报告、manifest、diff 或安装包，安装不得隐式复制凭据；缺失、不可读、畸形、空值或额外字段均为非计分 `setup_error`；
 - 模型连接、固定模型参数、30 秒超时和 2 次重试不能由项目配置覆盖；
 - 业务契约、三套数据集、固定 Conda 环境与命令和门禁必须在基线运行前向用户展示并由用户确认；
 - Skill 可以自动迭代临时候选，但不持久化或交付中间候选；

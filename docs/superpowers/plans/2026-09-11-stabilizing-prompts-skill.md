@@ -16,6 +16,9 @@
 - The fixed model is `dbirks/Qwen3.8-27B-W4A16-AutoRound` at `http://192.168.168.230:8000/v1`.
 - Use `temperature=0.0`, `max_retries=2`, a 30-second timeout, and `extra_body={"enable_thinking": False, "enable_reasoning": False, "enable_search": False}`; do not send other sampling parameters.
 - Never emit the Authorization Token or Authorization header in commands, exceptions, logs, manifests, reports, fixtures, or target repositories.
+- Store the only real credential, when locally configured by the user, at the Skill-root path `.local/model-credentials.json`; the root `.gitignore` must exclude exactly that file, and installation must not copy it implicitly.
+- The credential JSON must contain exactly one non-empty string field, `authorization_token`. Missing, unreadable, malformed, empty, or extra-field credentials are non-scoring `setup_error` conditions.
+- Endpoint, model, timeout, retries, and every generation setting are fixed in tracked client code and cannot be overridden by project configuration; tests use temporary sentinel credential paths only.
 - Tune exactly one repository-relative `.md` prompt and reuse the production renderer, message assembly, and Pydantic Schema.
 - Only `tune` may read and run `acceptance-cases.yaml`, once per cycle after the candidate hash is frozen; `verify` must never read it.
 - Only validation selection requires a strict metric improvement. Acceptance requires thresholds and no regression, not strict improvement.
@@ -290,9 +293,10 @@ rtk git commit -m "feat: validate prompt evaluation cases"
 **Files:**
 - Create: `scripts/local_model_client.py`
 - Create: `tests/test_local_model_client.py`
+- Modify: `.gitignore`
 
 **Interfaces:**
-- Consumes: the locally authorized token embedded in this personal Skill during execution.
+- Consumes: a user-created Skill-root `.local/model-credentials.json` file, or a temporary test credential path; the real credential is never tracked.
 - Produces: `build_client() -> ChatOpenAI`, `probe_model(client) -> ModelProbe`, `safe_client_config() -> dict[str, object]`, and `redact_secret(value: object) -> object`.
 
 - [ ] **Step 1: Write failing configuration and redaction tests**
@@ -301,7 +305,7 @@ rtk git commit -m "feat: validate prompt evaluation cases"
 def test_fixed_client_configuration(monkeypatch):
     captured = {}
     monkeypatch.setattr(module, "ChatOpenAI", lambda **kwargs: captured.update(kwargs) or object())
-    module.build_client()
+    module.build_client(credentials_path=temporary_credentials_path)
     assert captured["base_url"] == "http://192.168.168.230:8000/v1"
     assert captured["model"] == "dbirks/Qwen3.8-27B-W4A16-AutoRound"
     assert captured["temperature"] == 0.0
@@ -331,9 +335,9 @@ MODEL_NAME = "dbirks/Qwen3.8-27B-W4A16-AutoRound"
 EXTRA_BODY = {"enable_thinking": False, "enable_reasoning": False, "enable_search": False}
 
 
-def build_client() -> ChatOpenAI:
+def build_client(credentials_path: Path | None = None) -> ChatOpenAI:
     return ChatOpenAI(
-        api_key=_authorization_token(),
+        api_key=_authorization_token(credentials_path),
         base_url=BASE_URL,
         model=MODEL_NAME,
         temperature=0.0,
@@ -343,7 +347,15 @@ def build_client() -> ChatOpenAI:
     )
 ```
 
-Immediately before implementing `_authorization_token()`, pause and let the user place the authorized fixed value directly into the personal Skill client without echoing it through commands or agent output. Keep the real token out of fixtures and assertions; tests access only a monkeypatched sentinel. `probe_model` must require a non-empty returned model identity equal to `MODEL_NAME`.
+`_authorization_token()` reads only the Skill-root `.local/model-credentials.json`
+by default (tests pass a temporary path). The JSON object must contain exactly
+one non-empty string field, `authorization_token`; missing, unreadable,
+malformed, empty, or extra-field files raise non-scoring `setup_error` without
+including file contents. Add the exact `.local/model-credentials.json` entry to
+the root `.gitignore`. Keep the real token out of fixtures, tests, reports,
+manifests, diffs, and installation packages; installation never copies the
+credential file. `probe_model` must require a non-empty returned model identity
+equal to `MODEL_NAME`.
 
 - [ ] **Step 4: Run client tests and scan tracked output for the test sentinel**
 
@@ -359,7 +371,7 @@ Expected: tests PASS; inspect every match and confirm it is a literal in this pl
 - [ ] **Step 5: Commit the client without printing the credential**
 
 ```powershell
-rtk git add -- scripts/local_model_client.py tests/test_local_model_client.py
+rtk git add -- .gitignore scripts/local_model_client.py tests/test_local_model_client.py docs/superpowers/specs/2026-09-11-stabilizing-prompts-skill-design.md docs/superpowers/plans/2026-09-11-stabilizing-prompts-skill.md
 rtk git commit -m "feat: add fixed local model client"
 ```
 
