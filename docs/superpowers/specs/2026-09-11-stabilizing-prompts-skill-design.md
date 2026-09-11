@@ -9,12 +9,13 @@ Agent 在一次业务流程中可能多次调用 LLM。即使单次调用正确�
 核心原则：
 
 - 弱模型是固定压力测试模型，不是调参对象；
+- Python 运行环境固定为本机 Conda `kds` 环境，不探测或切换其他环境；
 - 一次只调优一个 `.md` Prompt；
 - `tune`（包括首次初始化阶段）必须在同一个专用 Git worktree 和调优周期中连续运行；
 - 评测复用工程现有 Prompt 渲染、消息组装和 Pydantic 结构化输出 Schema；
 - 正确性优先于一致性，稳定错误不算通过；
 - 测试预期在模型运行前由用户确认；
-- 开发集、验证集和验收集职责分离，验收集每个周期只执行一次终验；
+- 开发集、验证集和验收集职责分离，验收集每个周期只允许由 `tune` 执行一次终验；
 - 调优只修改候选 Prompt，不通过修改 Schema、断言或案例刷分；
 - 原 Prompt 只有在验收通过且用户确认后才能在 worktree 中被替换；
 - 最终成果以严格预检的补丁同步回原工作区，并保持未暂存、未提交。
@@ -26,11 +27,11 @@ Agent 在一次业务流程中可能多次调用 LLM。即使单次调用正确�
 目标 Prompt 必须同时满足：
 
 1. 位于 Python Git 工程内，且是单个 `.md` 文件；
-2. 存在可定位或可由用户明确指定的生产 Pydantic `BaseModel` 结构化输出 Schema；
+2. 存在可定位或可由用户明确指定的生产 Pydantic `BaseModel` 结构化输出 Schema，并能在当前 Conda `kds` 环境中导入；
 3. 输出具有确定的业务真值；
 4. 结果能够通过代码断言判定正确或错误；
 5. 工程中存在足够的调用链、业务代码、文档、测试或领域数据供 Codex 建立业务契约；
-6. 工程能够在用户确认的 Python 环境中直接复用生产渲染器和 Schema。
+6. 工程能够通过固定命令 `conda run -n kds python` 直接复用生产渲染器和 Schema。
 
 典型场景包括分类、字段抽取、路由决策、工具选择、实体匹配、规则审核和结构化转换。
 
@@ -38,6 +39,7 @@ Agent 在一次业务流程中可能多次调用 LLM。即使单次调用正确�
 
 - 内联字符串、YAML 字段或代码常量中的 Prompt；
 - 非 Python 工程；
+- 不能在本机 Conda `kds` 环境中导入或运行所需生产代码的工程；
 - 一次共同调优多个 Prompt；
 - 没有确定真值的故事、文风、人格化和其他开放式生成；
 - 使用 LLM-as-Judge 给目标模型输出判分；
@@ -148,20 +150,20 @@ src/agent-a/prompts/classify.md
 
 ### 5.1 Worktree 与交付边界
 
-`tune` 为每个调优周期创建一个专用 worktree 和内部调优分支。首次运行缺少有效评测资产时，`tune` 在该 worktree 中先完成内部初始化阶段，再于同一连续流程、同一 worktree 和同一周期中直接进入基线与候选调优；初始化阶段不是可单独退出后再恢复的用户运行模式。周期开始前：
+`tune` 为每个调优周期创建一个专用 worktree 和内部调优分支。`cycle_base_commit` 固定为创建该 worktree 时原工作区的 `HEAD`。首次运行缺少有效评测资产时，`tune` 在该 worktree 中先完成内部初始化阶段，再于同一连续流程、同一 worktree 和同一周期中直接进入基线与候选调优；初始化阶段不是可单独退出后再恢复的用户运行模式。周期开始前：
 
 - 允许原工作区存在无关的未提交修改；
 - 目标 Prompt、生产 Pydantic Schema、渲染器和关键消息组装文件必须与当前 `HEAD` 一致；
 - Skill 不自动 stash、不复制相关脏文件，也不替用户创建临时提交；
 - 已确认的契约、三套数据集、适配器和配置先在 worktree 中提交，再建立基线。
 
-中间候选只作为 `.runtime/` 中的临时文件，不提交、不交付。最终验收通过并经用户确认后，Skill 在 worktree 中替换生产 Prompt，更新 `prompt-contract.yaml` 中的当前 Prompt 哈希，追加 `optimization-history.yaml` 并提交。随后根据周期基准提交到最终提交生成仅包含可交付资产的 Git 补丁。
+中间候选只作为 `.runtime/` 中的临时文件，不提交、不交付。最终验收通过并经用户确认后，Skill 在 worktree 中替换生产 Prompt，更新 `prompt-contract.yaml` 中的当前 Prompt 哈希，追加 `optimization-history.yaml` 并提交。随后从 `cycle_base_commit` 到最终提交生成差异，并通过交付白名单过滤为 Git 补丁。评测资产提交和最终结果提交的名称及数量属于实现细节。
 
 同步回原工作区前必须执行严格补丁预检。补丁无法干净应用、目标文件已变化或待新增路径发生冲突时停止，不自动三方合并或覆盖。同步成功后的文件保持未暂存、未提交，并校验内容哈希。应用或校验异常时恢复同步前保存的目标文件状态。Skill 不自动删除 worktree 或内部调优分支。
 
 默认同步的可交付资产只有：最终生产 Prompt、契约、配置、三套案例、`adapter.py`、`optimization-history.yaml` 和必要的 `.gitignore` 增量。原始响应、缓存、临时候选和完整运行报告不进入原工作区。
 
-终验或调优周期失败时不交付任何候选或生产 Prompt 修改。Skill 可以在再次取得用户确认后，生成只包含已确认评测资产和本周期新增失败历史的补丁，并按相同预检规则同步回原工作区。该失败周期补丁允许包含契约、配置、三套案例、`adapter.py`、`optimization-history.yaml` 和必要的 `.gitignore` 增量，不包含原始响应、报告、缓存或临时候选。开启后续新周期前，用户必须自行审查并提交上一周期同步的资产；Skill 不替用户提交原工作区，也不能从未提交资产创建新的评测基线。
+终验或调优周期失败时不交付任何候选或生产 Prompt 修改。Skill 可以在再次取得用户确认后，从 `cycle_base_commit` 到当前评测资产提交生成差异，通过交付白名单过滤出已确认评测资产和本周期新增失败历史的补丁，并按相同预检规则同步回原工作区。该失败周期补丁允许包含契约、配置、三套案例、`adapter.py`、`optimization-history.yaml` 和必要的 `.gitignore` 增量，不包含原始响应、报告、缓存或临时候选。开启后续新周期前，用户必须自行审查并提交上一周期同步的资产；Skill 不替用户提交原工作区，也不能从未提交资产创建新的评测基线。
 
 ## 6. 单 Prompt 输入契约
 
@@ -174,7 +176,7 @@ target_prompt: <repository-relative-path-to-prompt.md>
 Skill 在执行前验证：
 
 - 当前目录属于 Git 仓库；
-- 工程是可由已确认 Python 命令运行、并可导入 `langchain_openai.ChatOpenAI` 和生产 Pydantic Schema 的 Python 工程；
+- 工程可由固定的 `conda run -n kds python` 运行，并可在该环境中导入 `langchain_openai.ChatOpenAI` 和生产 Pydantic Schema；
 - Prompt 位于仓库内且扩展名为 `.md`；
 - 本轮只有一个目标 Prompt；
 - 可以定位其加载和渲染逻辑；
@@ -218,7 +220,7 @@ Skill 生成 `prompt-contract.yaml`，至少包含：
 - 数据集覆盖矩阵；
 - 每个案例的输入、完整预期对象和依据；
 - 开发集、验证集与验收集的划分；
-- 自动探测到的候选 Python 命令及最终选择；
+- 固定 Conda `kds` 环境、实际 Python 命令和 Python 版本；
 - 默认重复次数、通过阈值和停止条件。
 
 只有用户明确确认后，契约和验收预期才被冻结，Skill 才能进入基线评测。确认前不得调用测试模型。
@@ -267,6 +269,8 @@ rationale: why-this-result-is-correct
 - `validation-cases.yaml` 用于每轮完整候选选择；
 - `acceptance-cases.yaml` 在首次模型运行前冻结，只在候选哈希冻结后执行一次最终评测活动；
 - “一次终验”允许按每例默认 10 次重复，但终验结果不得反馈到本周期继续调优；
+- `acceptance-cases.yaml` 只能由 `tune` 的终验步骤读取和运行；`verify` 在周期中或周期结束后都不得运行它；
+- 若要复用验收案例，必须经用户确认后将其转入下一周期开发集，并为下一周期重新生成、确认和冻结验收集；
 - 三个集合按业务维度和 `semantic_family` 划分，不能简单随机拆行；
 - 案例 ID 在三个集合中全局唯一，同义或轻微改写案例不能跨集合形成明显泄漏；
 - 这是一套冻结最终评测集，不宣称对负责生成案例和候选的 Codex 构成统计意义上的盲测；
@@ -277,7 +281,7 @@ rationale: why-this-result-is-correct
 
 `.prompt-evals/<prompt-id>/adapter.py` 是通用 Skill 与具体工程之间的唯一项目专属执行边界。
 
-V1 只支持 Python 工程。Skill 自动探测 `.venv`、uv、Poetry 或工程文档声明的候选 Python 命令，向用户展示并确认最终命令，再冻结到 `eval-config.yaml`。运行中不得自动切换 Python 环境。
+V1 只支持能在本机 Conda `kds` 环境中运行的 Python 工程，固定命令为 `conda run -n kds python`，不探测 `.venv`、uv、Poetry 或其他 Python 环境。设计和发布验证以当前环境中的 Python `3.14.6` 与 Pydantic `2.13.4` 为基准；`kds` 环境后续变更由用户管理，Skill 不在 manifest 中记录或比较各 Python 包版本。
 
 适配器必须复用：
 
@@ -311,18 +315,18 @@ Skill 不使用 LLM Judge。案例的完整 `expect.output` 先由生产 Pydanti
 
 不参与 Prompt 评分：
 
-1. `setup_error`：适配器导入、Prompt 渲染、Schema 定位或配置错误，暂停运行；
+1. `setup_error`：适配器导入、Prompt 渲染、Schema 定位或配置错误，以及 `ChatOpenAI` 或 OpenAI SDK 抛出的其他非重试异常，暂停运行；
 2. `transport_error`：连接失败、30 秒超时、HTTP 408、429 或 5xx，对应槽位最多重试 2 次；
-3. `protocol_error`：`ChatOpenAI` 明确报告服务响应不符合 Chat Completions 外层协议，暂停运行。
+3. `protocol_error`：`ChatOpenAI` 明确报告服务响应不符合 Chat Completions 外层协议，或结构化调用正常返回但结果不是同时包含 `raw`、`parsed` 和 `parsing_error` 的字典，暂停运行。
 
 参与 Prompt 评分：
 
-1. `parse_error`：调用未抛出明确的基础设施异常，但返回 `None`、缺少结构化 function call、目标载荷缺失或载荷无法解码；
+1. `parse_error`：已取得原始 `AIMessage`，但缺少结构化 function call、目标载荷缺失或载荷无法解码；
 2. `schema_error`：结构化载荷存在且可解码，但 `with_structured_output` 无法用生产 Pydantic Schema 构造对象；
 3. `business_error`：实际与预期均为同一生产 Pydantic 类型，但完整对象不相等；
 4. `pass`：实际与预期 Pydantic 对象完全相等。
 
-错误分类以明确证据为准：只有客户端抛出的连接、超时、指定 HTTP 状态或外层协议异常才排除 Prompt 评分。`ainvoke` 正常结束却返回 `None` 时记为 `parse_error: null_output`；存在原始 `AIMessage` 但没有预期 function call 时记为 `parse_error: missing_payload`；拒答、截断或不可解码载荷记录为 `parse_error` 的对应细分原因。`parsing_error` 为 JSON 解码错误、缺失载荷错误，或 Pydantic `ValidationError` 中的 `json_invalid` 时归为 `parse_error`；其他 Pydantic `ValidationError` 归为 `schema_error`，不得匹配异常文本分类。`message.content` 为 `None` 但 `tool_calls` 中存在可由生产 Schema 构造的结果时正常评分。
+错误分类以明确证据为准。连接、超时、HTTP 408、429 或 5xx 进入可恢复的 `transport_error`；其他由 `ChatOpenAI` 或 OpenAI SDK 抛出的异常统一进入非评分 `setup_error`。结构化调用正常返回时，结果必须是同时包含 `raw`、`parsed` 和 `parsing_error` 的字典，否则进入 `protocol_error`。只有取得原始 `AIMessage` 后才进入 Prompt 评分：没有预期 function call 时记为 `parse_error: missing_payload`；拒答、截断或不可解码载荷记录为 `parse_error` 的对应细分原因；Pydantic `ValidationError` 中的 `json_invalid` 归为 `parse_error`，其他 Pydantic `ValidationError` 归为 `schema_error`，不得匹配异常文本分类。`message.content` 为 `None` 但 `tool_calls` 中存在可由生产 Schema 构造的结果时正常评分。
 
 同一案例的多次结果中只要存在非 `pass`，该案例就不是完全稳定案例。错误类别应保留，不能统一折叠为失败。
 
@@ -359,20 +363,28 @@ stability_regression_count
 - 验证集：全部验证案例每例 5 次；
 - 最终验收：原 Prompt 与冻结候选对全部验收案例分别运行 10 次。
 
-默认门禁：
+默认门禁分阶段定义。所有阶段共同要求 Schema 合法率为 100%、`critical` 案例全部通过，且任一失败都能追溯到案例、重复序号、错误分类和原始响应。
 
-- Schema 合法率为 100%；
-- `critical` 案例在所有阶段必须全部通过；
-- 普通案例在开发集和验证集中至少 4/5 通过，在最终验收中至少 9/10 通过；
-- 基线中完全稳定的案例不得退化；
-- 候选的 `run_accuracy` 和 `stable_case_rate` 必须同时不低于基线，且至少一项严格提高；
-- `regression_count` 必须为 0；
-- `stability_regression_count` 必须为 0；
-- 任一失败必须能够追溯到案例、重复序号、错误分类和原始响应。
+开发集门禁：
+
+- 普通案例至少 4/5 通过；
+- `regression_count` 和 `stability_regression_count` 均为 0。
+
+验证集候选选择门禁：
+
+- 普通案例至少 4/5 通过；
+- `regression_count` 和 `stability_regression_count` 均为 0；
+- 候选的 `run_accuracy` 和 `stable_case_rate` 必须同时不低于验证集基线，且至少一项严格提高。
+
+验收集交付门禁：
+
+- 普通案例至少 9/10 通过；
+- `regression_count` 和 `stability_regression_count` 均为 0；
+- 候选的 `run_accuracy` 和 `stable_case_rate` 必须同时不低于验收集中的原 Prompt，但不要求严格提高。
 
 这些次数和阈值是本 Skill 的实用门禁，不代表统计显著性保证。每个 Prompt 可以在 `eval-config.yaml` 中声明更严格的重复次数或阈值。降低默认门禁必须在契约确认阶段由用户明确批准，调优循环不能自行降低。模型、地址、Token、`temperature=0.0`、关闭 thinking/reasoning/search、30 秒超时和 2 次重试不属于项目配置项。
 
-每次运行还生成不可变 manifest，至少记录周期 ID、worktree 基准提交、Prompt、契约、配置、案例、适配器和 Skill 执行脚本哈希、实际 Python 命令和版本、固定客户端报告的模型身份、移除 Authorization Token 后的固定 `ChatOpenAI` 与结构化调用配置、明确省略的采样字段、调用槽位计划及开始、恢复和完成时间。基线与候选比较时，除 Prompt 哈希和运行时间外，其他影响结果的字段必须兼容，否则拒绝比较并要求建立新基线。
+每次运行还生成不可变 manifest，至少记录周期 ID、`cycle_base_commit`、Prompt、契约、配置、案例、适配器和 Skill 执行脚本哈希、固定环境名 `kds`、实际 Python 命令和 Python 版本、固定客户端报告的模型身份、移除 Authorization Token 后的固定 `ChatOpenAI` 与结构化调用配置、明确省略的采样字段、调用槽位计划及开始、恢复和完成时间。manifest 不记录各 Python 包版本。基线与候选比较时，除 Prompt 哈希和运行时间外，其他已记录且影响结果的字段必须兼容，否则拒绝比较并要求建立新基线。
 
 ## 12. 两种用户运行模式
 
@@ -385,8 +397,8 @@ stability_regression_count
 1. 验证 Python Git 工程中的单个 `.md` Prompt、相关文件 Git 状态并创建专用 worktree；
 2. 追踪渲染、生产 Pydantic Schema、`ChatOpenAI` 结构化调用、下游业务和关键依赖；
 3. 若缺少有效评测资产，生成业务契约、开发集、验证集、验收集和覆盖矩阵；
-4. 探测 Python 命令并生成或验证项目适配器；
-5. 向用户展示契约、三套完整 Pydantic 预期、执行命令、重复次数和门禁并等待确认；
+4. 验证固定 Conda `kds` 环境并生成或验证项目适配器；
+5. 向用户展示契约、三套完整 Pydantic 预期、固定执行环境与命令、重复次数和门禁并等待确认；
 6. 确认后执行连接、模型身份和适配器真实 smoke test，只使用开发案例，不接触验收结果；
 7. 提交已确认且通过 smoke test 的评测资产，建立评测周期；
 8. 对原 Prompt 运行开发集和验证集基线并保存摘要和失败聚类，验收集暂不运行；
@@ -412,8 +424,10 @@ stability_regression_count
 用于只读验证：
 
 - 默认直接在当前工作区执行，不创建 worktree；
+- 固定使用 Conda `kds` 环境；
 - 校验评测资产和适配器；
-- 对指定的原 Prompt 或候选 Prompt 重复执行；
+- 对指定的原 Prompt 或候选 Prompt 运行开发集、验证集或用户另外提供的非验收案例；
+- 不得读取或运行 `acceptance-cases.yaml`；周期结束后也不例外；
 - 计算确定性指标；
 - 与已保存基线比较；
 - 输出通过、失败和回归明细；
@@ -479,10 +493,11 @@ stability_regression_count
 
 - 模型服务不可用或身份不匹配：暂停，不切换模型；
 - Schema 无法定位：请求用户提供位置，不能猜测替代 Schema；
-- Prompt 渲染、适配器导入或 Python 环境失败：记录 `setup_error` 并暂停，不用简化路径继续；
+- Prompt 渲染、适配器导入或固定 Conda `kds` 环境失败：记录 `setup_error` 并暂停，不用简化路径继续；
 - 业务证据冲突：暂停契约确认；
 - 单次传输失败：记录明确原因，最多重试 2 次；仍失败时槽位保持 `incomplete`，不按 Prompt 失败计分；
-- 服务响应 envelope 不合法：记录 `protocol_error` 并暂停；
+- `ChatOpenAI` 或 OpenAI SDK 抛出其他非重试异常：记录 `setup_error` 并暂停；
+- 服务响应 envelope 不合法，或结构化调用返回值缺少 `raw`、`parsed`、`parsing_error`：记录 `protocol_error` 并暂停；
 - 候选输出无法解析或验证：记录 `parse_error` 或 `schema_error`，不得用文本猜测结构；
 - 评测资产、Prompt 路径或 manifest 失配：提示迁移或重建基线，不能混用旧数据；
 - 契约、案例、Python 命令、门禁、适配器、生产关键依赖或固定客户端请求行为变化：结束旧周期并重新建立基线；
@@ -506,7 +521,7 @@ stability_regression_count
 - `prompt-id` 生成和路径碰撞；
 - 三套案例的 ID、语义族和格式校验；
 - 完整生产 Pydantic 对象相等比较和字段差异报告；
-- 正常调用返回 `None`、结构化载荷缺失、解析失败、Schema 失败和业务失败分类；
+- 结构化调用返回值不符合字典契约、原始消息缺失、结构化载荷缺失、解析失败、Schema 失败和业务失败分类；
 - 30 秒超时、最多 2 次重试、固定调用槽位中断与恢复；
 - manifest 兼容性和两类回归计算；
 - Token 和 Authorization 不进入任何输出；
@@ -515,9 +530,9 @@ stability_regression_count
 
 测试 transport 不能通过项目配置进入生产运行路径。生产客户端仍只允许固定局域网模型。
 
-Python 工程集成测试在隔离的临时仓库中验证生产渲染器和 Pydantic Schema 导入、Python 命令确认、相关与无关脏文件处理、`tune` 内部初始化阶段连续进入候选调优和最终同步、未暂存未提交的同步结果，以及 `verify` 不修改规范资产。
+Python 工程集成测试在隔离的临时仓库中验证固定 Conda `kds` 环境、生产渲染器和 Pydantic Schema 导入、拒绝其他 Python 环境、相关与无关脏文件处理、`tune` 内部初始化阶段连续进入候选调优、从 `cycle_base_commit` 生成白名单补丁和最终同步、未暂存未提交的同步结果，以及 `verify` 不修改规范资产且不能运行验收集。
 
-发布前必须使用固定局域网模型完成至少一次端到端 smoke test，确认模型身份、`temperature=0.0`、关闭 thinking/reasoning/search、Pydantic function calling、`include_raw=True`、超时、`None` 结果分类、基线与候选请求一致性，以及 Token 不进入输出。日常离线测试不依赖局域网服务。
+发布前必须使用固定局域网模型完成至少一次端到端 smoke test，确认模型身份、`temperature=0.0`、关闭 thinking/reasoning/search、Pydantic function calling、`include_raw=True`、超时、结构化返回契约与缺失载荷分类、基线与候选请求一致性，以及 Token 不进入输出。日常离线测试不依赖局域网服务。
 
 Codex 行为前向测试使用现实请求，且不给评测者预期答案、已知缺陷或建议修复。至少覆盖：
 
@@ -527,6 +542,7 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 - 一个开放式输出 Prompt、必须拒绝自动调优的工程；
 - 一个开发集和验证集基线完全通过、必须以 `no_change_needed` 结束且不运行验收集的工程；
 - 一个候选提高局部分数但引入回归、必须拒绝交付的工程；
+- 一个候选在验证集严格改善、原 Prompt 与候选在验收集均满分且允许交付的工程；
 - 一个终验失败、必须结束周期的工程；
 - 一个终验失败后只同步已确认评测资产和失败历史、不交付候选的工程；
 - 一个模型服务异常、不得切换模型或泄漏 Token 的工程；
@@ -555,32 +571,33 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 
 设计实现完成必须满足：
 
-1. Skill 可从 `$CODEX_HOME/skills` 被 Codex 隐式发现和显式调用，并在不同 Python Git 仓库中对任意单个 `.md` Pydantic 结构化 Prompt 启动，不包含任何具体 Agent 的业务字段；
+1. Skill 可从 `$CODEX_HOME/skills` 被 Codex 隐式发现和显式调用，并在能够通过固定 Conda `kds` 环境运行的不同 Python Git 仓库中对单个 `.md` Pydantic 结构化 Prompt 启动，不包含任何具体 Agent 的业务字段；
 2. 每个仓库只建立一个 `.prompt-evals/`，每个 Prompt 建立一个稳定 `prompt-id` 子目录；
 3. Skill 能从真实工程调用链生成有证据的业务契约和确定性测试集；
 4. 用户确认契约和案例前不调用本地模型；
 5. `tune` 在同一专用 worktree 和周期中连续完成必要的内部初始化、基线和候选调优，允许无关脏文件但拒绝未提交的关键依赖；
-6. 评测通过已确认的 Python 环境和最小适配器复用生产 Prompt 渲染、消息组装和 Pydantic Schema；
+6. 评测固定通过 Conda `kds` 环境和最小适配器复用生产 Prompt 渲染、消息组装和 Pydantic Schema，不探测或切换其他 Python 环境；
 7. 模型地址、名称、Token、`temperature=0.0`、关闭 thinking/reasoning/search、30 秒超时和 2 次重试固定在个人 Skill 客户端中，且 Token 不出现在日志、异常、manifest、报告或目标工程；
 8. 原 Prompt、候选 Prompt 使用相同固定请求行为和兼容 manifest；
 9. 开发集、验证集和验收集隔离，验收结果不反馈到本周期；
-10. 案例完整预期与模型结果均由同一生产 Pydantic Schema 构造，并以完整对象相等判定正确性；Schema 合法性、稳定性、门禁回归和完全稳定性回归分别计量；
+10. 案例完整预期与模型结果均由同一生产 Pydantic Schema 构造，并以完整对象相等判定正确性；Schema 合法性、稳定性、门禁回归和完全稳定性回归分别计量；严格改善只用于验证集候选选择，验收集只要求达标且相对原 Prompt 无回归；
 11. 传输失败不计入 Prompt 指标，固定槽位可恢复补齐，未完成时不形成结论；
 12. Skill 不使用 LLM Judge，不处理无法确定判分的 Prompt；
-13. 正常完成但返回 `None` 的模型调用计为 `parse_error`；自动调优只写临时候选，未经用户最终确认不在 worktree 中替换生产 Prompt；
+13. 结构化调用正常返回但不满足 `raw`、`parsed`、`parsing_error` 字典契约时计为 `protocol_error`；取得原始消息后缺少结构化载荷才计为 `parse_error`；自动调优只写临时候选，未经用户最终确认不在 worktree 中替换生产 Prompt；
 14. 最终只把白名单资产安全同步到原工作区，并保持未暂存、未提交；
-15. 冻结验收集不得在调优循环中自动修改或重复用于同周期调优；
+15. 冻结验收集不得在调优循环中自动修改或重复用于同周期调优，并且不能由 `verify` 读取或运行；
 16. `optimization-history.yaml` 保留必要失败知识，但不包含中间候选全文或原始响应；
 17. 模型不可用、契约冲突、回归、无改善、终验失败或同步冲突时能按明确停止条件退出；
 18. 失败周期未经再次确认不修改原工作区；确认后也只能同步已确认评测资产和新增失败历史；
 19. 开启新周期前，上一周期同步的评测资产必须已经由用户提交到目标仓库；
-20. 开发集和验证集基线完全通过时以 `no_change_needed` 结束，不生成候选、不运行验收集；Skill 自身通过 `quick_validate.py`、离线脚本测试、临时工程集成测试、真实局域网 smoke test 和 Codex 行为前向测试。
+20. 开发集和验证集基线完全通过时以 `no_change_needed` 结束，不生成候选、不运行验收集；成功或失败交付补丁都从 `cycle_base_commit` 生成并经过白名单过滤；Skill 自身通过 `quick_validate.py`、离线脚本测试、临时工程集成测试、真实局域网 smoke test 和 Codex 行为前向测试。
 
 ## 19. 明确决策
 
 - 这是通用 Prompt 调优 Skill，不是百科专属工具；
 - 百科可作为首个真实验证工程，但其字段、路径和规则不得进入 Skill 本体；
 - V1 专门面向 Python Git 工程，不设计跨语言适配器协议；
+- Python 运行环境固定为本机 Conda `kds`，命令为 `conda run -n kds python`，不探测 `.venv`、uv、Poetry 或其他环境；设计和发布验证以当前 Python `3.14.6`、Pydantic `2.13.4` 为基准；
 - 所有目标 Prompt 都是单独的 `.md` 文件；
 - 所有目标调用都使用生产 Pydantic Schema 和 `ChatOpenAI.with_structured_output(..., method="function_calling")`；
 - 一次只处理一个 Prompt；
@@ -588,10 +605,10 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 - 固定局域网模型不由 Skill 调整，`temperature=0.0` 且 thinking/reasoning/search 始终关闭；
 - 局域网 Token 经用户明确授权直接写入个人 Skill 代码；
 - 模型连接、固定模型参数、30 秒超时和 2 次重试不能由项目配置覆盖；
-- 业务契约、三套数据集、Python 命令和门禁必须在基线运行前由用户确认；
+- 业务契约、三套数据集、固定 Conda 环境与命令和门禁必须在基线运行前向用户展示并由用户确认；
 - Skill 可以自动迭代临时候选，但不持久化或交付中间候选；
-- 最终验收每周期只运行一次，失败后继续调优必须建立新周期和新验收集；
+- 最终验收每周期只运行一次且只能由 `tune` 执行，`verify` 不得读取或运行验收集；失败后继续调优必须建立新周期和新验收集；
 - 终验失败不交付候选或生产 Prompt 修改；经用户再次确认后，可以同步已确认评测资产和新增失败历史；
 - `bootstrap` 只作为 `tune` 的内部初始化阶段，并在同一 worktree 和周期中连续进入候选调优；`verify` 默认直接在当前工作区只读运行；
-- 最终成果同步回原工作区但不暂存、不提交，冲突时不自动合并；
+- `cycle_base_commit` 是创建 worktree 时原工作区的 `HEAD`；成功结果或经确认允许交付的失败周期资产都从该提交生成白名单补丁，同步回原工作区但不暂存、不提交，冲突时不自动合并；
 - 每个工程使用根目录 `.prompt-evals/`，每个 Prompt 使用“可读 slug + 12 位路径哈希”的独立子目录。
