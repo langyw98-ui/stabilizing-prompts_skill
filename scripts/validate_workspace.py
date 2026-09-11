@@ -183,15 +183,20 @@ def _contract_recorded_path(repo_root: Path, contract_path: Path) -> str | None:
     # The design names the field semantically rather than prescribing one
     # serialization key.  Support the names used by the CLI input and the
     # contract artifact, plus a nested prompt record for forward compatibility.
+    recorded_paths: list[str] = []
     for key in ("prompt_path", "target_prompt", "path"):
         if key in data:
-            return _canonical_contract_path(repo_root, data[key])
+            recorded_paths.append(_canonical_contract_path(repo_root, data[key]))
     prompt_record = data.get("prompt")
     if isinstance(prompt_record, dict):
         for key in ("path", "prompt_path", "target_prompt"):
             if key in prompt_record:
-                return _canonical_contract_path(repo_root, prompt_record[key])
-    return None
+                recorded_paths.append(_canonical_contract_path(repo_root, prompt_record[key]))
+    if not recorded_paths:
+        return None
+    if len(set(recorded_paths)) > 1:
+        raise WorkspaceError("prompt-contract.yaml contains conflicting prompt paths")
+    return recorded_paths[0]
 
 
 def _validate_recorded_contract(repo_root: Path, relative: str, prompt_id: str) -> None:
