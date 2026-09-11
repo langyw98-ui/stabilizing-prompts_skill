@@ -5,7 +5,7 @@ from typing import Literal
 
 import pytest
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from scripts.validate_cases import (
     CaseSetupError,
@@ -17,6 +17,11 @@ from scripts.validate_cases import (
 
 class Decision(BaseModel):
     action: Literal["accept", "reject"]
+    reason: str
+
+
+class AliasedDecision(BaseModel):
+    action: Literal["accept", "reject"] = Field(alias="actionType")
     reason: str
 
 
@@ -51,21 +56,44 @@ def write_case_sets(
     root: Path,
     *,
     dev_expect: dict[str, object] | None = None,
+    dev_input: dict[str, dict[str, object]] | None = None,
     validation: list[dict[str, object]] | None = None,
     acceptance: list[dict[str, object]] | None = None,
 ) -> tuple[Path, Path, Path]:
     return (
         _write(
             root / "dev-cases.yaml",
-            [_case("dev-1", "routing-dev", output=dev_expect)],
+            [
+                _case(
+                    "dev-1",
+                    "routing-dev",
+                    output=dev_expect,
+                    input=dev_input
+                    or {"variables": {"split": "dev"}, "context": {}},
+                )
+            ],
         ),
         _write(
             root / "validation-cases.yaml",
-            validation or [_case("validation-1", "routing-validation")],
+            validation
+            or [
+                _case(
+                    "validation-1",
+                    "routing-validation",
+                    input={"variables": {"split": "validation"}, "context": {}},
+                )
+            ],
         ),
         _write(
             root / "acceptance-cases.yaml",
-            acceptance or [_case("acceptance-1", "routing-acceptance")],
+            acceptance
+            or [
+                _case(
+                    "acceptance-1",
+                    "routing-acceptance",
+                    input={"variables": {"split": "acceptance"}, "context": {}},
+                )
+            ],
         ),
     )
 
@@ -95,6 +123,50 @@ def test_rejects_duplicate_ids_and_cross_split_family_leakage(tmp_path: Path) ->
         load_case_suite(leaking_paths, Decision)
 
 
+def test_rejects_exact_duplicate_inputs_across_splits(tmp_path: Path) -> None:
+    paths = write_case_sets(
+        tmp_path,
+        validation=[
+            _case(
+                "validation-1",
+                "different-validation-family",
+                input={"variables": {}, "context": {}},
+            )
+        ],
+        dev_input={"variables": {}, "context": {}},
+    )
+
+    with pytest.raises(CaseSetupError, match="input fingerprint"):
+        load_case_suite(paths, Decision)
+
+
+def test_rejects_recursively_normalized_duplicate_inputs_across_splits(
+    tmp_path: Path,
+) -> None:
+    paths = write_case_sets(
+        tmp_path,
+        validation=[
+            _case(
+                "validation-1",
+                "another-validation-family",
+                input={
+                    "variables": {"message": "  ACCEPT   VALUE  "},
+                    "context": {"region": "US"},
+                },
+            )
+        ],
+    )
+    raw = yaml.safe_load(paths[0].read_text(encoding="utf-8"))
+    raw[0]["input"] = {
+        "variables": {"message": "accept value"},
+        "context": {"region": "  us  "},
+    }
+    paths[0].write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(CaseSetupError, match="input fingerprint"):
+        load_case_suite(paths, Decision)
+
+
 def test_loads_all_splits_with_validated_production_models(tmp_path: Path) -> None:
     paths = write_case_sets(tmp_path)
 
@@ -107,6 +179,40 @@ def test_loads_all_splits_with_validated_production_models(tmp_path: Path) -> No
     assert isinstance(suite.dev[0].expected, Decision)
     assert suite.dev[0].expected.action == "accept"
     assert suite.dev[0].expected.reason == "matched"
+
+
+def test_accepts_complete_expected_object_using_production_alias(
+    tmp_path: Path,
+) -> None:
+    alias_output = {"actionType": "accept", "reason": "matched"}
+    paths = write_case_sets(
+        tmp_path,
+        dev_expect=alias_output,
+        validation=[
+            _case(
+                "validation-1",
+                "routing-validation",
+                output=alias_output,
+                input={"variables": {"split": "validation"}, "context": {}},
+            )
+        ],
+        acceptance=[
+            _case(
+                "acceptance-1",
+                "routing-acceptance",
+                output=alias_output,
+                input={"variables": {"split": "acceptance"}, "context": {}},
+            )
+        ],
+    )
+
+    suite = load_case_suite(paths, AliasedDecision)
+
+    expected = suite.dev[0].expected
+    assert isinstance(expected, AliasedDecision)
+    assert expected.action == "accept"
+    assert expected.reason == "matched"
+    assert expected.model_fields_set == {"action", "reason"}
 
 
 def test_rejects_unknown_case_fields(tmp_path: Path) -> None:
@@ -124,7 +230,7 @@ def test_dataset_hash_is_stable_for_yaml_case_order(tmp_path: Path) -> None:
     second = write_case_sets(tmp_path / "second")
 
     raw = yaml.safe_load(second[0].read_text(encoding="utf-8"))
-    raw[0]["input"] = {"context": {}, "variables": {}}
+    raw[0]["input"] = {"context": {}, "variables": {"split": "dev"}}
     second[0].write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
     assert dataset_hash(load_case_suite(first, Decision)) == dataset_hash(

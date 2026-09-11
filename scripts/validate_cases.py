@@ -182,6 +182,37 @@ def _normalized_family(value: str) -> str:
     return "".join(character for character in normalized if character.isalnum())
 
 
+def _normalize_input_strings(value: object) -> object:
+    """Recursively normalize only string content for input leak detection."""
+
+    if isinstance(value, str):
+        normalized = unicodedata.normalize("NFKC", value).strip()
+        return " ".join(normalized.split()).casefold()
+    if isinstance(value, Mapping):
+        return {
+            _normalize_input_strings(key): _normalize_input_strings(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalize_input_strings(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_input_strings(item) for item in value)
+    return value
+
+
+def _canonical_json(value: object, *, label: str) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise CaseSetupError(f"{label} must contain JSON-compatible values: {exc}") from exc
+
+
 def _validate_expected(
     case: EvalCase, schema: type[_SchemaT], *, split: str, index: int
 ) -> _SchemaT:
@@ -198,28 +229,25 @@ def _validate_expected(
             f"{split} case {case.id!r} expect.output must be an object"
         )
 
-    declared = set(schema.model_fields)
-    supplied = set(output)
-    missing = sorted(declared - supplied)
-    if missing:
-        raise CaseSetupError(
-            f"{split} case {case.id!r} expect.output is missing schema field(s): "
-            + ", ".join(missing)
-        )
-    unexpected = sorted(supplied - declared)
-    if unexpected:
-        raise CaseSetupError(
-            f"{split} case {case.id!r} expect.output contains unknown schema field(s): "
-            + ", ".join(unexpected)
-        )
-
     try:
-        return schema.model_validate(output)
+        # Let Pydantic own alias/validation_alias parsing and reject extras in
+        # the exact same validation pass.  ``extra="forbid"`` is an override
+        # for schemas whose production config would otherwise ignore extras.
+        expected = schema.model_validate(output, extra="forbid")
     except Exception as exc:
         detail = _format_validation_error(exc)
         raise CaseSetupError(
             f"{split} case {case.id!r} has an invalid expect.output at item {index}: {detail}"
         ) from exc
+
+    declared = set(schema.model_fields)
+    missing = sorted(declared - set(expected.model_fields_set))
+    if missing:
+        raise CaseSetupError(
+            f"{split} case {case.id!r} expect.output is missing schema field(s): "
+            + ", ".join(missing)
+        )
+    return expected
 
 
 def _parse_split(
@@ -263,6 +291,8 @@ def load_case_suite(
 
     seen_ids: dict[str, str] = {}
     seen_families: dict[str, tuple[str, str]] = {}
+    seen_inputs: dict[str, tuple[str, str]] = {}
+    seen_normalized_inputs: dict[str, tuple[str, str]] = {}
     for split in _SPLITS:
         for validated in split_cases[split]:
             case = validated.case
@@ -286,6 +316,37 @@ def load_case_suite(
                     f"{previous[1]!r} in {previous[0]}"
                 )
             seen_families.setdefault(family, (split, case.semantic_family))
+
+            input_fingerprint = _canonical_json(
+                case.input, label=f"{split} case {case.id!r} input"
+            )
+            normalized_input_fingerprint = _canonical_json(
+                _normalize_input_strings(case.input),
+                label=f"{split} case {case.id!r} input",
+            )
+            previous_input = seen_inputs.get(input_fingerprint)
+            if previous_input is not None and previous_input[0] != split:
+                raise CaseSetupError(
+                    "input fingerprint leakage across splits: "
+                    f"{case.id!r} in {split} conflicts with "
+                    f"{previous_input[1]!r} in {previous_input[0]}"
+                )
+            previous_normalized_input = seen_normalized_inputs.get(
+                normalized_input_fingerprint
+            )
+            if (
+                previous_normalized_input is not None
+                and previous_normalized_input[0] != split
+            ):
+                raise CaseSetupError(
+                    "normalized input fingerprint leakage across splits: "
+                    f"{case.id!r} in {split} conflicts with "
+                    f"{previous_normalized_input[1]!r} in {previous_normalized_input[0]}"
+                )
+            seen_inputs.setdefault(input_fingerprint, (split, case.id))
+            seen_normalized_inputs.setdefault(
+                normalized_input_fingerprint, (split, case.id)
+            )
 
     return CaseSuite(
         dev=split_cases["dev"],
