@@ -13,23 +13,28 @@ import argparse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-import importlib
 import json
 from pathlib import Path
 from typing import Literal
 
 try:
-    from scripts.run_prompt_eval import RunManifest, load_manifest
+    from scripts.run_prompt_eval import DEFAULT_PHASE_REPEATS, RunManifest, load_manifest
     from scripts.score_results import (
         CaseScore,
         RunMetrics,
         ScoreError,
-        _schema_import_reference,
+        _schema_from_reference,
         score_run,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct-script compatibility
-    from run_prompt_eval import RunManifest, load_manifest
-    from score_results import CaseScore, RunMetrics, ScoreError, _schema_import_reference, score_run
+    from run_prompt_eval import DEFAULT_PHASE_REPEATS, RunManifest, load_manifest
+    from score_results import (
+        CaseScore,
+        RunMetrics,
+        ScoreError,
+        _schema_from_reference,
+        score_run,
+    )
 
 
 Phase = Literal["development", "validation", "acceptance"]
@@ -37,6 +42,11 @@ _PHASE_DATASET = {
     "development": "dev",
     "validation": "validation",
     "acceptance": "acceptance",
+}
+_PHASE_REPEATS = {
+    "development": DEFAULT_PHASE_REPEATS["dev"],
+    "validation": DEFAULT_PHASE_REPEATS["validation"],
+    "acceptance": DEFAULT_PHASE_REPEATS["acceptance"],
 }
 
 
@@ -107,6 +117,40 @@ def _slot_plan(manifest: RunManifest) -> tuple[tuple[str, int], ...]:
     return tuple((slot.case_id, slot.repeat_index) for slot in manifest.slots)
 
 
+def _manifest_phase_errors(
+    manifest: RunManifest, label: str, phase: Phase
+) -> tuple[str, ...]:
+    """Reject incomplete identity or non-default evaluation intensity."""
+
+    errors: list[str] = []
+    expected_dataset = _PHASE_DATASET[phase]
+    dataset = "dev" if manifest.dataset == "development" else manifest.dataset
+    if not dataset:
+        errors.append(f"{label}.dataset is missing")
+    elif dataset != expected_dataset:
+        errors.append(f"{label}.dataset is incompatible with {phase}")
+    expected_repeats = _PHASE_REPEATS[phase]
+    if manifest.repeats != expected_repeats:
+        errors.append(
+            f"{label}.repeats must be exactly {expected_repeats} for {phase}"
+        )
+    for name, value in (
+        ("cycle_id", manifest.cycle_id),
+        ("prompt_path", manifest.prompt_path),
+        ("schema_import", manifest.schema_import),
+        ("prompt_hash", manifest.prompt_hash),
+    ):
+        if not isinstance(value, str) or not value:
+            errors.append(f"{label}.{name} is missing")
+    if not manifest.slots:
+        errors.append(f"{label}.slots are missing")
+    if not manifest.case_data:
+        errors.append(f"{label}.case_data is missing")
+    if not isinstance(manifest.client_config, Mapping) or not manifest.client_config:
+        errors.append(f"{label}.client_config is missing")
+    return tuple(errors)
+
+
 def _canonical_path(value: object) -> str | None:
     if value is None:
         return None
@@ -146,21 +190,6 @@ def _manifest_compatibility(
     return tuple(errors)
 
 
-def _schema_from_reference(reference: str) -> type:
-    module_name, separator, qualname = reference.partition(":")
-    if not separator or not module_name or not qualname:
-        raise ComparisonError("manifest schema import reference is malformed")
-    try:
-        value: object = importlib.import_module(module_name)
-        for part in qualname.split("."):
-            value = getattr(value, part)
-    except Exception as error:
-        raise ComparisonError(
-            "unable to import production schema recorded by manifest"
-        ) from error
-    return value  # score_run performs the BaseModel check without exposing secrets
-
-
 def _coerce_run(value: object, schema: type | None) -> tuple[RunMetrics, RunManifest | None]:
     if isinstance(value, RunMetrics):
         return value, None
@@ -174,7 +203,14 @@ def _coerce_run(value: object, schema: type | None) -> tuple[RunMetrics, RunMani
     if schema is None:
         if not value.schema_import:
             raise ComparisonError("manifest schema import reference is missing")
-        schema = _schema_from_reference(value.schema_import)
+        try:
+            schema = _schema_from_reference(
+                value.schema_import,
+                manifest_path=value.manifest_path,
+                prompt_path=value.prompt_path,
+            )
+        except ScoreError as error:
+            raise ComparisonError(str(error)) from None
     try:
         metrics = score_run(value, schema)
     except ScoreError as error:
@@ -286,6 +322,23 @@ class Comparison:
         normal = [case for case in self.candidate.case_scores if case.priority == "normal"]
         return all(case.meets(repeats_required) for case in normal)
 
+    def phase_intensity_matches(self, phase: Phase | str | None = None) -> bool:
+        """Require the default number of completed repeats for scored evidence.
+
+        Hand-authored ``RunMetrics`` without case evidence remain useful for
+        callers that only need arithmetic deltas.  Manifests are scored into
+        case evidence, so every real gate comparison takes this strict branch.
+        """
+
+        selected_phase = _phase(phase if phase is not None else self.phase)
+        expected = _PHASE_REPEATS[selected_phase]
+        if not self.candidate.case_scores:
+            return True
+        return all(
+            case.repeats == expected and case.total_responses == expected
+            for case in self.candidate.case_scores
+        )
+
     def has_strict_core_improvement(self) -> bool:
         return bool(
             self.run_accuracy_delta is not None
@@ -309,6 +362,10 @@ class Comparison:
         if not self.normal_cases_meeting(repeats_required):
             reasons.append(
                 f"normal cases do not meet the {repeats_required}-response threshold"
+            )
+        if not self.phase_intensity_matches(selected_phase):
+            reasons.append(
+                f"phase requires exactly {_PHASE_REPEATS[selected_phase]} repeats per case"
             )
         if self.regression_count:
             reasons.append("case regression")
@@ -367,12 +424,8 @@ def compare_runs(
     errors: tuple[str, ...] = ()
     if baseline_manifest is not None and candidate_manifest is not None:
         errors = _manifest_compatibility(baseline_manifest, candidate_manifest)
-        expected_dataset = _PHASE_DATASET[selected_phase]
         for name, manifest in (("baseline", baseline_manifest), ("candidate", candidate_manifest)):
-            dataset = manifest.dataset
-            normalized = "dev" if dataset == "development" else dataset
-            if normalized is not None and normalized != expected_dataset:
-                errors += (f"{name}.dataset is incompatible with {selected_phase}",)
+            errors += _manifest_phase_errors(manifest, name, selected_phase)
         if baseline_manifest.schema_import != candidate_manifest.schema_import:
             errors += ("schema_import",)
         if errors:
@@ -408,6 +461,7 @@ def evaluate_gate(
         and comparison.candidate.schema_valid_rate == Decimal("1")
         and comparison.critical_failures == 0
         and comparison.normal_cases_meeting(repeats_required)
+        and comparison.phase_intensity_matches(selected_phase)
         and comparison.regression_count == 0
         and comparison.stability_regression_count == 0
     )

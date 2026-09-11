@@ -466,7 +466,7 @@ def test_cli_uses_task3_validation_and_canonical_expected_alias(tmp_path: Path, 
                 "--dataset",
                 "dev",
                 "--repeats",
-                "1",
+                "5",
                 "--manifest",
                 str(eval_root / "run.json"),
             ]
@@ -545,7 +545,7 @@ def test_cli_loads_selected_non_acceptance_split_without_acceptance_file(
                 "--dataset",
                 dataset,
                 "--repeats",
-                "1",
+                "5",
                 "--manifest",
                 str(manifest_path),
             ]
@@ -626,7 +626,7 @@ def test_cli_acceptance_loads_acceptance_split_without_unrelated_splits(
                 "--dataset",
                 "acceptance",
                 "--repeats",
-                "1",
+                "10",
                 "--manifest",
                 str(manifest_path),
             ]
@@ -639,6 +639,35 @@ def test_cli_acceptance_loads_acceptance_split_without_unrelated_splits(
     assert payload["dataset"] == "acceptance"
     assert list(payload["case_data"]) == [case_id]
     assert "status" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("dataset", "repeats"),
+    [("dev", 4), ("validation", 4), ("acceptance", 9)],
+)
+def test_cli_rejects_repeat_counts_below_phase_defaults(
+    dataset: str, repeats: int, tmp_path: Path
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("prompt\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--prompt",
+                str(prompt),
+                "--dataset",
+                dataset,
+                "--repeats",
+                str(repeats),
+                "--manifest",
+                str(eval_root / "run.json"),
+            ]
+        )
 
 
 def test_api_response_validation_error_is_protocol_error() -> None:

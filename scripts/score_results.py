@@ -13,22 +13,39 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+import hashlib
 import json
 import importlib
+import importlib.util
 from pathlib import Path
+import re
+import sys
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 try:
     from scripts.run_prompt_eval import (
+        ADAPTER_SCHEMA_REFERENCE_PREFIX,
+        DEFAULT_PHASE_REPEATS,
         NON_SCORING_KINDS,
         RunManifest,
         SlotResult,
+        _schema_import_reference as _runtime_schema_import_reference,
         load_manifest,
+        redact_secret,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct-script compatibility
-    from run_prompt_eval import NON_SCORING_KINDS, RunManifest, SlotResult, load_manifest
+    from run_prompt_eval import (
+        ADAPTER_SCHEMA_REFERENCE_PREFIX,
+        DEFAULT_PHASE_REPEATS,
+        NON_SCORING_KINDS,
+        RunManifest,
+        SlotResult,
+        _schema_import_reference as _runtime_schema_import_reference,
+        load_manifest,
+        redact_secret,
+    )
 
 
 SCORING_KINDS = frozenset({"parse_error", "schema_error", "business_error", "pass"})
@@ -46,15 +63,92 @@ ScoringError = ScoreError
 
 
 def _schema_import_reference(schema: type[BaseModel]) -> str:
-    module = getattr(schema, "__module__", None)
-    qualname = getattr(schema, "__qualname__", None)
-    if not isinstance(module, str) or not isinstance(qualname, str):
+    reference = _runtime_schema_import_reference(schema)
+    if not isinstance(reference, str):
         raise ScoreError("production schema has no import reference")
-    return f"{module}:{qualname}"
+    return reference
 
 
-def _schema_from_reference(reference: str) -> type[BaseModel]:
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _adapter_reference_parts(reference: str) -> tuple[Path, str, str] | None:
+    if not reference.startswith(ADAPTER_SCHEMA_REFERENCE_PREFIX + "|"):
+        return None
+    parts = reference.split("|")
+    if len(parts) != 4 or parts[0] != ADAPTER_SCHEMA_REFERENCE_PREFIX:
+        raise ScoreError("manifest adapter Schema reference is malformed")
+    raw_path, digest, qualname = parts[1:]
+    if not raw_path or not Path(raw_path).is_absolute():
+        raise ScoreError("manifest adapter Schema reference path must be absolute")
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ScoreError("manifest adapter Schema reference hash is malformed")
+    components = qualname.split(".")
+    if not components or any(not component.isidentifier() for component in components):
+        raise ScoreError("manifest adapter Schema reference qualname is malformed")
+    return Path(raw_path), digest, qualname
+
+
+def _schema_from_reference(
+    reference: str,
+    *,
+    manifest_path: Path | None = None,
+    prompt_path: str | None = None,
+) -> type[BaseModel]:
     """Resolve the production Schema recorded in a completed manifest."""
+
+    adapter_parts = _adapter_reference_parts(reference)
+    if adapter_parts is not None:
+        adapter_path, expected_hash, qualname = adapter_parts
+        try:
+            adapter_path = adapter_path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise ScoreError("recorded adapter Schema source is unavailable") from None
+        if adapter_path.name != "adapter.py" or not adapter_path.is_file():
+            raise ScoreError("recorded adapter Schema source is outside the adapter boundary")
+
+        # A persisted manifest may only import the adapter belonging to its
+        # evaluation root.  This keeps the scorer from becoming a general
+        # arbitrary-file import primitive when given a crafted manifest.
+        roots: list[Path] = []
+        if manifest_path is not None:
+            manifest_parent = Path(manifest_path).resolve(strict=False).parent
+            roots.append(manifest_parent)
+            if manifest_parent.name in {".runtime", "reports"}:
+                roots.append(manifest_parent.parent)
+        if isinstance(prompt_path, str):
+            roots.append(Path(prompt_path).resolve(strict=False).parent)
+        if not roots:
+            raise ScoreError("manifest adapter Schema reference lacks a file boundary")
+        if not any(_is_within(adapter_path, root) for root in roots):
+            raise ScoreError("recorded adapter Schema source is outside the manifest boundary")
+        try:
+            actual_hash = hashlib.sha256(adapter_path.read_bytes()).hexdigest()
+        except OSError:
+            raise ScoreError("recorded adapter Schema source is unreadable") from None
+        if actual_hash != expected_hash:
+            raise ScoreError("recorded adapter Schema source hash does not match manifest")
+
+        module_name = f"_stabilizing_prompts_adapter_{expected_hash[:16]}"
+        spec = importlib.util.spec_from_file_location(module_name, adapter_path)
+        if spec is None or spec.loader is None:
+            raise ScoreError("unable to load recorded adapter Schema source")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+            value: object = module
+            for part in qualname.split("."):
+                value = getattr(value, part)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise ScoreError("unable to import production schema recorded by manifest") from None
+        return _require_schema(value)
 
     module_name, separator, qualname = reference.partition(":")
     if not separator or not module_name or not qualname:
@@ -80,8 +174,8 @@ def _require_schema(schema: object) -> type[BaseModel]:
     return schema
 
 
-def _safe_value(value: object) -> object:
-    """Return a JSON-compatible report value without evaluating user code."""
+def _safe_value_raw(value: object) -> object:
+    """Return a JSON-compatible value without evaluating user code."""
 
     if value is None or isinstance(value, (str, bool, int)):
         return value
@@ -91,21 +185,30 @@ def _safe_value(value: object) -> object:
         return str(value)
     if isinstance(value, BaseModel):
         try:
-            return _safe_value(value.model_dump(mode="json"))
+            return _safe_value_raw(value.model_dump(mode="json"))
         except Exception:
             return str(value)
     if isinstance(value, Mapping):
         return {
-            str(key): _safe_value(item)
+            str(key): _safe_value_raw(item)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [_safe_value(item) for item in value]
+        return [_safe_value_raw(item) for item in value]
     if isinstance(value, (set, frozenset)):
-        return sorted((_safe_value(item) for item in value), key=repr)
+        return sorted((_safe_value_raw(item) for item in value), key=repr)
     if isinstance(value, Path):
         return str(value)
     return str(value)
+
+
+def _safe_value(value: object) -> object:
+    """Return a JSON-compatible, credential-redacted report value."""
+
+    try:
+        return redact_secret(_safe_value_raw(value))
+    except Exception:
+        return "[REDACTION_FAILED]"
 
 
 def _model_mapping(value: BaseModel) -> Mapping[str, object]:
@@ -116,6 +219,39 @@ def _model_mapping(value: BaseModel) -> Mapping[str, object]:
     if not isinstance(dumped, Mapping):  # pragma: no cover - pydantic contract
         raise ScoreError("production schema object did not serialize to an object")
     return dumped
+
+
+def _model_state(value: BaseModel) -> dict[str, object]:
+    """Capture Pydantic equality state omitted by ``model_dump``.
+
+    Pydantic compares private attributes, extra fields, and user-added
+    ``__dict__`` state in addition to declared fields.  Keep those components
+    under stable names so a business mismatch never loses its evidence merely
+    because the differing state is not a public model field.
+    """
+
+    field_names = set(getattr(type(value), "model_fields", {}))
+    raw_dict = getattr(value, "__dict__", {})
+    internal: Mapping[object, object]
+    if isinstance(raw_dict, Mapping):
+        internal = {
+            key: item
+            for key, item in raw_dict.items()
+            if key not in field_names
+        }
+    else:
+        internal = {}
+    private = getattr(value, "__pydantic_private__", None)
+    extra = getattr(value, "__pydantic_extra__", None)
+    return {
+        "private": private if isinstance(private, Mapping) else {},
+        "extra": extra if isinstance(extra, Mapping) else {},
+        "internal": internal,
+    }
+
+
+def _model_state_path(path: str) -> str:
+    return f"{path}.$model_state" if path else "$model_state"
 
 
 def _path_for_key(path: str, key: object) -> str:
@@ -162,6 +298,20 @@ def _diff_values(expected: object, actual: object, path: str, output: list[dict[
                 )
             else:
                 _diff_values(expected_map[key], actual_map[key], child_path, output)
+        expected_state = _model_state(expected)
+        actual_state = _model_state(actual)
+        try:
+            state_differs = expected_state != actual_state
+        except Exception:
+            state_differs = True
+        if state_differs:
+            output.append(
+                {
+                    "path": _model_state_path(path),
+                    "expected": _safe_value(expected_state),
+                    "actual": _safe_value(actual_state),
+                }
+            )
         return
 
     if isinstance(expected, Mapping) and isinstance(actual, Mapping):
@@ -240,6 +390,23 @@ def field_diff(expected: BaseModel, actual: BaseModel) -> list[dict[str, object]
         raise TypeError("field_diff expects two Pydantic BaseModel objects")
     output: list[dict[str, object]] = []
     _diff_values(expected, actual, "", output)
+    if not output:
+        try:
+            objects_differ = expected != actual
+        except Exception:
+            objects_differ = True
+        if objects_differ:
+            output.append(
+                {
+                    "path": "$model_state",
+                    "expected": _safe_value(
+                        {"fields": _model_mapping(expected), **_model_state(expected)}
+                    ),
+                    "actual": _safe_value(
+                        {"fields": _model_mapping(actual), **_model_state(actual)}
+                    ),
+                }
+            )
     return output
 
 
@@ -490,6 +657,17 @@ def _ratio(numerator: int, denominator: int) -> Decimal:
     return Decimal(numerator) / Decimal(denominator)
 
 
+def _validate_manifest_phase_repeats(manifest: RunManifest) -> None:
+    dataset = "dev" if manifest.dataset == "development" else manifest.dataset
+    if dataset not in DEFAULT_PHASE_REPEATS:
+        return
+    expected = DEFAULT_PHASE_REPEATS[dataset]
+    if manifest.repeats != expected:
+        raise ScoreError(
+            f"manifest repeats must be exactly {expected} for {dataset}"
+        )
+
+
 def score_run(
     manifest: RunManifest | Path,
     schema: type[_SchemaT] | None = None,
@@ -503,6 +681,7 @@ def score_run(
             raise ScoreError(f"unable to load run manifest: {error}") from None
     if not isinstance(manifest, RunManifest):
         raise TypeError("score_run expects a RunManifest or manifest path")
+    _validate_manifest_phase_repeats(manifest)
     if any(
         isinstance(result, SlotResult) and result.kind in NON_SCORING_KINDS
         for result in manifest.results.values()
@@ -517,7 +696,11 @@ def score_run(
     production_schema = (
         _require_schema(schema)
         if schema is not None
-        else _schema_from_reference(manifest.schema_import)
+        else _schema_from_reference(
+            manifest.schema_import,
+            manifest_path=manifest.manifest_path,
+            prompt_path=manifest.prompt_path,
+        )
     )
     expected_ref = _schema_import_reference(production_schema)
     if manifest.schema_import != expected_ref:

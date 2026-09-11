@@ -19,6 +19,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 from types import MappingProxyType
 from typing import Any
@@ -48,6 +49,8 @@ except ModuleNotFoundError:  # pragma: no cover - direct-script compatibility
 NON_SCORING_KINDS = frozenset({"setup_error", "transport_error", "protocol_error"})
 SCORING_KINDS = frozenset({"parse_error", "schema_error", "business_error", "pass"})
 REQUIRED_INCLUDE_RAW_KEYS = frozenset({"raw", "parsed", "parsing_error"})
+DEFAULT_PHASE_REPEATS = {"dev": 5, "validation": 5, "acceptance": 10}
+ADAPTER_SCHEMA_REFERENCE_PREFIX = "adapter-file-v1"
 _SENSITIVE_OUTPUT_KEY = {
     "authorization",
     "authorization_token",
@@ -102,13 +105,44 @@ def _validate_prompt_identity(manifest: "RunManifest", prompt_path: Path) -> Non
             )
 
 
-def _schema_import_reference(schema: object | None) -> str | None:
+def _schema_import_reference(
+    schema: object | None, adapter_path: Path | str | None = None
+) -> str | None:
+    """Return a durable reference for a production Schema.
+
+    Adapters are loaded from a file under a generated module name.  That name
+    is useful while the adapter is executing but cannot be imported after a
+    process restart.  When the class came from such an adapter, persist the
+    canonical adapter path, its content hash, and the class qualname instead.
+    Ordinary importable production classes retain the historical
+    ``module:qualname`` spelling.
+    """
     if not isinstance(schema, type):
         return None
     module = getattr(schema, "__module__", None)
     qualname = getattr(schema, "__qualname__", None)
     if not isinstance(module, str) or not isinstance(qualname, str):
         return None
+    adapter_file: Path | None = None
+    module_object = sys.modules.get(module)
+    module_file = getattr(module_object, "__file__", None)
+    if isinstance(module_file, str):
+        module_file_path = Path(module_file).resolve(strict=False)
+        if adapter_path is not None:
+            requested = Path(adapter_path).resolve(strict=False)
+            if module_file_path == requested:
+                adapter_file = requested
+        elif module_file_path.name == "adapter.py":
+            adapter_file = module_file_path
+    if adapter_file is not None:
+        try:
+            canonical = adapter_file.resolve(strict=True)
+            digest = hashlib.sha256(canonical.read_bytes()).hexdigest()
+        except (OSError, RuntimeError) as error:
+            raise ValueError("unable to hash adapter for Schema reference") from error
+        if "|" in str(canonical) or "|" in qualname or "<locals>" in qualname:
+            raise ValueError("adapter Schema reference contains an invalid delimiter")
+        return f"{ADAPTER_SCHEMA_REFERENCE_PREFIX}|{canonical}|{digest}|{qualname}"
     return f"{module}:{qualname}"
 
 
@@ -996,9 +1030,14 @@ def load_adapter(eval_root: Path) -> Callable[[Path, object], Mapping[str, objec
     if spec is None or spec.loader is None:
         raise RuntimeError("unable to load adapter.py")
     module = importlib.util.module_from_spec(spec)
+    # Keep the generated module available only as an in-process execution
+    # detail.  Manifests never rely on this name: ``_schema_import_reference``
+    # records a durable adapter-file reference instead.
+    sys.modules[name] = module
     try:
         spec.loader.exec_module(module)
     except Exception as error:
+        sys.modules.pop(name, None)
         raise RuntimeError(safe_error(error)) from None
     prepare_call = getattr(module, "prepare_call", None)
     if not callable(prepare_call):
@@ -1165,10 +1204,13 @@ def execute_run(
             schema = call["schema"]
             if not isinstance(schema, type) or not issubclass(schema, BaseModel):
                 raise RuntimeError("adapter schema must be a Pydantic BaseModel class")
-            if current.schema_import is not None and current.schema_import != _schema_import_reference(schema):
+            schema_reference = _schema_import_reference(schema, adapter_path)
+            if schema_reference is None:
+                raise RuntimeError("adapter schema has no durable import reference")
+            if current.schema_import is not None and current.schema_import != schema_reference:
                 raise RuntimeError("adapter returned an incompatible Schema")
             if current.schema_import is None:
-                current = replace(current, schema_import=_schema_import_reference(schema))
+                current = replace(current, schema_import=schema_reference)
             structured = client.with_structured_output(
                 schema,
                 method="function_calling",
@@ -1324,7 +1366,12 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-root", type=Path, required=True)
     parser.add_argument("--prompt", type=Path, required=True)
     parser.add_argument("--dataset", choices=("dev", "validation", "acceptance", "external"), required=True)
-    parser.add_argument("--repeats", type=int, required=True)
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=None,
+        help="repeat count; development/validation require 5 and acceptance requires 10",
+    )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--prompt-hash", default=None)
     parser.add_argument("--credentials", type=Path, default=None)
@@ -1332,7 +1379,17 @@ def _cli_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _cli_parser().parse_args(argv)
+    parser = _cli_parser()
+    args = parser.parse_args(argv)
+    default_repeats = DEFAULT_PHASE_REPEATS.get(args.dataset, 5)
+    repeats = default_repeats if args.repeats is None else args.repeats
+    if repeats < 1:
+        parser.error("--repeats must be positive")
+    required_repeats = DEFAULT_PHASE_REPEATS.get(args.dataset)
+    if required_repeats is not None and repeats != required_repeats:
+        parser.error(
+            f"--dataset {args.dataset} requires exactly {required_repeats} repeats"
+        )
     if args.dataset == "external":
         dataset_path = args.eval_root / "external-cases.yaml"
     else:
@@ -1340,6 +1397,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare_call: Callable[[Path, object], Mapping[str, object]] | None = None
     if args.manifest.exists():
         manifest = load_manifest(args.manifest)
+        if manifest.dataset != args.dataset:
+            parser.error("manifest dataset does not match --dataset")
+        if manifest.repeats != repeats:
+            parser.error(
+                f"manifest repeats {manifest.repeats} do not match required {repeats}"
+            )
     else:
         prompt_hash = args.prompt_hash or hashlib.sha256(args.prompt.read_bytes()).hexdigest()
         raw_cases = _load_cli_cases(dataset_path)
@@ -1348,7 +1411,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # setup-error evidence instead of disappearing with the exception.
         provisional = new_manifest(
             raw_cases,
-            args.repeats,
+            repeats,
             prompt_hash,
             prompt_path=args.prompt,
             manifest_path=args.manifest,
@@ -1382,7 +1445,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if result.status == "complete" else 2
         manifest = new_manifest(
             cases,
-            args.repeats,
+            repeats,
             prompt_hash,
             prompt_path=args.prompt,
             manifest_path=args.manifest,
@@ -1404,6 +1467,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "CallSlot",
     "ClassifiedResult",
+    "ADAPTER_SCHEMA_REFERENCE_PREFIX",
+    "DEFAULT_PHASE_REPEATS",
     "RunManifest",
     "SlotResult",
     "classify_exception",

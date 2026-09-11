@@ -60,3 +60,39 @@ clean
 The implementation and tests were committed as `41ce11b829f4b9ada41b5724bad84e165def6dc8`.
 This report is the follow-up documentation commit for Task 6.
 
+## Fix round 1 — reviewer regressions
+
+The first review identified four safety/contract gaps.  RED regressions were
+added before the corresponding implementation changes:
+
+- adapter-local Schemas were persisted as generated module names that could
+  not be imported by a fresh process;
+- phase gates accepted 4/4 development or validation repeats and 9/9
+  acceptance repeats without proving the required 5/5 and 10/10 plans;
+- Pydantic private/model state mismatches could produce an empty field diff;
+- completed comparisons allowed missing phase identity, including a missing
+  dataset.
+
+The fix stores adapter Schema references as a versioned adapter-file path,
+qualname, and SHA-256 content identity.  Scoring and comparison validate the
+adapter filename, manifest/prompt boundary, content hash, and safe qualname
+before loading it, so persisted score and compare CLIs reconstruct the Schema
+in a new process without treating a manifest as an arbitrary import request.
+The runner defaults development/validation to exactly 5 repeats and
+acceptance to exactly 10; comparison rejects manifests with another count,
+and gates retain the 4/5 and 9/10 pass thresholds.  Model-state diffs now use
+the stable `$model_state` path and the existing secret redaction policy.
+Comparisons also fail closed for missing dataset, cycle, prompt, Schema,
+prompt hash, slot, case, or client identity evidence and enforce phase/dataset
+isolation.
+
+Fix-round verification:
+
+```text
+rtk conda run -n kds python -m pytest tests/test_score_results.py tests/test_compare_runs.py tests/test_run_prompt_eval.py -q
+61 passed
+rtk conda run -n kds python -m pytest tests -q
+104 passed
+rtk git diff --check
+clean
+```

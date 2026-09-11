@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
 import pytest
 from pydantic import BaseModel
 
 from scripts.compare_runs import Comparison, compare_runs, evaluate_gate
-from scripts.run_prompt_eval import SlotResult, new_manifest, record_slot_result
+from scripts.run_prompt_eval import (
+    SlotResult,
+    load_adapter,
+    new_manifest,
+    persist_manifest,
+    record_slot_result,
+)
 from scripts.score_results import CaseScore, RunMetrics
 
 
@@ -62,6 +74,44 @@ def test_any_case_or_stability_regression_fails_every_candidate_gate():
     assert evaluate_gate(comparison, "development").passed is False
     assert evaluate_gate(comparison, "validation").passed is False
     assert evaluate_gate(comparison, "acceptance").passed is False
+
+
+def test_development_gate_rejects_four_of_four_instead_of_required_five_repeats():
+    case = CaseScore(
+        case_id="normal-1",
+        priority="normal",
+        repeats=4,
+        pass_count=4,
+        classifications=("pass",) * 4,
+    )
+    comparison = Comparison(
+        baseline=_metrics(case_scores=(case,)),
+        candidate=_metrics(case_scores=(case,)),
+    )
+
+    gate = evaluate_gate(comparison, "development")
+
+    assert gate.passed is False
+    assert any("5" in reason for reason in gate.reasons)
+
+
+def test_acceptance_gate_rejects_nine_of_nine_instead_of_required_ten_repeats():
+    case = CaseScore(
+        case_id="normal-1",
+        priority="normal",
+        repeats=9,
+        pass_count=9,
+        classifications=("pass",) * 9,
+    )
+    comparison = Comparison(
+        baseline=_metrics(case_scores=(case,)),
+        candidate=_metrics(case_scores=(case,)),
+    )
+
+    gate = evaluate_gate(comparison, "acceptance")
+
+    assert gate.passed is False
+    assert any("10" in reason for reason in gate.reasons)
 
 
 def test_manifest_compatibility_failure_cannot_pass_a_gate():
@@ -146,6 +196,8 @@ def _manifest(
     client_config: dict[str, object] | None = None,
     kinds: tuple[str, ...] = ("pass",) * 5,
 ):
+    if dataset == "acceptance" and len(kinds) == 5:
+        kinds = ("pass",) * 10
     case = {
         "id": "case-1",
         "semantic_family": "family-case-1",
@@ -160,10 +212,11 @@ def _manifest(
         [case],
         repeats=len(kinds),
         prompt_hash=prompt_hash,
+        prompt_path="prompt.md",
         schema=Decision,
         dataset=dataset,
         cycle_id="cycle-1",
-        client_config=client_config,
+        client_config=client_config or {"model": "fixed"},
     )
     for slot, kind in zip(manifest.slots, kinds, strict=True):
         manifest = record_slot_result(
@@ -193,7 +246,7 @@ def test_compare_completed_manifests_allows_prompt_hash_change():
 
 def test_compare_rejects_changed_result_affecting_manifest_field():
     baseline = _manifest("baseline-hash")
-    candidate = _manifest("candidate-hash", client_config={"model": "fixed"})
+    candidate = _manifest("candidate-hash", client_config={"model": "changed"})
 
     with pytest.raises(ValueError, match="client_config"):
         compare_runs(baseline, candidate, "validation", schema=Decision)
@@ -205,3 +258,111 @@ def test_compare_rejects_acceptance_manifest_in_validation_phase():
 
     with pytest.raises(ValueError, match="dataset"):
         compare_runs(baseline, candidate, "validation", schema=Decision)
+
+
+def test_compare_rejects_manifests_missing_phase_dataset_identity():
+    baseline = _manifest("baseline-hash")
+    candidate = _manifest("candidate-hash")
+    baseline = replace(baseline, dataset=None)
+    candidate = replace(candidate, dataset=None)
+
+    with pytest.raises(ValueError, match="dataset"):
+        compare_runs(baseline, candidate, "validation", schema=Decision)
+
+
+def test_compare_rejects_manifests_missing_cycle_identity():
+    baseline = replace(_manifest("baseline-hash"), cycle_id=None)
+    candidate = replace(_manifest("candidate-hash"), cycle_id=None)
+
+    with pytest.raises(ValueError, match="cycle_id"):
+        compare_runs(baseline, candidate, "validation", schema=Decision)
+
+
+def test_compare_rejects_manifest_repeats_below_phase_default():
+    baseline = _manifest("baseline-hash", kinds=("pass",) * 4)
+    candidate = _manifest("candidate-hash", kinds=("pass",) * 4)
+
+    with pytest.raises(ValueError, match="repeats"):
+        compare_runs(baseline, candidate, "validation", schema=Decision)
+
+
+def test_compare_cli_reconstructs_adapter_schema_in_a_fresh_process(tmp_path: Path):
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    adapter = eval_root / "adapter.py"
+    adapter.write_text(
+        "from pydantic import BaseModel\n"
+        "class ProductionDecision(BaseModel):\n"
+        "    action: str\n"
+        "    reason: str\n"
+        "def prepare_call(prompt_path, case):\n"
+        "    return {'messages': [], 'schema': ProductionDecision}\n",
+        encoding="utf-8",
+    )
+    prompt = eval_root / "prompt.md"
+    prompt.write_text("prompt\n", encoding="utf-8")
+    prepare_call = load_adapter(eval_root)
+    schema = prepare_call(prompt, {"id": "case-1"})["schema"]
+    case = {
+        "id": "case-1",
+        "semantic_family": "family-case-1",
+        "source": ["production.py"],
+        "input": {"variables": {"case": "1"}, "context": {}},
+        "expect": {"output": {"action": "accept", "reason": "matched"}},
+        "priority": "normal",
+        "dimensions": ["routing"],
+        "rationale": "production evidence determines the expected decision",
+    }
+    prompt_hash = hashlib.sha256(prompt.read_bytes()).hexdigest()
+    manifests: list[Path] = []
+    for name, kinds in (
+        ("baseline", ("business_error",) + ("pass",) * 4),
+        ("candidate", ("pass",) * 5),
+    ):
+        manifest_path = eval_root / f"{name}.json"
+        manifest = new_manifest(
+            [case],
+            repeats=5,
+            prompt_hash=prompt_hash if name == "baseline" else "candidate-hash",
+            prompt_path=prompt,
+            schema=schema,
+            manifest_path=manifest_path,
+            dataset="validation",
+            cycle_id="cycle-1",
+            client_config={"model": "fixed"},
+        )
+        for slot, kind in zip(manifest.slots, kinds, strict=True):
+            parsed = schema(action="accept", reason="matched")
+            if kind == "business_error":
+                parsed = schema(action="reject", reason="matched")
+            manifest = record_slot_result(
+                manifest,
+                slot.key,
+                SlotResult(kind=kind, parsed=parsed),
+            )
+        persist_manifest(manifest, manifest_path)
+        manifests.append(manifest_path)
+
+    report_path = eval_root / "compare.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.compare_runs",
+            "--baseline",
+            str(manifests[0]),
+            "--candidate",
+            str(manifests[1]),
+            "--phase",
+            "validation",
+            "--report",
+            str(report_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    assert json.loads(report_path.read_text(encoding="utf-8"))["status"] == "passed"

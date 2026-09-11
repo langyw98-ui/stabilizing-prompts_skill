@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import hashlib
+import json
 from pathlib import Path
 from dataclasses import replace
+import subprocess
+import sys
 
 import pytest
 from pydantic import BaseModel, Field, PrivateAttr
 
 from scripts.run_prompt_eval import (
     SlotResult,
+    load_adapter,
+    load_manifest,
     new_manifest,
     persist_manifest,
     record_slot_result,
@@ -30,6 +36,12 @@ class DecisionWithPrivateState(BaseModel):
 class AliasedDecision(BaseModel):
     action: str = Field(alias="actionType")
     reason: str
+
+
+class DecisionWithSecretPrivateState(BaseModel):
+    action: str
+    reason: str
+    _authorization_token: str = PrivateAttr(default="expected-token")
 
 
 def _case(case_id: str, *, priority: str = "normal") -> dict[str, object]:
@@ -111,6 +123,22 @@ def test_field_diff_preserves_production_schema_field_order():
         "zulu",
         "alpha",
     ]
+
+
+def test_field_diff_reports_redacted_model_state_when_private_attr_differs():
+    expected = DecisionWithSecretPrivateState(action="accept", reason="matched")
+    actual = DecisionWithSecretPrivateState(action="accept", reason="matched")
+    expected._authorization_token = "expected-secret-token"
+    actual._authorization_token = "actual-secret-token"
+
+    differences = field_diff(expected, actual)
+
+    assert differences
+    assert differences[0]["path"] == "$model_state"
+    rendered = repr(differences)
+    assert "expected-secret-token" not in rendered
+    assert "actual-secret-token" not in rendered
+    assert "REDACTED" in rendered
 
 
 def test_scoring_uses_complete_pydantic_object_equality():
@@ -245,3 +273,137 @@ def test_score_cli_writes_metrics_report_without_invoking_model(tmp_path: Path):
 
     assert main(["--manifest", str(manifest_path), "--report", str(report_path)]) == 0
     assert '"run_accuracy": "1"' in report_path.read_text(encoding="utf-8")
+
+
+def test_score_cli_reconstructs_adapter_schema_in_a_fresh_process(tmp_path: Path):
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    adapter = eval_root / "adapter.py"
+    adapter.write_text(
+        "from pydantic import BaseModel\n"
+        "class ProductionDecision(BaseModel):\n"
+        "    action: str\n"
+        "    reason: str\n"
+        "def prepare_call(prompt_path, case):\n"
+        "    return {'messages': [], 'schema': ProductionDecision}\n",
+        encoding="utf-8",
+    )
+    prompt = eval_root / "prompt.md"
+    prompt.write_text("prompt\n", encoding="utf-8")
+    prepare_call = load_adapter(eval_root)
+    schema = prepare_call(prompt, _case("adapter"))["schema"]
+    manifest_path = eval_root / "run.json"
+    manifest = new_manifest(
+        [_case("adapter")],
+        repeats=1,
+        prompt_hash=hashlib.sha256(prompt.read_bytes()).hexdigest(),
+        prompt_path=prompt,
+        schema=schema,
+        manifest_path=manifest_path,
+        dataset="external",
+        cycle_id="cycle-1",
+    )
+    manifest = record_slot_result(
+        manifest,
+        manifest.slots[0].key,
+        SlotResult(kind="pass", parsed=schema(action="accept", reason="matched")),
+    )
+    persist_manifest(manifest, manifest_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert payload["schema_import"].startswith("adapter-file-v1|")
+
+    report_path = eval_root / "score.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.score_results",
+            "--manifest",
+            str(manifest_path),
+            "--report",
+            str(report_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    assert '"run_accuracy": "1"' in report_path.read_text(encoding="utf-8")
+
+
+def test_score_rejects_adapter_schema_reference_outside_manifest_boundary(tmp_path: Path):
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    outside = tmp_path / "outside" / "adapter.py"
+    outside.parent.mkdir()
+    outside.write_text(
+        "from pydantic import BaseModel\n"
+        "class ProductionDecision(BaseModel):\n"
+        "    action: str\n"
+        "    reason: str\n",
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(outside.read_bytes()).hexdigest()
+    reference = f"adapter-file-v1|{outside.resolve()}|{digest}|ProductionDecision"
+    prompt = eval_root / "prompt.md"
+    prompt.write_text("prompt\n", encoding="utf-8")
+    manifest = new_manifest(
+        [_case("boundary")],
+        repeats=1,
+        prompt_hash="prompt-hash",
+        prompt_path=prompt,
+        schema=Decision,
+        manifest_path=eval_root / "run.json",
+        dataset="external",
+        cycle_id="cycle-1",
+    )
+    manifest = replace(manifest, schema_import=reference)
+    manifest = record_slot_result(
+        manifest,
+        manifest.slots[0].key,
+        SlotResult(kind="pass", parsed=Decision(action="accept", reason="matched")),
+    )
+
+    with pytest.raises(ScoreError, match="outside the manifest boundary"):
+        score_run(manifest)
+
+
+def test_score_rejects_changed_adapter_schema_content(tmp_path: Path):
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    adapter = eval_root / "adapter.py"
+    adapter.write_text(
+        "from pydantic import BaseModel\n"
+        "class ProductionDecision(BaseModel):\n"
+        "    action: str\n"
+        "    reason: str\n"
+        "def prepare_call(prompt_path, case):\n"
+        "    return {'messages': [], 'schema': ProductionDecision}\n",
+        encoding="utf-8",
+    )
+    prompt = eval_root / "prompt.md"
+    prompt.write_text("prompt\n", encoding="utf-8")
+    prepare_call = load_adapter(eval_root)
+    schema = prepare_call(prompt, _case("hash"))["schema"]
+    manifest = new_manifest(
+        [_case("hash")],
+        repeats=1,
+        prompt_hash="prompt-hash",
+        prompt_path=prompt,
+        schema=schema,
+        manifest_path=eval_root / "run.json",
+        dataset="external",
+        cycle_id="cycle-1",
+    )
+    manifest = record_slot_result(
+        manifest,
+        manifest.slots[0].key,
+        SlotResult(kind="pass", parsed=schema(action="accept", reason="matched")),
+    )
+    persist_manifest(manifest, eval_root / "run.json")
+    adapter.write_text(adapter.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8")
+
+    with pytest.raises(ScoreError, match="hash does not match"):
+        score_run(load_manifest(eval_root / "run.json"))
