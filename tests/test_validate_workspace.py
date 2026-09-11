@@ -156,6 +156,33 @@ def test_rejects_recorded_prompt_contract_path_mismatch(
         validate_workspace(repo, prompt, ())
 
 
+def test_rejects_recorded_prompt_contract_path_outside_repository(
+    repo_with_prompt: tuple[Path, Path], tmp_path: Path
+) -> None:
+    repo, prompt = repo_with_prompt
+    prompt_id = prompt_id_for_path("prompts/classify.md")
+    contract = repo / ".prompt-evals" / prompt_id / "prompt-contract.yaml"
+    contract.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    contract.write_text(f"prompt_path: '{outside.as_posix()}'\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="prompt-contract"):
+        validate_workspace(repo, prompt, ())
+
+
+def test_rejects_invalid_recorded_prompt_contract_path_value(
+    repo_with_prompt: tuple[Path, Path],
+) -> None:
+    repo, prompt = repo_with_prompt
+    prompt_id = prompt_id_for_path("prompts/classify.md")
+    contract = repo / ".prompt-evals" / prompt_id / "prompt-contract.yaml"
+    contract.parent.mkdir(parents=True)
+    contract.write_text("prompt_path: 123\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="prompt-contract"):
+        validate_workspace(repo, prompt, ())
+
+
 def test_rejects_non_kds_environment(
     repo_with_prompt: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

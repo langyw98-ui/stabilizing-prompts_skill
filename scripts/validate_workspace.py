@@ -146,17 +146,28 @@ def _differs_from_head(repo_root: Path, relative_paths: Sequence[str]) -> bool:
     return False
 
 
-def _canonical_contract_path(repo_root: Path, value: Any) -> str | None:
+def _canonical_contract_path(repo_root: Path, value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
-        return None
+        raise WorkspaceError("prompt-contract.yaml contains an invalid prompt path")
     candidate = Path(value)
     if candidate.is_absolute():
         try:
             _, relative = _resolve_inside(repo_root, candidate, label="recorded prompt path")
-        except WorkspaceError:
-            return None
+        except WorkspaceError as exc:
+            raise WorkspaceError(
+                "prompt-contract.yaml records a prompt path outside repository"
+            ) from exc
         return relative
-    return _canonical_posix_path(value)
+    canonical = _canonical_posix_path(value)
+    if (
+        not canonical
+        or canonical == ".."
+        or canonical.startswith("../")
+        or "\x00" in value
+        or any(character in canonical for character in "*?[")
+    ):
+        raise WorkspaceError("prompt-contract.yaml contains an invalid prompt path")
+    return canonical
 
 
 def _contract_recorded_path(repo_root: Path, contract_path: Path) -> str | None:
@@ -172,16 +183,14 @@ def _contract_recorded_path(repo_root: Path, contract_path: Path) -> str | None:
     # The design names the field semantically rather than prescribing one
     # serialization key.  Support the names used by the CLI input and the
     # contract artifact, plus a nested prompt record for forward compatibility.
-    for key in ("prompt_path", "target_prompt"):
-        recorded = _canonical_contract_path(repo_root, data.get(key))
-        if recorded is not None:
-            return recorded
+    for key in ("prompt_path", "target_prompt", "path"):
+        if key in data:
+            return _canonical_contract_path(repo_root, data[key])
     prompt_record = data.get("prompt")
     if isinstance(prompt_record, dict):
         for key in ("path", "prompt_path", "target_prompt"):
-            recorded = _canonical_contract_path(repo_root, prompt_record.get(key))
-            if recorded is not None:
-                return recorded
+            if key in prompt_record:
+                return _canonical_contract_path(repo_root, prompt_record[key])
     return None
 
 
