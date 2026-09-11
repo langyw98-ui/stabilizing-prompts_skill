@@ -14,6 +14,7 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import hashlib
 import importlib.util
 import json
 import os
@@ -28,16 +29,15 @@ from pydantic import BaseModel, ValidationError
 
 try:  # The module is also useful when executed as a script from the Skill root.
     from scripts.local_model_client import (
-        MAX_RETRIES,
         build_client,
         redact_secret,
         safe_client_config,
         safe_error,
     )
-    from scripts.validate_cases import EvalCase, ValidatedCase
+    from scripts.validate_cases import CaseSetupError, EvalCase, ValidatedCase, load_case_suite
 except ModuleNotFoundError:  # pragma: no cover - direct-script compatibility
-    from local_model_client import MAX_RETRIES, build_client, redact_secret, safe_client_config, safe_error
-    from validate_cases import EvalCase, ValidatedCase
+    from local_model_client import build_client, redact_secret, safe_client_config, safe_error
+    from validate_cases import CaseSetupError, EvalCase, ValidatedCase, load_case_suite
 
 
 NON_SCORING_KINDS = frozenset({"setup_error", "transport_error", "protocol_error"})
@@ -59,6 +59,44 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class PromptIdentityError(ValueError):
+    """Raised when a resume target does not match its manifest identity."""
+
+
+def _canonical_prompt_path(path: Path | str) -> Path:
+    return Path(path).resolve(strict=False)
+
+
+def _prompt_hash(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise PromptIdentityError("unable to read prompt for hash validation") from error
+
+
+def _validate_prompt_identity(manifest: "RunManifest", prompt_path: Path) -> None:
+    """Require the resume path and bytes to match the planned prompt exactly."""
+
+    actual_path = _canonical_prompt_path(prompt_path)
+    if manifest.prompt_path is not None:
+        expected_path = _canonical_prompt_path(manifest.prompt_path)
+        if actual_path != expected_path:
+            raise PromptIdentityError(
+                f"prompt path does not match manifest: {actual_path} != {expected_path}"
+            )
+
+    # A prompt path is always validated when recorded.  For legacy manifests
+    # without a path, validate the hash when the supplied file exists; this
+    # keeps synthetic/unit manifests usable while still preventing reuse of a
+    # stale slot plan in a real run.
+    if manifest.prompt_path is not None or actual_path.is_file():
+        actual_hash = _prompt_hash(actual_path)
+        if manifest.prompt_hash and actual_hash != manifest.prompt_hash:
+            raise PromptIdentityError(
+                f"prompt hash does not match manifest: {actual_hash} != {manifest.prompt_hash}"
+            )
+
+
 def _schema_import_reference(schema: object | None) -> str | None:
     if not isinstance(schema, type):
         return None
@@ -70,7 +108,12 @@ def _schema_import_reference(schema: object | None) -> str | None:
 
 
 def _safe_serialize(value: object, _seen: set[int] | None = None) -> object:
-    """Convert runtime values to JSON-compatible values before redaction."""
+    """Convert runtime values to JSON-compatible values before redaction.
+
+    ``_seen`` is an active recursion stack, rather than a process-wide visited
+    set.  A shared value is therefore serialized at each reference while a
+    value encountered through its own children is still recognized as a cycle.
+    """
 
     seen = _seen if _seen is not None else set()
     if value is None or isinstance(value, (str, bool, int)):
@@ -91,26 +134,38 @@ def _safe_serialize(value: object, _seen: set[int] | None = None) -> object:
                 dumped = value.model_dump(mode="python")
             except Exception:
                 dumped = safe_error(value)
-        return _safe_serialize(dumped, seen)
+        try:
+            return _safe_serialize(dumped, seen)
+        finally:
+            seen.remove(value_id)
 
     if isinstance(value, Mapping):
         seen.add(value_id)
-        result: dict[str, object] = {}
-        for key, item in value.items():
-            safe_key = key if isinstance(key, str) else _safe_serialize(key, seen)
-            if not isinstance(safe_key, str):
-                safe_key = str(safe_key)
-            result[safe_key] = _safe_serialize(item, seen)
-        return result
+        try:
+            result: dict[str, object] = {}
+            for key, item in value.items():
+                safe_key = key if isinstance(key, str) else _safe_serialize(key, seen)
+                if not isinstance(safe_key, str):
+                    safe_key = str(safe_key)
+                result[safe_key] = _safe_serialize(item, seen)
+            return result
+        finally:
+            seen.remove(value_id)
 
     if isinstance(value, (list, tuple)):
         seen.add(value_id)
-        return [_safe_serialize(item, seen) for item in value]
+        try:
+            return [_safe_serialize(item, seen) for item in value]
+        finally:
+            seen.remove(value_id)
 
     if isinstance(value, (set, frozenset)):
         seen.add(value_id)
-        values = [_safe_serialize(item, seen) for item in value]
-        return sorted(values, key=lambda item: repr(item))
+        try:
+            values = [_safe_serialize(item, seen) for item in value]
+            return sorted(values, key=lambda item: repr(item))
+        finally:
+            seen.remove(value_id)
 
     if isinstance(value, Path):
         return str(value)
@@ -185,11 +240,15 @@ class CallSlot:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "CallSlot":
-        return cls(
+        slot = cls(
             case_id=str(value["case_id"]),
             repeat_index=int(value["repeat_index"]),
             prompt_hash=str(value["prompt_hash"]),
         )
+        recorded_key = value.get("key")
+        if recorded_key is not None and recorded_key != slot.key:
+            raise ValueError("manifest slot key does not match its stable identity")
+        return slot
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,11 +328,22 @@ class SlotResult:
             unknown = ", ".join(sorted(str(key) for key in aliases))
             raise TypeError(f"unknown SlotResult argument(s): {unknown}")
         if status is None:
-            status = "incomplete" if kind == "transport_error" else "complete"
+            status = (
+                "incomplete"
+                if kind == "transport_error"
+                else "paused"
+                if kind in {"setup_error", "protocol_error"}
+                else "complete"
+            )
         elif kind == "transport_error":
             # Transport exhaustion is the one retryable state that must remain
             # resumable regardless of what a caller supplied as ``status``.
             status = "incomplete"
+        elif kind in {"setup_error", "protocol_error"}:
+            # Non-scoring setup/protocol evidence must pause the run.  A
+            # complete slot with ``metrics=None`` would look resumable only in
+            # metadata while hiding the reason for the stop.
+            status = "paused"
         if attempts < 1:
             raise ValueError("slot attempts must be positive")
         object.__setattr__(self, "kind", kind)
@@ -364,6 +434,11 @@ class RunManifest:
         object.__setattr__(self, "runtime_cases", MappingProxyType(dict(self.runtime_cases)))
         if self.metrics is not None:
             object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
+        slot_keys = {slot.key for slot in self.slots}
+        if any(slot.prompt_hash != self.prompt_hash for slot in self.slots):
+            raise ValueError("manifest slot prompt hash does not match manifest prompt hash")
+        if any(key not in slot_keys for key in self.results):
+            raise ValueError("manifest contains a result for an unknown slot")
 
     @property
     def pending(self) -> tuple[CallSlot, ...]:
@@ -422,6 +497,9 @@ class RunManifest:
         if any(not isinstance(item, Mapping) for item in results_raw.values()):
             raise ValueError("manifest results must contain objects")
         results = {str(key): SlotResult.from_dict(item) for key, item in results_raw.items()}
+        for key, result in results.items():
+            if result.slot_key is not None and result.slot_key != key:
+                raise ValueError("manifest result slot key does not match its result key")
         case_data = value.get("case_data", {})
         if not isinstance(case_data, Mapping):
             case_data = {}
@@ -463,14 +541,16 @@ def _case_id(case: object) -> str:
     raise ValueError("each evaluation case must expose a string id")
 
 
-def _case_payload(case: object) -> tuple[dict[str, object], object | None, type[BaseModel] | None]:
+def _case_payload(
+    case: object, *, schema: type[BaseModel] | None = None
+) -> tuple[dict[str, object], object | None, type[BaseModel] | None]:
     expected: object | None = None
-    schema: type[BaseModel] | None = None
+    case_schema: type[BaseModel] | None = None
     source = case.case if isinstance(case, ValidatedCase) else case
     if isinstance(case, ValidatedCase):
         expected = case.expected
         if isinstance(case.expected, BaseModel):
-            schema = type(case.expected)
+            case_schema = type(case.expected)
     if isinstance(source, BaseModel):
         payload = _safe_serialize(source)
     elif isinstance(source, Mapping):
@@ -487,8 +567,15 @@ def _case_payload(case: object) -> tuple[dict[str, object], object | None, type[
     elif isinstance(payload.get("expect"), Mapping):
         output = payload["expect"].get("output")
         if isinstance(output, Mapping):
-            payload["expected"] = _redacted(output)
-    return payload, expected, schema
+            if schema is not None:
+                try:
+                    normalized = schema.model_validate(output, extra="forbid")
+                except Exception:
+                    normalized = output
+                payload["expected"] = _redacted(normalized)
+            else:
+                payload["expected"] = _redacted(output)
+    return payload, expected, case_schema
 
 
 def new_manifest(
@@ -515,12 +602,12 @@ def new_manifest(
         if case_id in ids:
             raise ValueError(f"duplicate case id: {case_id}")
         ids.append(case_id)
-        payload, _expected, case_schema = _case_payload(case)
+        payload, _expected, case_schema = _case_payload(case, schema=inferred_schema)
         case_data[case_id] = payload
-        # Keep only a serializable case payload in the manifest object.  The
-        # runner reconstructs an EvalCase when callers do not pass runtime
-        # cases explicitly; no live Pydantic case/expected object is retained.
-        runtime_cases[case_id] = payload
+        # Keep the caller's validated object only as an in-process convenience;
+        # ``to_dict`` intentionally persists ``case_data`` instead.  A fresh
+        # process therefore always reconstructs an EvalCase from that data.
+        runtime_cases[case_id] = case.case if isinstance(case, ValidatedCase) else case
         inferred_schema = inferred_schema or case_schema
     slots = tuple(
         CallSlot(case_id=case_id, repeat_index=repeat, prompt_hash=prompt_hash)
@@ -531,7 +618,11 @@ def new_manifest(
         slots=slots,
         prompt_hash=prompt_hash,
         repeats=repeats,
-        prompt_path=str(prompt_path) if prompt_path is not None else None,
+        prompt_path=(
+            str(_canonical_prompt_path(prompt_path))
+            if prompt_path is not None
+            else None
+        ),
         schema_import=schema_import or _schema_import_reference(inferred_schema),
         case_data=case_data,
         dataset=dataset,
@@ -628,14 +719,27 @@ def record_slot_result(
     )
     results = dict(manifest.results)
     results[slot_key] = safe_result
+    result_status = (
+        "incomplete"
+        if safe_result.kind == "transport_error"
+        else "paused"
+        if safe_result.kind in {"setup_error", "protocol_error"}
+        else "complete"
+        if not pending_slots(replace(manifest, results=results))
+        else "running"
+    )
     updated = replace(
         manifest,
         results=results,
         resumed_at=_now() if existing is not None and existing.is_incomplete else manifest.resumed_at,
         completed_at=_now() if not pending_slots(replace(manifest, results=results)) else None,
-        status="complete" if not pending_slots(replace(manifest, results=results)) else "running",
+        status=result_status,
         metrics=None,
-        stop_reason=None,
+        stop_reason=(
+            safe_result.kind
+            if safe_result.kind in NON_SCORING_KINDS
+            else None
+        ),
     )
     computed = _metrics(updated)
     if computed is not None:
@@ -670,9 +774,23 @@ def _transport_exception(error: BaseException) -> bool:
     )
 
 
+def _protocol_exception(error: BaseException) -> bool:
+    """Recognize response-envelope/protocol failures from SDK type names."""
+
+    names = {cls.__name__.casefold() for cls in type(error).__mro__}
+    return any(
+        "protocol" in name
+        or "envelope" in name
+        or ("response" in name and "validation" in name)
+        for name in names
+    )
+
+
 def classify_exception(error: BaseException) -> ClassifiedResult:
     """Classify SDK failures without using exception-message heuristics."""
 
+    if _protocol_exception(error):
+        return ClassifiedResult("protocol_error", safe_error(error))
     status = _status_code(error)
     if status in (408, 429) or (status is not None and 500 <= status <= 599):
         return ClassifiedResult("transport_error", f"http_status_{status}")
@@ -767,31 +885,39 @@ def _expected_data(manifest: RunManifest, case_id: str) -> object | None:
     return None
 
 
+def _restore_eval_case(case_id: str, payload: object) -> EvalCase:
+    if not isinstance(payload, Mapping):
+        raise CaseSetupError(f"manifest case {case_id!r} is not an object")
+    candidate = dict(payload)
+    # ``expected`` is the canonical production-object snapshot used by the
+    # scorer; it is not part of Task 3's EvalCase input model.
+    candidate.pop("expected", None)
+    try:
+        return EvalCase.model_validate(candidate)
+    except Exception as error:
+        raise CaseSetupError(
+            f"manifest case {case_id!r} cannot be restored as EvalCase: {error}"
+        ) from error
+
+
 def _case_for(manifest: RunManifest, case_id: str, cases: Mapping[str, object] | None) -> object:
     if cases is not None and case_id in cases:
         return cases[case_id]
     if case_id in manifest.runtime_cases:
         runtime_payload = manifest.runtime_cases[case_id]
+        if isinstance(runtime_payload, EvalCase):
+            return runtime_payload
+        if isinstance(runtime_payload, ValidatedCase):
+            return runtime_payload.case
         if isinstance(runtime_payload, Mapping):
-            candidate = dict(runtime_payload)
-            candidate.pop("expected", None)
-            try:
-                return EvalCase.model_validate(candidate)
-            except Exception:
-                return SimpleCase(case_id, runtime_payload)
+            return _restore_eval_case(case_id, runtime_payload)
+        # Direct callers may use a lightweight case double in tests; this
+        # value is never persisted and is not a fallback for a loaded manifest.
+        return runtime_payload
     payload = manifest.case_data.get(case_id)
     if isinstance(payload, Mapping):
-        try:
-            return EvalCase.model_validate(payload)
-        except Exception:
-            return SimpleCase(case_id, payload)
-    return SimpleCase(case_id, {"id": case_id})
-
-
-@dataclass(frozen=True, slots=True)
-class SimpleCase:
-    id: str
-    payload: Mapping[str, object]
+        return _restore_eval_case(case_id, payload)
+    raise CaseSetupError(f"manifest does not contain case {case_id!r}")
 
 
 def _slot_result_from_response(
@@ -855,7 +981,12 @@ def load_adapter(eval_root: Path) -> Callable[[Path, object], Mapping[str, objec
     adapter_path = eval_root / "adapter.py"
     if not adapter_path.is_file():
         raise RuntimeError("adapter.py is missing")
-    name = f"prompt_eval_adapter_{abs(hash(adapter_path.resolve()))}"
+    # Python's built-in hash is randomized per process.  A deterministic module
+    # name keeps the persisted ``schema_import`` compatible across resumes.
+    adapter_identity = hashlib.sha256(
+        str(adapter_path.resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    name = f"prompt_eval_adapter_{adapter_identity}"
     spec = importlib.util.spec_from_file_location(name, adapter_path)
     if spec is None or spec.loader is None:
         raise RuntimeError("unable to load adapter.py")
@@ -877,6 +1008,41 @@ def _invoke(runnable: object, messages: object) -> object:
     return invoke(messages)
 
 
+def _record_setup_failure(
+    manifest: RunManifest, detail: object, output_path: Path | None
+) -> RunManifest:
+    """Persist a non-scoring setup failure without losing the slot plan."""
+
+    current = replace(
+        manifest,
+        started_at=manifest.started_at or _now(),
+        status="running",
+        stop_reason=None,
+        metrics=None,
+    )
+    if output_path is not None:
+        persist_manifest(current, output_path)
+    pending = pending_slots(current)
+    if not pending:
+        current = replace(current, status="paused", stop_reason="setup_error", metrics=None)
+        if output_path is not None:
+            persist_manifest(current, output_path)
+        return current
+    slot = pending[0]
+    return record_slot_result(
+        current,
+        slot.key,
+        SlotResult(
+            kind="setup_error",
+            detail=detail,
+            attempts=1,
+            status="paused",
+            slot_key=slot.key,
+            completed_at=_now(),
+        ),
+    )
+
+
 def execute_run(
     manifest: RunManifest | Path,
     prompt_path: Path | None = None,
@@ -888,9 +1054,13 @@ def execute_run(
     adapter_path: Path | None = None,
     eval_root: Path | None = None,
     credentials_path: Path | None = None,
-    max_retries: int = MAX_RETRIES,
 ) -> RunManifest:
-    """Execute only pending slots and persist after each slot update."""
+    """Execute only pending slots and persist after each slot update.
+
+    Retry ownership stays entirely with the fixed ``ChatOpenAI`` client.  The
+    runner performs one structured invocation per slot; with the client's
+    ``max_retries=2`` that gives no more than three transport attempts total.
+    """
 
     if isinstance(manifest, Path):
         manifest = load_manifest(manifest)
@@ -903,25 +1073,24 @@ def execute_run(
         prompt_path = Path(manifest.prompt_path)
     if prompt_path is None:
         raise ValueError("prompt_path is required")
-    if prepare_call is None:
-        if adapter_path is None and eval_root is not None:
-            adapter_path = eval_root / "adapter.py"
-        if adapter_path is not None:
-            prepare_call = load_adapter(adapter_path.parent)
-    if prepare_call is None:
-        raise ValueError("prepare_call or adapter_path is required")
-    case_map: dict[str, object] | None
-    if isinstance(cases, Mapping):
-        case_map = {str(key): value for key, value in cases.items()}
-    elif cases is not None:
-        case_map = {_case_id(value): (value.case if isinstance(value, ValidatedCase) else value) for value in cases}
-    else:
-        case_map = None
-    if client is None:
-        client = build_client(credentials_path)
 
+    try:
+        _validate_prompt_identity(manifest, prompt_path)
+    except PromptIdentityError as error:
+        paused = replace(
+            manifest,
+            status="paused",
+            stop_reason="setup_error",
+            metrics=None,
+        )
+        if output_path is not None:
+            persist_manifest(paused, output_path)
+        raise PromptIdentityError(str(error)) from None
+
+    canonical_prompt = _canonical_prompt_path(prompt_path)
     current = replace(
         manifest,
+        prompt_path=manifest.prompt_path or str(canonical_prompt),
         started_at=manifest.started_at or _now(),
         resumed_at=_now() if manifest.results else manifest.resumed_at,
         status="running",
@@ -931,69 +1100,93 @@ def execute_run(
     if output_path is not None:
         persist_manifest(current, output_path)
 
-    for slot in pending_slots(current):
-        case_value = _case_for(current, slot.case_id, case_map)
-        started = _now()
-        attempts = 0
-        previous_attempts = current.results.get(slot.key).attempts if slot.key in current.results else 0
-        slot_result: SlotResult | None = None
-        while attempts <= max_retries:
-            attempts += 1
+    adapter_was_loaded = False
+    if prepare_call is None:
+        if adapter_path is None and eval_root is not None:
+            adapter_path = eval_root / "adapter.py"
+        if adapter_path is not None:
             try:
-                call = prepare_call(prompt_path, case_value)
-                if not isinstance(call, Mapping) or "messages" not in call or "schema" not in call:
-                    raise RuntimeError("adapter prepare_call must return messages and schema")
-                schema = call["schema"]
-                if not isinstance(schema, type) or not issubclass(schema, BaseModel):
-                    raise RuntimeError("adapter schema must be a Pydantic BaseModel class")
-                if current.schema_import is not None and current.schema_import != _schema_import_reference(schema):
-                    raise RuntimeError("adapter returned an incompatible Schema")
-                if current.schema_import is None:
-                    current = replace(current, schema_import=_schema_import_reference(schema))
-                structured = client.with_structured_output(
-                    schema,
-                    method="function_calling",
-                    include_raw=True,
-                )
-                response = _invoke(structured, call["messages"])
-                classified = classify_response(response)
-                slot_result = _slot_result_from_response(
-                    current, slot, classified, schema, previous_attempts + attempts
-                )
-                slot_result = replace(slot_result, started_at=started, completed_at=_now())
-                break
+                prepare_call = load_adapter(adapter_path.parent)
+                adapter_was_loaded = True
             except Exception as error:
-                classified_error = classify_exception(error)
-                if classified_error.kind == "transport_error" and attempts <= max_retries:
-                    continue
-                slot_result = SlotResult(
-                    kind=classified_error.kind,
-                    detail=classified_error.detail,
-                    attempts=previous_attempts + attempts,
-                    status="incomplete" if classified_error.kind == "transport_error" else "complete",
-                    slot_key=slot.key,
-                    started_at=started,
-                    completed_at=_now(),
+                return _record_setup_failure(current, safe_error(error), output_path)
+    if prepare_call is None:
+        return _record_setup_failure(
+            current, "prepare_call or adapter_path is required", output_path
+        )
+    if not callable(prepare_call):
+        return _record_setup_failure(
+            current, "adapter prepare_call is not callable", output_path
+        )
+
+    try:
+        if isinstance(cases, Mapping):
+            case_map: dict[str, object] | None = {
+                str(key): (
+                    value.case if isinstance(value, ValidatedCase) else value
                 )
-                break
-        if slot_result is None:
+                for key, value in cases.items()
+            }
+        elif cases is not None:
+            case_map = {
+                _case_id(value): (
+                    value.case if isinstance(value, ValidatedCase) else value
+                )
+                for value in cases
+            }
+        else:
+            case_map = None
+    except Exception as error:
+        return _record_setup_failure(current, safe_error(error), output_path)
+
+    if client is None:
+        try:
+            client = build_client(credentials_path)
+        except Exception as error:
+            return _record_setup_failure(current, safe_error(error), output_path)
+
+    for slot in pending_slots(current):
+        started = _now()
+        previous_attempts = current.results.get(slot.key).attempts if slot.key in current.results else 0
+        try:
+            case_value = _case_for(current, slot.case_id, case_map)
+            if adapter_was_loaded and not isinstance(case_value, EvalCase):
+                raise CaseSetupError(
+                    "adapter prepare_call requires a validated EvalCase"
+                )
+            call = prepare_call(canonical_prompt, case_value)
+            if not isinstance(call, Mapping) or "messages" not in call or "schema" not in call:
+                raise RuntimeError("adapter prepare_call must return messages and schema")
+            schema = call["schema"]
+            if not isinstance(schema, type) or not issubclass(schema, BaseModel):
+                raise RuntimeError("adapter schema must be a Pydantic BaseModel class")
+            if current.schema_import is not None and current.schema_import != _schema_import_reference(schema):
+                raise RuntimeError("adapter returned an incompatible Schema")
+            if current.schema_import is None:
+                current = replace(current, schema_import=_schema_import_reference(schema))
+            structured = client.with_structured_output(
+                schema,
+                method="function_calling",
+                include_raw=True,
+            )
+            response = _invoke(structured, call["messages"])
+            classified = classify_response(response)
+            slot_result = _slot_result_from_response(
+                current, slot, classified, schema, previous_attempts + 1
+            )
+            slot_result = replace(slot_result, started_at=started, completed_at=_now())
+        except Exception as error:
+            classified_error = classify_exception(error)
             slot_result = SlotResult(
-                kind="setup_error",
-                detail="slot did not produce a result",
-                attempts=previous_attempts + attempts,
+                kind=classified_error.kind,
+                detail=classified_error.detail,
+                attempts=previous_attempts + 1,
                 slot_key=slot.key,
                 started_at=started,
                 completed_at=_now(),
             )
         current = record_slot_result(current, slot.key, slot_result)
-        if current.results[slot.key].kind in {"setup_error", "transport_error", "protocol_error"}:
-            current = replace(
-                current,
-                status="incomplete" if current.results[slot.key].kind == "transport_error" else "paused",
-                stop_reason=current.results[slot.key].kind,
-            )
-            if current.manifest_path is not None:
-                persist_manifest(current, current.manifest_path)
+        if current.results[slot.key].kind in NON_SCORING_KINDS:
             break
 
     if not pending_slots(current) and current.status == "running":
@@ -1074,6 +1267,53 @@ def _load_cli_cases(path: Path) -> list[EvalCase]:
         raise RuntimeError("case dataset contains an invalid case") from None
 
 
+def _schema_from_adapter(
+    prepare_call: Callable[[Path, object], Mapping[str, object]],
+    prompt_path: Path,
+    case: EvalCase,
+) -> type[BaseModel]:
+    """Discover the production Schema through the Task 3 adapter boundary."""
+
+    try:
+        call = prepare_call(prompt_path, case)
+    except Exception as error:
+        raise CaseSetupError(f"adapter schema discovery failed: {safe_error(error)}") from None
+    if not isinstance(call, Mapping) or "schema" not in call:
+        raise CaseSetupError("adapter prepare_call must return a production schema")
+    schema = call["schema"]
+    if not isinstance(schema, type) or not issubclass(schema, BaseModel):
+        raise CaseSetupError("adapter schema must be a Pydantic BaseModel class")
+    return schema
+
+
+def _validated_external_cases(
+    cases: Sequence[EvalCase], schema: type[BaseModel]
+) -> list[ValidatedCase]:
+    """Validate an explicitly supplied external split with the production Schema."""
+
+    validated: list[ValidatedCase] = []
+    for index, case in enumerate(cases):
+        output = case.expect.get("output")
+        if not isinstance(output, Mapping):
+            raise CaseSetupError(
+                f"external case {case.id!r} expect must contain an output object"
+            )
+        try:
+            expected = schema.model_validate(output, extra="forbid")
+        except Exception as error:
+            raise CaseSetupError(
+                f"external case {case.id!r} has an invalid expect.output at item {index}: {error}"
+            ) from None
+        missing = sorted(set(schema.model_fields) - set(expected.model_fields_set))
+        if missing:
+            raise CaseSetupError(
+                f"external case {case.id!r} expect.output is missing schema field(s): "
+                + ", ".join(missing)
+            )
+        validated.append(ValidatedCase(case=case, expected=expected))
+    return validated
+
+
 def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--eval-root", type=Path, required=True)
@@ -1092,13 +1332,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset_path = args.eval_root / "external-cases.yaml"
     else:
         dataset_path = args.eval_root / f"{args.dataset}-cases.yaml"
+    prepare_call: Callable[[Path, object], Mapping[str, object]] | None = None
     if args.manifest.exists():
         manifest = load_manifest(args.manifest)
     else:
-        import hashlib
-
         prompt_hash = args.prompt_hash or hashlib.sha256(args.prompt.read_bytes()).hexdigest()
-        cases = _load_cli_cases(dataset_path)
+        raw_cases = _load_cli_cases(dataset_path)
+        # Establish a durable slot plan before importing project code.  If the
+        # adapter or case validation fails, that plan becomes the paused
+        # setup-error evidence instead of disappearing with the exception.
+        provisional = new_manifest(
+            raw_cases,
+            args.repeats,
+            prompt_hash,
+            prompt_path=args.prompt,
+            manifest_path=args.manifest,
+            dataset=args.dataset,
+        )
+        try:
+            prepare_call = load_adapter(args.eval_root)
+            if not raw_cases:
+                raise CaseSetupError("selected case dataset must not be empty")
+            schema = _schema_from_adapter(prepare_call, args.prompt, raw_cases[0])
+            if args.dataset == "external":
+                cases = _validated_external_cases(raw_cases, schema)
+            else:
+                suite = load_case_suite(
+                    {
+                        "dev": args.eval_root / "dev-cases.yaml",
+                        "validation": args.eval_root / "validation-cases.yaml",
+                        "acceptance": args.eval_root / "acceptance-cases.yaml",
+                    },
+                    schema,
+                )
+                cases = list(suite[args.dataset])
+        except Exception as error:
+            result = _record_setup_failure(
+                provisional, safe_error(error), args.manifest
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": result.status,
+                        "pending": len(result.pending),
+                        "metrics": _redacted(result.metrics),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0 if result.status == "complete" else 2
         manifest = new_manifest(
             cases,
             args.repeats,
@@ -1106,11 +1388,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             prompt_path=args.prompt,
             manifest_path=args.manifest,
             dataset=args.dataset,
+            schema=schema,
         )
     result = execute_run(
         manifest,
         prompt_path=args.prompt,
-        adapter_path=args.eval_root / "adapter.py",
+        prepare_call=prepare_call,
+        adapter_path=args.eval_root / "adapter.py" if prepare_call is None else None,
         manifest_path=args.manifest,
         credentials_path=args.credentials,
     )
