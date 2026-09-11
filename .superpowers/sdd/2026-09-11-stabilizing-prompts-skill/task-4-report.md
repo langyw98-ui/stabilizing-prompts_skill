@@ -42,3 +42,12 @@ that file.
 - `git diff --check`: passed.
 - Secret scan found only intentional schema names, documentation examples, and
   temporary-test sentinel literals; no real credential or generated output.
+
+## Fix round 1
+
+- Updated the Task 4 brief so Ruling 4 explicitly supersedes the obsolete
+  tracked-code Token instruction.
+- The brief now consistently documents Skill-root
+  `.local/model-credentials.json` loading, temporary sentinel paths for tests,
+  the exact `.gitignore` rule, strict one-field validation, and no implicit
+  credential installation or output.
