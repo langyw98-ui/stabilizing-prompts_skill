@@ -72,8 +72,12 @@ After the contract confirmation gate, `run_prompt_eval.py` loads only the
 selected split:
 
 ```text
-run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH
+run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH [--mode tune|verify]
 ```
+
+The runner defaults to `--mode tune` for the final acceptance activity. A
+read-only caller must pass `--mode verify`; that mode rejects `--dataset
+acceptance` before opening any manifest or case file.
 
 Development and validation runs therefore do not require or read the
 acceptance file. Only the single final acceptance activity owned by `tune` may

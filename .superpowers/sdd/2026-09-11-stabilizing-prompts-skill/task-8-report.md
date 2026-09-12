@@ -89,6 +89,44 @@ Task 4/5 files (`scripts/local_model_client.py`,
 not modify those files. No real model call was made and no real Token was read
 or stored.
 
+## Fix round 1: executable CLI and mode boundary
+
+The validation scripts now expose the documented `argparse` interfaces,
+`main()` functions, and `__main__` entry points. They reuse the existing
+validation functions, write stable JSON snapshots/suite summaries, redact
+credential-shaped output, and return exit code 2 for setup or validation
+errors. Help and unknown-argument behavior is delegated to argparse.
+
+`run_prompt_eval.py` now accepts `--mode tune|verify` (defaulting to `tune` to
+preserve existing callers), persists the mode in manifests, and rejects
+`--mode verify --dataset acceptance` immediately after argument parsing. The
+guard runs before manifest/case reads, adapter loading, client construction,
+or model invocation; acceptance remains available to the upper `tune` state
+machine. SKILL.md and the runner references include the same optional mode
+argument and explicit ownership rule.
+
+The fix-round regression coverage includes direct `main()` success/failure
+checks, subprocess help/unknown-argument probes for all three CLIs, and a
+mocked early-rejection test proving that verify acceptance does not touch case,
+adapter, or client boundaries. No real model call or credential read was
+performed.
+
+Fix-round verification:
+
+```text
+rtk conda run -n kds python -m pytest tests/test_validate_workspace.py tests/test_validate_cases.py tests/test_run_prompt_eval.py -q
+65 passed
+
+rtk conda run -n kds python -m pytest tests -q
+146 passed in 72.51s
+
+rtk conda run -n kds python C:/Users/kgcda/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
+Skill is valid!
+
+rtk git diff --check
+clean
+```
+
 ## Commit
 
 Implementation commit: `d859968fe44ae32074ac5372cd2e8a58499c2ebf`

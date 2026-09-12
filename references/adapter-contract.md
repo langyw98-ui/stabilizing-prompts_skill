@@ -50,8 +50,12 @@ a Prompt score.
 For ordinary evaluation the adapter is consumed through:
 
 ```text
-run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH
+run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH [--mode tune|verify]
 ```
+
+The runner defaults to `--mode tune`; verification passes `--mode verify` and
+cannot select the acceptance dataset. This boundary is enforced before the
+adapter is imported or a model client is constructed.
 
 The selected `PATH` may be a runtime candidate, but the renderer, message
 assembly, Schema, fixed request configuration, and call-slot identity must be

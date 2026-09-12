@@ -153,9 +153,9 @@ repository or worktree and is never taken from model output.
 - Commands (five repetitions each):
 
   ```text
-  run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev --repeats 5 --manifest DEV_BASELINE_MANIFEST
+  run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev --repeats 5 --manifest DEV_BASELINE_MANIFEST --mode tune
   score_results.py --manifest DEV_BASELINE_MANIFEST --report DEV_BASELINE_REPORT
-  run_prompt_eval.py --eval-root PATH --prompt PATH --dataset validation --repeats 5 --manifest VALIDATION_BASELINE_MANIFEST
+  run_prompt_eval.py --eval-root PATH --prompt PATH --dataset validation --repeats 5 --manifest VALIDATION_BASELINE_MANIFEST --mode tune
   score_results.py --manifest VALIDATION_BASELINE_MANIFEST --report VALIDATION_BASELINE_REPORT
   ```
 
@@ -220,8 +220,8 @@ new baseline; it is not fed into this cycle's acceptance.
   each prompt):
 
   ```text
-  run_prompt_eval.py --eval-root PATH --prompt ORIGINAL_PATH --dataset acceptance --repeats 10 --manifest ACCEPTANCE_BASELINE_MANIFEST
-  run_prompt_eval.py --eval-root PATH --prompt FROZEN_CANDIDATE_PATH --dataset acceptance --repeats 10 --manifest ACCEPTANCE_CANDIDATE_MANIFEST
+  run_prompt_eval.py --eval-root PATH --prompt ORIGINAL_PATH --dataset acceptance --repeats 10 --manifest ACCEPTANCE_BASELINE_MANIFEST --mode tune
+  run_prompt_eval.py --eval-root PATH --prompt FROZEN_CANDIDATE_PATH --dataset acceptance --repeats 10 --manifest ACCEPTANCE_CANDIDATE_MANIFEST --mode tune
   score_results.py --manifest ACCEPTANCE_BASELINE_MANIFEST --report ACCEPTANCE_BASELINE_REPORT
   score_results.py --manifest ACCEPTANCE_CANDIDATE_MANIFEST --report ACCEPTANCE_CANDIDATE_REPORT
   compare_runs.py --baseline ACCEPTANCE_BASELINE_MANIFEST --candidate ACCEPTANCE_CANDIDATE_MANIFEST --phase acceptance --report ACCEPTANCE_COMPARISON
@@ -306,13 +306,18 @@ uses `--mode verify`; only `tune` may select `--dataset acceptance`.
 ```text
 validate_workspace.py --repo PATH --prompt REPO_RELATIVE_MD --mode tune|verify --output WORKSPACE_JSON
 validate_cases.py --eval-root PATH --schema MODULE:CLASS --output CASE_SUITE_JSON
-run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH
+run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH [--mode tune|verify]
 score_results.py --manifest PATH --report PATH
 compare_runs.py --baseline PATH --candidate PATH --phase development|validation|acceptance --report PATH
 manage_worktree.py create --repo PATH --prompt-id ID --state PATH
 manage_worktree.py build-patch --state PATH --out PATCH --out-manifest PATCH_JSON --result success|failure
 manage_worktree.py apply-patch --state PATH --patch PATCH --patch-manifest PATCH_JSON
 ```
+
+The runner defaults to `--mode tune`; callers running the read-only workflow
+must pass `--mode verify`. A verify invocation rejects `--dataset acceptance`
+before opening any manifest or case file, importing the adapter, or
+constructing the model client.
 
 ## verify
 
@@ -333,7 +338,7 @@ constructing the model client. It must not read or run `acceptance-cases.yaml`
    with `validate_cases.py --eval-root PATH --schema MODULE:CLASS --output CASE_SUITE_JSON`
    or the external-case contract.
 3. Run the selected prompt using
-   `run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|external --repeats N --manifest PATH`,
+   `run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|external --repeats N --manifest PATH --mode verify`,
    then use `score_results.py --manifest PATH --report PATH` and, when a saved
    baseline exists, `compare_runs.py --baseline PATH --candidate PATH --phase development|validation --report PATH`.
 4. Write only ignored report/cache outputs. Report deterministic metrics,

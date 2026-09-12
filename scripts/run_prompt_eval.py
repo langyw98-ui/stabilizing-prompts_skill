@@ -71,6 +71,10 @@ class PromptIdentityError(ValueError):
     """Raised when a resume target does not match its manifest identity."""
 
 
+class UsageError(ValueError):
+    """Raised when a runner mode and dataset combination is forbidden."""
+
+
 def _canonical_prompt_path(path: Path | str) -> Path:
     return Path(path).resolve(strict=False)
 
@@ -471,6 +475,7 @@ class RunManifest:
     schema_import: str | None = None
     case_data: Mapping[str, object] = field(default_factory=dict)
     dataset: str | None = None
+    mode: str = "tune"
     cycle_id: str | None = None
     manifest_path: Path | None = field(default=None, repr=False, compare=False)
     started_at: str | None = None
@@ -488,6 +493,10 @@ class RunManifest:
         object.__setattr__(self, "case_data", MappingProxyType(dict(self.case_data)))
         object.__setattr__(self, "client_config", MappingProxyType(dict(self.client_config)))
         object.__setattr__(self, "runtime_cases", MappingProxyType(dict(self.runtime_cases)))
+        if self.mode not in {"tune", "verify"}:
+            raise ValueError("manifest mode must be tune or verify")
+        if self.mode == "verify" and self.dataset == "acceptance":
+            raise UsageError("verify mode cannot use the acceptance dataset")
         if self.metrics is not None:
             object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
         slot_keys = {slot.key for slot in self.slots}
@@ -521,6 +530,7 @@ class RunManifest:
             "prompt_path": self.prompt_path,
             "repeats": self.repeats,
             "dataset": self.dataset,
+            "mode": self.mode,
             "cycle_id": self.cycle_id,
             "schema_import": self.schema_import,
             "slots": [slot.to_dict() for slot in self.slots],
@@ -574,6 +584,7 @@ class RunManifest:
             schema_import=value.get("schema_import") if isinstance(value.get("schema_import"), str) else None,
             case_data=case_data,
             dataset=value.get("dataset") if isinstance(value.get("dataset"), str) else None,
+            mode=value.get("mode", "tune") if isinstance(value.get("mode", "tune"), str) else "tune",
             cycle_id=value.get("cycle_id") if isinstance(value.get("cycle_id"), str) else None,
             manifest_path=manifest_path,
             started_at=value.get("started_at") if isinstance(value.get("started_at"), str) else None,
@@ -644,6 +655,7 @@ def new_manifest(
     schema_import: str | None = None,
     manifest_path: Path | None = None,
     dataset: str | None = None,
+    mode: str = "tune",
     cycle_id: str | None = None,
     client_config: Mapping[str, object] | None = None,
 ) -> RunManifest:
@@ -682,6 +694,7 @@ def new_manifest(
         schema_import=schema_import or _schema_import_reference(inferred_schema),
         case_data=case_data,
         dataset=dataset,
+        mode=mode,
         cycle_id=cycle_id,
         manifest_path=manifest_path,
         status="planned",
@@ -1143,6 +1156,8 @@ def execute_run(
         manifest = load_manifest(manifest)
     if not isinstance(manifest, RunManifest):
         raise TypeError("execute_run expects a RunManifest or manifest path")
+    if manifest.mode == "verify" and manifest.dataset == "acceptance":
+        raise UsageError("verify mode cannot use the acceptance dataset")
     output_path = manifest_path or manifest.manifest_path
     if output_path is not None and manifest.manifest_path != output_path:
         manifest = replace(manifest, manifest_path=output_path)
@@ -1400,6 +1415,12 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", type=Path, required=True)
     parser.add_argument("--dataset", choices=("dev", "validation", "acceptance", "external"), required=True)
     parser.add_argument(
+        "--mode",
+        choices=("tune", "verify"),
+        default="tune",
+        help="workflow owner; verify cannot select the acceptance dataset",
+    )
+    parser.add_argument(
         "--repeats",
         type=int,
         default=None,
@@ -1414,6 +1435,16 @@ def _cli_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _cli_parser()
     args = parser.parse_args(argv)
+    # This guard intentionally runs immediately after argparse.  In
+    # particular, it precedes manifest reads, case-file reads, adapter import,
+    # client construction, and every model invocation.
+    if args.mode == "verify" and args.dataset == "acceptance":
+        payload = {
+            "status": "error",
+            "error": "verify mode cannot use the acceptance dataset",
+        }
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 2
     default_repeats = DEFAULT_PHASE_REPEATS.get(args.dataset, 5)
     repeats = default_repeats if args.repeats is None else args.repeats
     if repeats < 1:
@@ -1432,6 +1463,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest = load_manifest(args.manifest)
         if manifest.dataset != args.dataset:
             parser.error("manifest dataset does not match --dataset")
+        if manifest.mode != args.mode:
+            parser.error("manifest mode does not match --mode")
         if manifest.repeats != repeats:
             parser.error(
                 f"manifest repeats {manifest.repeats} do not match required {repeats}"
@@ -1449,6 +1482,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             prompt_path=args.prompt,
             manifest_path=args.manifest,
             dataset=args.dataset,
+            mode=args.mode,
         )
         try:
             prepare_call = load_adapter(args.eval_root)
@@ -1483,6 +1517,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             prompt_path=args.prompt,
             manifest_path=args.manifest,
             dataset=args.dataset,
+            mode=args.mode,
             schema=schema,
         )
     result = execute_run(
@@ -1493,7 +1528,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest_path=args.manifest,
         credentials_path=args.credentials,
     )
-    print(json.dumps({"status": result.status, "pending": len(result.pending), "metrics": _redacted(result.metrics)}, ensure_ascii=False))
+    print(json.dumps({"status": result.status, "mode": result.mode, "pending": len(result.pending), "metrics": _redacted(result.metrics)}, ensure_ascii=False))
     return 0 if result.status == "complete" else 2
 
 
@@ -1504,6 +1539,7 @@ __all__ = [
     "DEFAULT_PHASE_REPEATS",
     "RunManifest",
     "SlotResult",
+    "UsageError",
     "classify_exception",
     "classify_parsing_failure",
     "classify_response",

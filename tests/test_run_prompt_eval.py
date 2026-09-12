@@ -4,6 +4,8 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import httpx
@@ -487,6 +489,41 @@ def test_cli_uses_task3_validation_and_canonical_expected_alias(tmp_path: Path, 
     assert "status" in capsys.readouterr().out
 
 
+def test_runner_cli_help_and_unknown_argument_are_real_argparse_contracts() -> None:
+    root = Path(__file__).resolve().parents[1]
+    help_result = subprocess.run(
+        [sys.executable, "-m", "scripts.run_prompt_eval", "--help"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    garbage_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.run_prompt_eval",
+            "--eval-root",
+            str(root),
+            "--prompt",
+            "SKILL.md",
+            "--dataset",
+            "dev",
+            "--manifest",
+            str(root / "does-not-exist.json"),
+            "--garbage",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert help_result.returncode == 0
+    assert "--mode" in help_result.stdout
+    assert garbage_result.returncode != 0
+
+
 @pytest.mark.parametrize("dataset", ["dev", "validation"])
 def test_cli_loads_selected_non_acceptance_split_without_acceptance_file(
     dataset: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -566,6 +603,91 @@ def test_cli_loads_selected_non_acceptance_split_without_acceptance_file(
     assert payload["dataset"] == dataset
     assert list(payload["case_data"]) == [case_id]
     assert payload["results"][f"{case_id}:0:{hashlib.sha256(prompt.read_bytes()).hexdigest()}"]["kind"] == "pass"
+    assert "status" in capsys.readouterr().out
+
+
+def test_verify_rejects_acceptance_before_reading_cases_or_loading_adapter_or_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("prompt\n", encoding="utf-8")
+    acceptance = eval_root / "acceptance-cases.yaml"
+    acceptance.write_text("this must not be read\n", encoding="utf-8")
+    manifest = eval_root / "run.json"
+    calls: list[str] = []
+
+    def fail_load(_path: Path) -> object:
+        calls.append("cases")
+        raise AssertionError("acceptance cases were loaded")
+
+    def fail_adapter(_path: Path) -> object:
+        calls.append("adapter")
+        raise AssertionError("adapter was loaded")
+
+    def fail_client(_path: Path | None = None) -> object:
+        calls.append("client")
+        raise AssertionError("client was built")
+
+    monkeypatch.setattr("scripts.run_prompt_eval._load_cli_cases", fail_load)
+    monkeypatch.setattr("scripts.run_prompt_eval.load_adapter", fail_adapter)
+    monkeypatch.setattr("scripts.run_prompt_eval.build_client", fail_client)
+
+    exit_code = main(
+        [
+            "--mode",
+            "verify",
+            "--eval-root",
+            str(eval_root),
+            "--prompt",
+            str(prompt),
+            "--dataset",
+            "acceptance",
+            "--manifest",
+            str(manifest),
+        ]
+    )
+
+    assert exit_code == 2
+    assert calls == []
+    assert not manifest.exists()
+
+
+def test_tune_acceptance_remains_available_to_upper_layer_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("prompt\n", encoding="utf-8")
+    (eval_root / "acceptance-cases.yaml").write_text("[]\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "scripts.run_prompt_eval.load_adapter",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("expected setup stop")),
+    )
+
+    exit_code = main(
+        [
+            "--mode",
+            "tune",
+            "--eval-root",
+            str(eval_root),
+            "--prompt",
+            str(prompt),
+            "--dataset",
+            "acceptance",
+            "--repeats",
+            "10",
+            "--manifest",
+            str(eval_root / "run.json"),
+        ]
+    )
+
+    assert exit_code == 2
     assert "status" in capsys.readouterr().out
 
 

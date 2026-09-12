@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from scripts.validate_workspace import (
     WorkspaceError,
+    main,
     prompt_id_for_path,
     validate_workspace,
 )
@@ -259,3 +262,88 @@ def test_snapshot_contains_head_hash_and_prompt_metadata(
     assert len(snapshot.prompt_hash) == 64
     assert snapshot.prompt_id == prompt_id_for_path("prompts/classify.md")
     assert snapshot.python_command == ("conda", "run", "-n", "kds", "python")
+
+
+def test_workspace_cli_writes_machine_readable_snapshot(
+    repo_with_prompt: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, prompt = repo_with_prompt
+    monkeypatch.setattr("scripts.validate_workspace._ensure_kds_environment", lambda: None)
+    output = tmp_path / "workspace.json"
+
+    assert (
+        main(
+            [
+                "--repo",
+                str(repo),
+                "--prompt",
+                str(prompt.relative_to(repo)),
+                "--mode",
+                "verify",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["status"] == "valid"
+    assert payload["mode"] == "verify"
+    assert payload["prompt_path"] == "prompts/classify.md"
+    assert payload["prompt_id"] == prompt_id_for_path("prompts/classify.md")
+    assert payload["python_command"] == ["conda", "run", "-n", "kds", "python"]
+
+
+def test_workspace_cli_writes_explicit_error_for_validation_failure(
+    repo_with_prompt: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _prompt = repo_with_prompt
+    monkeypatch.setattr("scripts.validate_workspace._ensure_kds_environment", lambda: None)
+    output = tmp_path / "workspace-error.json"
+
+    assert (
+        main(
+            [
+                "--repo",
+                str(repo),
+                "--prompt",
+                "missing.md",
+                "--mode",
+                "tune",
+                "--output",
+                str(output),
+            ]
+        )
+        == 2
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["status"] == "error"
+    assert "error" in payload and payload["error"]
+
+
+def test_workspace_cli_help_and_unknown_argument_are_real_argparse_contracts() -> None:
+    root = Path(__file__).resolve().parents[1]
+    help_result = subprocess.run(
+        [sys.executable, "-m", "scripts.validate_workspace", "--help"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    garbage_result = subprocess.run(
+        [sys.executable, "-m", "scripts.validate_workspace", "--garbage"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert help_result.returncode == 0
+    assert "--mode" in help_result.stdout
+    assert garbage_result.returncode != 0

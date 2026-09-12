@@ -679,7 +679,7 @@ For every state, name the supporting script command, required input files, gener
 ```text
 validate_workspace.py --repo PATH --prompt REPO_RELATIVE_MD --mode tune|verify --output WORKSPACE_JSON
 validate_cases.py --eval-root PATH --schema MODULE:CLASS --output CASE_SUITE_JSON
-run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH
+run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH [--mode tune|verify]
 score_results.py --manifest PATH --report PATH
 compare_runs.py --baseline PATH --candidate PATH --phase development|validation|acceptance --report PATH
 manage_worktree.py create --repo PATH --prompt-id ID --state PATH

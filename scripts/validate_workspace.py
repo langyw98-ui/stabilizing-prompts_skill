@@ -7,9 +7,11 @@ stages can consume an immutable snapshot instead of re-discovering it.
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Sequence
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -296,3 +298,93 @@ def validate_workspace(
         prompt_hash=prompt_hash,
         prompt_id=prompt_id,
     )
+
+
+def _safe_error(error: BaseException) -> str:
+    """Return a concise error without exposing credential-shaped values."""
+
+    text = str(error).replace("\x00", "")
+    text = re.sub(
+        r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;\"']+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)(\bbearer\s+)[^\s,;\"']+", r"\1[REDACTED]", text)
+    text = re.sub(
+        r"(?i)((?:authorization[_-]?token|api[_-]?key|access[_-]?token|token|secret)\s*[:=]\s*)[\"']?[^\s,;\"']+",
+        r"\1[REDACTED]",
+        text,
+    )
+    return text or type(error).__name__
+
+
+def _snapshot_payload(snapshot: WorkspaceSnapshot, mode: str) -> dict[str, object]:
+    """Convert a validated snapshot to the stable JSON CLI representation."""
+
+    return {
+        "status": "valid",
+        "mode": mode,
+        "repo_root": str(snapshot.repo_root),
+        "head_commit": snapshot.head_commit,
+        "prompt_path": snapshot.prompt_path,
+        "prompt_hash": snapshot.prompt_hash,
+        "prompt_id": snapshot.prompt_id,
+        "python_command": list(snapshot.python_command),
+        "python_version": snapshot.python_version,
+    }
+
+
+def _write_json(path: Path, payload: object) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, required=True, help="Git repository root")
+    parser.add_argument(
+        "--prompt",
+        type=Path,
+        required=True,
+        help="one repository-relative Markdown prompt path",
+    )
+    parser.add_argument("--mode", choices=("tune", "verify"), required=True)
+    parser.add_argument("--output", type=Path, required=True, help="snapshot JSON path")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Validate a workspace and write a machine-readable snapshot."""
+
+    args = _parser().parse_args(argv)
+    try:
+        snapshot = validate_workspace(args.repo, args.prompt, ())
+        payload = _snapshot_payload(snapshot, args.mode)
+        _write_json(args.output, payload)
+    except (WorkspaceError, OSError, ValueError, TypeError) as error:
+        payload = {"status": "error", "error": _safe_error(error)}
+        try:
+            _write_json(args.output, payload)
+        except OSError as write_error:
+            payload["error"] = f"{payload['error']}; unable to write output: {_safe_error(write_error)}"
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 2
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+__all__ = [
+    "WorkspaceError",
+    "WorkspaceSnapshot",
+    "main",
+    "prompt_id_for_path",
+    "validate_workspace",
+]
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by CLI probes
+    raise SystemExit(main())

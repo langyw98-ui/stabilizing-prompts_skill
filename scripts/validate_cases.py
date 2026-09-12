@@ -8,12 +8,15 @@ keep validation and acceptance data from leaking into development data.
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
+import importlib
 import json
 from pathlib import Path
 import re
+import sys
 from typing import Any, Literal, TypeVar
 import unicodedata
 
@@ -432,6 +435,170 @@ def dataset_hash(suite: CaseSuite) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _load_schema(reference: str, eval_root: Path) -> type[BaseModel]:
+    """Import a production Schema from the documented ``MODULE:CLASS`` form."""
+
+    if not isinstance(reference, str) or reference.count(":") != 1:
+        raise CaseSetupError("--schema must use MODULE:CLASS")
+    module_name, qualname = (part.strip() for part in reference.split(":", 1))
+    if not module_name or not qualname or any(
+        part in {"", ".", "..", "<locals>"} for part in qualname.split(".")
+    ):
+        raise CaseSetupError("--schema must use MODULE:CLASS")
+
+    root_text = str(Path(eval_root).resolve(strict=False))
+    added_root = root_text not in sys.path
+    if added_root:
+        sys.path.insert(0, root_text)
+    try:
+        try:
+            module: object = importlib.import_module(module_name)
+        except Exception as error:
+            raise CaseSetupError(
+                f"unable to import Schema module {module_name!r}: {type(error).__name__}"
+            ) from None
+    finally:
+        if added_root:
+            try:
+                sys.path.remove(root_text)
+            except ValueError:
+                pass
+
+    value: object = module
+    try:
+        for name in qualname.split("."):
+            value = getattr(value, name)
+    except AttributeError:
+        raise CaseSetupError(
+            f"Schema class {qualname!r} is not defined by module {module_name!r}"
+        ) from None
+    try:
+        is_schema = isinstance(value, type) and issubclass(value, BaseModel)
+    except TypeError:
+        is_schema = False
+    if not is_schema:
+        raise CaseSetupError(f"Schema {reference!r} must be a Pydantic BaseModel subclass")
+    return value
+
+
+_SENSITIVE_OUTPUT_KEY = {
+    "authorization",
+    "authorization_token",
+    "api_key",
+    "apikey",
+    "access_token",
+    "password",
+    "secret",
+    "token",
+}
+
+
+def _redact_cli_value(value: object) -> object:
+    """Redact credential-shaped values before emitting case evidence."""
+
+    if isinstance(value, Mapping):
+        result: dict[object, object] = {}
+        for key, item in value.items():
+            if isinstance(key, str) and key.casefold().replace("-", "_") in _SENSITIVE_OUTPUT_KEY:
+                result[key] = "[REDACTED]"
+            else:
+                result[key] = _redact_cli_value(item)
+        return result
+    if isinstance(value, list):
+        return [_redact_cli_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_cli_value(item) for item in value]
+    if isinstance(value, str):
+        text = re.sub(
+            r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;\"']+",
+            r"\1[REDACTED]",
+            value,
+        )
+        return re.sub(r"(?i)(\bbearer\s+)[^\s,;\"']+", r"\1[REDACTED]", text)
+    return value
+
+
+def _suite_payload(suite: CaseSuite, eval_root: Path, schema_ref: str) -> dict[str, object]:
+    """Build the stable JSON representation written by the validation CLI."""
+
+    return {
+        "status": "valid",
+        "eval_root": str(eval_root.resolve(strict=False)),
+        "schema": schema_ref,
+        "dataset_hash": dataset_hash(suite),
+        "splits": {
+            split: [_redact_cli_value(_canonical_case(item)) for item in suite[split]]
+            for split in _SPLITS
+        },
+        "counts": {split: len(suite[split]) for split in _SPLITS},
+    }
+
+
+def _safe_error(error: BaseException) -> str:
+    """Format CLI errors without exposing credential-shaped values."""
+
+    text = str(error).replace("\x00", "")
+    text = re.sub(
+        r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;\"']+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)(\bbearer\s+)[^\s,;\"']+", r"\1[REDACTED]", text)
+    text = re.sub(
+        r"(?i)((?:authorization[_-]?token|api[_-]?key|access[_-]?token|token|secret)\s*[:=]\s*)[\"']?[^\s,;\"']+",
+        r"\1[REDACTED]",
+        text,
+    )
+    return text or type(error).__name__
+
+
+def _write_json(path: Path, payload: object) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--eval-root", type=Path, required=True, help="evaluation asset directory")
+    parser.add_argument(
+        "--schema",
+        dest="schema_ref",
+        required=True,
+        help="production Pydantic Schema import reference MODULE:CLASS",
+    )
+    parser.add_argument("--output", type=Path, required=True, help="validated suite JSON path")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Validate all three case splits and write a machine-readable summary."""
+
+    args = _parser().parse_args(argv)
+    try:
+        eval_root = args.eval_root.resolve(strict=False)
+        if not eval_root.is_dir():
+            raise CaseSetupError(f"evaluation root does not exist: {args.eval_root}")
+        schema = _load_schema(args.schema_ref, eval_root)
+        paths = tuple(eval_root / f"{split}-cases.yaml" for split in _SPLITS)
+        suite = load_case_suite(paths, schema)
+        payload = _suite_payload(suite, eval_root, args.schema_ref)
+        _write_json(args.output, payload)
+    except (CaseSetupError, OSError, ValueError, TypeError) as error:
+        payload = {"status": "error", "error": _safe_error(error)}
+        try:
+            _write_json(args.output, payload)
+        except OSError as write_error:
+            payload["error"] = f"{payload['error']}; unable to write output: {_safe_error(write_error)}"
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 2
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 __all__ = [
     "CaseSetupError",
     "CaseSuite",
@@ -440,4 +607,9 @@ __all__ = [
     "dataset_hash",
     "load_case_split",
     "load_case_suite",
+    "main",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by CLI probes
+    raise SystemExit(main())

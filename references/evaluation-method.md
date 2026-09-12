@@ -89,10 +89,14 @@ The runner, scorer, and comparator are the executable boundary for the
 workflow states:
 
 ```text
-run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH
+run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH [--mode tune|verify]
 score_results.py --manifest PATH --report PATH
 compare_runs.py --baseline PATH --candidate PATH --phase development|validation|acceptance --report PATH
 ```
+
+The runner defaults to `--mode tune`; read-only verification must pass
+`--mode verify`, which rejects the acceptance dataset before any case file,
+adapter, or model client is loaded.
 
 The runner creates all fixed slots before invoking the adapter. The default
 plan is five repeats per development/validation case and ten per acceptance
