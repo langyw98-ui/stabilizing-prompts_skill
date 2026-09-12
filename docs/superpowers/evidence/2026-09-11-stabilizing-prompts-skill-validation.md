@@ -2,7 +2,8 @@
 
 Validation date: 2026-09-12  
 Task: 10 (personal installation and local-model validation)  
-Source checkout: `feature/stabilizing-prompts-skill` at `d3c66b586c95a44fdeaf4ffc58249776cddf3d18`
+Source checkout: `feature/stabilizing-prompts-skill` at the verified implementation
+commit `834a887c3a284984b0cd13e71eec600e93a41421`
 
 ## Offline validation
 
@@ -12,7 +13,7 @@ They use the fixed `kds` environment and do not require network access.
 
 | Check | Exit code | Result |
 | --- | ---: | --- |
-| `rtk conda run -n kds python -m pytest tests -v` | 0 | 168 passed, no skipped tests |
+| `rtk conda run -n kds python -m pytest tests -v` | 0 | 172 passed, no skipped tests |
 | `rtk conda run -n kds python C:/Users/kgcda/.codex/skills/.system/skill-creator/scripts/quick_validate.py .` | 0 | `Skill is valid!` |
 | `rtk git diff --check` | 0 | clean |
 
@@ -78,11 +79,8 @@ strict loader result: valid
 
 The source checkout credential path remained absent, as required. A fixed
 client construction check exited 0 and reported `client-settings-status:
-verified`; its safe configuration hash was:
-
-```text
-1cb27d35b75624521c182572a2dca939c99cc9746ca2d0246d062ecdfd2a6436
-```
+verified`; the current endpoint's canonical safe-configuration hash is recorded
+in the current-endpoint subsection below.
 
 The disposable committed Python Git fixture was:
 
@@ -133,7 +131,10 @@ omitted_sampling_parameters:
 
 The current fixed-client construction check exited 0 with
 `client-settings-status: verified`; its safe configuration SHA-256 was
-`1cb27d35b75624521c182572a2dca939c99cc9746ca2d0246d062ecdfd2a6436`.
+`4d92cef36f3e538c81e0c277b2904d30d4fdb8a15fdb65002e0915c18d0e8ae7`.
+This digest is the SHA-256 of the production `safe_client_config()` mapping
+serialized as canonical JSON with `ensure_ascii=False`, `sort_keys=True`, and
+`separators=(",", ":")` (without a trailing newline).
 
 The one-development-case fixture was committed at
 `b51ca78e8c67f1fd2172623ce74a7c23eeba6269`. Renderer and production Pydantic
@@ -194,6 +195,11 @@ gate (`HTTP 502`); no alternate model, endpoint, or credential was tried.
 
 The safe fixed-client configuration used for that historical attempt (old
 endpoint) is:
+
+Its canonical safe-configuration SHA-256 was
+`1cb27d35b75624521c182572a2dca939c99cc9746ca2d0246d062ecdfd2a6436`; this
+digest applies only to the historical old-endpoint configuration and is not the
+current endpoint's digest.
 
 ```yaml
 base_url: http://192.168.168.230:8000/v1
