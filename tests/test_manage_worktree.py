@@ -11,11 +11,14 @@ from scripts.manage_worktree import (
     FAILURE_ALLOWLIST,
     SUCCESS_ALLOWLIST,
     DeliveryConflict,
+    DeliveryError,
     WorktreeCycle,
+    WorktreeError,
     apply_delivery_patch,
     build_delivery_patch,
     create_cycle,
     preflight_patch,
+    _patch_header_paths,
 )
 
 
@@ -80,6 +83,23 @@ def completed_cycle(repo: tuple[Path, str]) -> WorktreeCycle:
     return cycle
 
 
+@pytest.fixture
+def spaced_path_cycle(repo: tuple[Path, str]) -> WorktreeCycle:
+    original, prompt_id = repo
+    git(original, "mv", "prompts/classify.md", "prompts/classify prompt.md")
+    contract = original / ".prompt-evals" / prompt_id / "prompt-contract.yaml"
+    contract.write_text("prompt_path: prompts/classify prompt.md\n", encoding="utf-8")
+    git(original, "add", ".prompt-evals")
+    git(original, "commit", "-m", "use prompt path with spaces")
+    cycle = create_cycle(original, prompt_id)
+    (cycle.worktree / "prompts" / "classify prompt.md").write_text(
+        "candidate prompt\n", encoding="utf-8"
+    )
+    git(cycle.worktree, "add", "-A")
+    git(cycle.worktree, "commit", "-m", "candidate with spaces")
+    return cycle
+
+
 def test_cycle_base_is_original_head(repo: tuple[Path, str]) -> None:
     original, prompt_id = repo
     expected_head = git(original, "rev-parse", "HEAD")
@@ -100,6 +120,18 @@ def test_success_allowlist_resolves_prompt_symbol_to_canonical_target(
     assert "prompts/classify.md" in patch.paths
     assert "prompt" not in patch.paths
     assert all(Path(path).is_absolute() is False for path in patch.paths)
+
+
+def test_delivery_supports_prompt_path_with_spaces(
+    spaced_path_cycle: WorktreeCycle,
+) -> None:
+    patch = build_delivery_patch(spaced_path_cycle, {"prompt"})
+
+    assert patch.paths == ("prompts/classify prompt.md",)
+    apply_delivery_patch(spaced_path_cycle, patch)
+    assert (
+        spaced_path_cycle.original_repo / "prompts" / "classify prompt.md"
+    ).read_text(encoding="utf-8") == "candidate prompt\n"
 
 
 def test_patch_excludes_runtime_reports_and_unlisted_files(
@@ -223,3 +255,129 @@ def test_patch_records_source_and_destination_hashes(
     assert patch.destination_hashes[prompt_path] == hashlib.sha256(
         (completed_cycle.worktree / prompt_path).read_bytes()
     ).hexdigest()
+
+
+def test_patch_parser_rejects_hunk_without_diff_header() -> None:
+    text = """--- a/prompts/classify.md
++++ b/prompts/classify.md
+@@ -1 +1 @@
+-original prompt
++candidate prompt
+"""
+
+    with pytest.raises(DeliveryError, match="header"):
+        _patch_header_paths(text)
+
+
+def test_patch_parser_rejects_binary_patch_marker() -> None:
+    text = """diff --git a/prompts/classify.md b/prompts/classify.md
+new file mode 100644
+index 0000000..1111111
+GIT binary patch
+literal 4
+text
+"""
+
+    with pytest.raises(DeliveryError, match="binary"):
+        _patch_header_paths(text)
+
+
+def test_patch_parser_rejects_rename_and_copy_metadata() -> None:
+    for marker in ("rename from prompts/classify.md", "copy from prompts/classify.md"):
+        text = f"""diff --git a/prompts/classify.md b/prompts/classify.md
+{marker}
+"""
+        with pytest.raises(DeliveryError, match="rename|copy"):
+            _patch_header_paths(text)
+
+
+def test_patch_parser_rejects_extra_hunk_without_matching_body() -> None:
+    text = """diff --git a/prompts/classify.md b/prompts/classify.md
+index 1111111..2222222 100644
+--- a/prompts/classify.md
++++ b/prompts/classify.md
+@@ -1 +1 @@
+-original prompt
++candidate prompt
+@@ -99 +99 @@
+"""
+
+    with pytest.raises(DeliveryError, match="hunk"):
+        _patch_header_paths(text)
+
+
+def test_patch_parser_accepts_quoted_and_unquoted_paths_with_spaces() -> None:
+    quoted = """diff --git \"a/prompts/classify prompt.md\" \"b/prompts/classify prompt.md\"
+index 1111111..2222222 100644
+--- \"a/prompts/classify prompt.md\"
++++ \"b/prompts/classify prompt.md\"
+@@ -1 +1 @@
+-original prompt
++candidate prompt
+"""
+    unquoted = """diff --git a/prompts/classify prompt.md b/prompts/classify prompt.md
+index 1111111..2222222 100644
+--- a/prompts/classify prompt.md
++++ b/prompts/classify prompt.md
+@@ -1 +1 @@
+-original prompt
++candidate prompt
+"""
+
+    assert _patch_header_paths(quoted) == ("prompts/classify prompt.md",)
+    assert _patch_header_paths(unquoted) == ("prompts/classify prompt.md",)
+
+
+def test_preflight_rejects_tampered_persisted_allowlist_metadata(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST)
+    tampered = replace(
+        patch,
+        allowlist_paths=patch.allowlist_paths + ("unrelated.txt",),
+    )
+
+    with pytest.raises(DeliveryError, match="allowlist manifest"):
+        preflight_patch(completed_cycle, tampered)
+
+
+def test_failure_preflight_rejects_explicit_canonical_prompt_path(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    success = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST)
+    canonical_prompt = "prompts/classify.md"
+    crafted = replace(
+        success,
+        result="failure",
+        paths=(canonical_prompt,),
+        source_hashes={canonical_prompt: success.source_hashes[canonical_prompt]},
+        destination_hashes={canonical_prompt: success.destination_hashes[canonical_prompt]},
+        allowlist_paths=(canonical_prompt,),
+    )
+
+    with pytest.raises(DeliveryError, match="Prompt|prompt"):
+        preflight_patch(completed_cycle, crafted)
+
+
+def test_build_rejects_deleting_canonical_prompt(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    prompt = completed_cycle.worktree / "prompts" / "classify.md"
+    prompt.unlink()
+    git(completed_cycle.worktree, "add", "-A")
+    git(completed_cycle.worktree, "commit", "-m", "delete prompt")
+
+    with pytest.raises(DeliveryError, match="delet"):
+        build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST)
+
+
+def test_create_cycle_rejects_worktree_inside_original_repository(
+    repo: tuple[Path, str],
+) -> None:
+    original, prompt_id = repo
+    inside = original / "nested-worktree"
+
+    with pytest.raises(WorktreeError, match="outside"):
+        create_cycle(original, prompt_id, worktree=inside)
+
+    assert not inside.exists()

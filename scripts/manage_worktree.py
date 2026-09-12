@@ -24,7 +24,6 @@ import re
 import stat
 import subprocess
 import uuid
-from typing import Any
 
 try:
     import yaml
@@ -127,6 +126,24 @@ def _repo_root(repo: Path) -> Path:
     return actual
 
 
+def _path_key(path: Path) -> str:
+    """Return a case-aware boundary key for an absolute filesystem path."""
+
+    # ``normcase`` is significant on Windows: two spellings of the same path
+    # must not evade the repository-boundary check.  ``commonpath`` (rather
+    # than a string prefix) keeps ``repo-two`` outside ``repo``.
+    return os.path.normcase(os.path.normpath(os.path.abspath(str(path))))
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        return os.path.commonpath((_path_key(path), _path_key(parent))) == _path_key(parent)
+    except ValueError:
+        # Different Windows drives, or another platform's incompatible roots,
+        # are necessarily outside one another.
+        return False
+
+
 def _normalize_relative(value: str, *, label: str = "path") -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise AllowlistError(f"{label} must be a concrete repository-relative path")
@@ -183,13 +200,7 @@ def _contract_values(data: Mapping[str, object]) -> list[object]:
     return values
 
 
-def _parse_contract_prompt_path(root: Path, contract: Path) -> str | None:
-    if yaml is None:
-        raise DeliveryError("cannot resolve prompt allowlist without PyYAML")
-    try:
-        data = yaml.safe_load(contract.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
-        raise DeliveryError(f"invalid prompt-contract.yaml: {error}") from error
+def _parse_contract_data(root: Path, data: object) -> str | None:
     if not isinstance(data, Mapping):
         raise DeliveryError("prompt-contract.yaml must contain a mapping")
     paths: list[str] = []
@@ -206,54 +217,82 @@ def _parse_contract_prompt_path(root: Path, contract: Path) -> str | None:
         return None
     if len(set(paths)) != 1:
         raise DeliveryError("prompt-contract.yaml contains conflicting prompt paths")
+    if not paths[0].casefold().endswith(".md"):
+        raise DeliveryError("canonical Prompt path must name a Markdown file")
     return paths[0]
 
 
+def _parse_contract_prompt_path(root: Path, contract: Path) -> str | None:
+    if yaml is None:
+        raise DeliveryError("cannot resolve prompt allowlist without PyYAML")
+    try:
+        data = yaml.safe_load(contract.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise DeliveryError(f"invalid prompt-contract.yaml: {error}") from error
+    return _parse_contract_data(root, data)
+
+
+def _evaluation_prefix(cycle: "WorktreeCycle") -> str | None:
+    if cycle.prompt_id is None:
+        return None
+    if (
+        not isinstance(cycle.prompt_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9._-]+", cycle.prompt_id)
+    ):
+        raise AllowlistError("prompt_id is not a safe evaluation directory name")
+    return f".prompt-evals/{cycle.prompt_id}/"
+
+
+def _base_contract_prompt_path(cycle: "WorktreeCycle") -> tuple[bool, str | None]:
+    """Read the cycle's contract from its immutable base commit."""
+
+    if not cycle.prompt_id:
+        return False, None
+    prefix = _evaluation_prefix(cycle)
+    assert prefix is not None
+    relative = f"{prefix}prompt-contract.yaml"
+    result = _git(
+        cycle.original_repo,
+        "show",
+        f"{cycle.cycle_base_commit}:{relative}",
+        check=False,
+    )
+    if result.returncode != 0:
+        return False, None
+    if yaml is None:
+        raise DeliveryError("cannot resolve prompt allowlist without PyYAML")
+    try:
+        data = yaml.safe_load(result.stdout.decode("utf-8"))
+    except Exception as error:
+        raise DeliveryError(f"invalid prompt-contract.yaml: {error}") from error
+    return True, _parse_contract_data(cycle.original_repo, data)
+
+
 def _discover_prompt_path(cycle: "WorktreeCycle") -> str | None:
-    if cycle.prompt_path is not None:
-        return _relative_path(cycle.original_repo, cycle.prompt_path, label="prompt path")
     contract = (
         cycle.original_repo
         / ".prompt-evals"
         / (cycle.prompt_id or "")
         / "prompt-contract.yaml"
     )
-    if contract.is_file():
-        return _parse_contract_prompt_path(cycle.original_repo, contract)
-    # The normal contract is committed at the cycle base.  Reading it from
-    # the original worktree is not sufficient when it was created by an
-    # earlier stage in the cycle, so inspect the immutable base commit too.
-    if cycle.prompt_id:
-        relative = f".prompt-evals/{cycle.prompt_id}/prompt-contract.yaml"
-        result = _git(
-            cycle.original_repo,
-            "show",
-            f"{cycle.cycle_base_commit}:{relative}",
-            check=False,
-        )
-        if result.returncode == 0:
-            temporary = cycle.original_repo / ".git" / "__stabilizing_prompt_contract.tmp"
-            # Avoid writing into the repository while resolving a symbolic
-            # path.  Parse the Git blob directly instead.
-            if yaml is None:
-                raise DeliveryError("cannot resolve prompt allowlist without PyYAML")
-            try:
-                data = yaml.safe_load(result.stdout.decode("utf-8"))
-            except Exception as error:
-                raise DeliveryError(f"invalid prompt-contract.yaml: {error}") from error
-            if isinstance(data, Mapping):
-                values = _contract_values(data)
-                paths: list[str] = []
-                for raw in values:
-                    if not isinstance(raw, str) or not raw.strip():
-                        raise DeliveryError(
-                            "prompt-contract.yaml contains an invalid prompt path"
-                        )
-                    paths.append(_relative_path(cycle.original_repo, raw, label="recorded prompt path"))
-                if len(set(paths)) > 1:
-                    raise DeliveryError("prompt-contract.yaml contains conflicting prompt paths")
-                return paths[0] if paths else None
-    return None
+    base_has_contract, base_prompt = _base_contract_prompt_path(cycle)
+    if base_has_contract:
+        contract_prompt = base_prompt
+    elif contract.is_file():
+        # A cycle created before its contract was committed may still use the
+        # current contract, but a committed base contract always wins.
+        contract_prompt = _parse_contract_prompt_path(cycle.original_repo, contract)
+    else:
+        contract_prompt = None
+
+    if cycle.prompt_path is not None:
+        explicit = _relative_path(cycle.original_repo, cycle.prompt_path, label="prompt path")
+        if not explicit.casefold().endswith(".md"):
+            raise DeliveryError("canonical Prompt path must name a Markdown file")
+        if contract_prompt is not None and explicit != contract_prompt:
+            raise DeliveryError("cycle Prompt path conflicts with prompt-contract.yaml")
+        return explicit
+    return contract_prompt
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,7 +388,11 @@ def create_cycle(
         if worktree is not None
         else root.parent / f".{root.name}-stabilizing-prompts-{slug}-{identity}"
     )
-    if selected_worktree == root or selected_worktree.exists():
+    if _path_is_within(selected_worktree, root):
+        raise WorktreeError(
+            f"worktree path must be outside original repository: {selected_worktree}"
+        )
+    if selected_worktree.exists():
         raise WorktreeError(f"worktree path already exists: {selected_worktree}")
     selected_worktree.parent.mkdir(parents=True, exist_ok=True)
     _git(root, "worktree", "add", "-b", selected_branch, str(selected_worktree), base)
@@ -368,7 +411,8 @@ def _changed_paths(cycle: WorktreeCycle, final_commit: str) -> tuple[str, ...]:
         cycle.worktree,
         "diff",
         "--name-status",
-        "--no-renames",
+        "--find-renames",
+        "--find-copies",
         "-z",
         cycle.cycle_base_commit,
         final_commit,
@@ -383,16 +427,21 @@ def _changed_paths(cycle: WorktreeCycle, final_commit: str) -> tuple[str, ...]:
     while index < len(fields) and fields[index]:
         status = fields[index].decode("ascii", "replace")
         index += 1
-        if index >= len(fields):
+        if index >= len(fields) or not fields[index]:
             raise DeliveryError("Git returned a malformed changed-path list")
+        kind = status[:1]
+        if kind in {"R", "C"}:
+            raise DeliveryError("rename and copy changes are not supported for delivery")
+        if kind not in {"A", "D", "M"} or len(status) != 1:
+            raise DeliveryError(f"unsupported Git change status: {status}")
         raw_path = os.fsdecode(fields[index])
         index += 1
-        if len(status) != 1:
-            raise DeliveryError(f"unsupported Git change status: {status}")
         # Runtime/report paths are intentionally enumerated here so the
         # allowlist can reject them from the generated patch.  Rejecting them
         # while parsing would prevent a safe filtered patch from being built.
         paths.append(_normalize_relative(raw_path, label="changed path"))
+    if any(fields[index:]):
+        raise DeliveryError("Git returned a malformed changed-path list")
     return tuple(dict.fromkeys(paths))
 
 
@@ -403,17 +452,16 @@ def _allowlist_paths(
     result: str,
     changed_paths: Sequence[str] | None = None,
 ) -> frozenset[str]:
+    if isinstance(allowlist, (str, bytes)):
+        raise AllowlistError("delivery allowlist must be a collection of paths")
     if isinstance(allowlist, Mapping):
         entries = list(allowlist.keys())
     else:
         entries = list(allowlist)
     if result not in {"success", "failure"}:
         raise DeliveryError("delivery result must be success or failure")
-    if result == "failure":
-        entries = [entry for entry in entries if entry != "prompt"]
-    resolved_prompt: str | None = None
-    if "prompt" in entries:
-        resolved_prompt = _discover_prompt_path(cycle)
+    resolved_prompt = _discover_prompt_path(cycle)
+    if "prompt" in entries and result == "success":
         if resolved_prompt is None and changed_paths is not None:
             candidates = [
                 path
@@ -428,13 +476,15 @@ def _allowlist_paths(
                 "symbolic prompt allowlist entry cannot resolve a canonical Prompt path"
             )
         resolved_prompt = _reject_unsafe_delivery_path(resolved_prompt, label="prompt path")
-    eval_prefix = f".prompt-evals/{cycle.prompt_id}/" if cycle.prompt_id else None
+    elif resolved_prompt is not None:
+        resolved_prompt = _reject_unsafe_delivery_path(resolved_prompt, label="prompt path")
+    eval_prefix = _evaluation_prefix(cycle)
     resolved: set[str] = set()
     for entry in entries:
         if not isinstance(entry, str):
             raise AllowlistError("delivery allowlist entries must be strings")
         if entry == "prompt":
-            if resolved_prompt is not None:
+            if result == "success" and resolved_prompt is not None:
                 resolved.add(resolved_prompt)
             continue
         if entry == ".gitignore":
@@ -464,6 +514,29 @@ def _allowlist_paths(
     return frozenset(resolved)
 
 
+def _canonical_allowlist_paths(
+    cycle: WorktreeCycle,
+    *,
+    result: str,
+    changed_paths: Sequence[str] | None = None,
+) -> frozenset[str]:
+    """Derive the only allowlist accepted during delivery preflight.
+
+    The persisted manifest is evidence about what was built, never an input
+    to this decision.  The cycle identity and the fixed result policy are the
+    trust anchors; the symbolic ``prompt`` entry is resolved from the cycle's
+    immutable contract (Ruling 1).
+    """
+
+    if result not in {"success", "failure"}:
+        raise DeliveryError("delivery result must be success or failure")
+    prompt = _discover_prompt_path(cycle)
+    if prompt is None:
+        raise AllowlistError("canonical Prompt path cannot be resolved")
+    defaults = SUCCESS_ALLOWLIST if result == "success" else FAILURE_ALLOWLIST
+    return _allowlist_paths(cycle, defaults, result=result, changed_paths=changed_paths)
+
+
 def _commit_blob(cycle: WorktreeCycle, commit: str, path: str) -> bytes | None:
     type_result = _git(cycle.worktree, "cat-file", "-t", f"{commit}:{path}", check=False)
     if type_result.returncode != 0:
@@ -479,6 +552,10 @@ def _commit_blob(cycle: WorktreeCycle, commit: str, path: str) -> bytes | None:
 
 def _hash_bytes(data: bytes | None) -> str | None:
     return hashlib.sha256(data).hexdigest() if data is not None else None
+
+
+def _is_digest(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
 
 
 def _working_tree_matches_commit(cycle: WorktreeCycle, path: str) -> bool:
@@ -537,7 +614,18 @@ def _final_commit(cycle: WorktreeCycle, value: str | None) -> str:
     result = _git(cycle.worktree, "rev-parse", "--verify", f"{selected}^{{commit}}", check=False)
     if result.returncode != 0:
         raise DeliveryError("final worktree commit is not a valid Git commit")
-    return result.stdout.decode("utf-8", "replace").strip()
+    resolved = result.stdout.decode("utf-8", "replace").strip()
+    ancestry = _git(
+        cycle.worktree,
+        "merge-base",
+        "--is-ancestor",
+        cycle.cycle_base_commit,
+        resolved,
+        check=False,
+    )
+    if ancestry.returncode != 0:
+        raise DeliveryConflict("final worktree commit is not based on the cycle base commit")
+    return resolved
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,26 +710,39 @@ def build_delivery_patch(
 
     if not isinstance(cycle, WorktreeCycle):
         raise TypeError("build_delivery_patch expects a WorktreeCycle")
+    if result not in {"success", "failure"}:
+        raise DeliveryError("delivery result must be success or failure")
     final = _final_commit(cycle, final_commit)
     changed = _changed_paths(cycle, final)
-    selected_allowlist = (
-        SUCCESS_ALLOWLIST if result == "success" and allowlist is None else
-        FAILURE_ALLOWLIST if result == "failure" and allowlist is None else allowlist
-    )
-    if selected_allowlist is None:
-        raise DeliveryError("delivery allowlist is required")
-    allowed = _allowlist_paths(
+    canonical = _canonical_allowlist_paths(
         cycle,
-        selected_allowlist,
         result=result,
         changed_paths=changed,
     )
+    if allowlist is None:
+        allowed = canonical
+    else:
+        requested = _allowlist_paths(
+            cycle,
+            allowlist,
+            result=result,
+            changed_paths=changed,
+        )
+        if not requested.issubset(canonical):
+            outside = sorted(requested - canonical)
+            raise AllowlistError(
+                "requested delivery allowlist contains unsupported paths: "
+                + ", ".join(outside)
+            )
+        allowed = requested
     selected = tuple(path for path in changed if path in allowed)
     source_hashes = {path: _build_source_hash(cycle, path) for path in selected}
     destination_hashes = {
         path: _build_destination_hash(cycle, final, path)
         for path in selected
     }
+    if any(destination_hashes[path] is None for path in selected):
+        raise DeliveryError("deletion delivery is not supported")
     patch_text = ""
     if selected:
         result_patch = _git(
@@ -658,6 +759,10 @@ def build_delivery_patch(
             detail = result_patch.stderr.decode("utf-8", "replace").strip()
             raise DeliveryError(f"unable to build delivery patch: {detail}")
         patch_text = result_patch.stdout.decode("utf-8", "surrogateescape")
+        # Parse the generated patch too.  This keeps the builder and the
+        # persisted-artifact preflight on exactly the same fail-closed grammar
+        # and rejects selected deletions before any manifest is returned.
+        _patch_header_paths(patch_text)
     return DeliveryPatch(
         text=patch_text,
         paths=selected,
@@ -667,24 +772,296 @@ def build_delivery_patch(
         final_worktree_commit=final,
         result=result,
         prompt_path=_discover_prompt_path(cycle),
-        allowlist_paths=tuple(sorted(allowed)),
+        allowlist_paths=tuple(sorted(canonical)),
     )
 
 
-def _patch_header_paths(text: str) -> tuple[str, ...]:
-    """Extract paths from Git's ordinary ``diff --git a/ b/`` headers."""
+@dataclass(frozen=True, slots=True)
+class _ParsedPatchSection:
+    path: str
+    deleted: bool
 
-    paths: list[str] = []
-    for line in text.splitlines():
-        if not line.startswith("diff --git "):
-            continue
-        fields = line[len("diff --git ") :].split(" ")
-        if len(fields) != 2 or not fields[0].startswith("a/") or not fields[1].startswith("b/"):
+
+_PATCH_INDEX_RE = re.compile(
+    r"^index [0-9a-fA-F]{7,64}\.\.[0-9a-fA-F]{7,64}(?: [0-7]{6})?$"
+)
+_PATCH_HUNK_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
+)
+
+
+def _decode_patch_quoted(payload: str, start: int = 0) -> tuple[str, int]:
+    """Decode one Git C-style quoted path and return its end offset."""
+
+    if start >= len(payload) or payload[start] != '"':
+        raise DeliveryError("delivery patch contains an invalid quoted path")
+    data = bytearray()
+    index = start + 1
+    escapes = {
+        "a": 0x07,
+        "b": 0x08,
+        "t": 0x09,
+        "n": 0x0A,
+        "v": 0x0B,
+        "f": 0x0C,
+        "r": 0x0D,
+        "\\": 0x5C,
+        '"': 0x22,
+        "?": 0x3F,
+    }
+    while index < len(payload):
+        character = payload[index]
+        if character == '"':
+            try:
+                return data.decode("utf-8"), index + 1
+            except UnicodeDecodeError as error:
+                raise DeliveryError("delivery patch path is not valid UTF-8") from error
+        if character == "\\":
+            index += 1
+            if index >= len(payload):
+                raise DeliveryError("delivery patch contains an incomplete path escape")
+            escaped = payload[index]
+            if escaped in escapes:
+                data.append(escapes[escaped])
+                index += 1
+                continue
+            if escaped == "x":
+                digits = payload[index + 1 : index + 3]
+                if len(digits) != 2 or not re.fullmatch(r"[0-9a-fA-F]{2}", digits):
+                    raise DeliveryError("delivery patch contains an invalid path escape")
+                data.append(int(digits, 16))
+                index += 3
+                continue
+            if escaped in "01234567":
+                end = index + 1
+                while end < len(payload) and end < index + 3 and payload[end] in "01234567":
+                    end += 1
+                data.append(int(payload[index:end], 8))
+                index = end
+                continue
+            raise DeliveryError("delivery patch contains an unsupported path escape")
+        if ord(character) < 0x20:
+            raise DeliveryError("delivery patch path contains a control character")
+        data.extend(character.encode("utf-8"))
+        index += 1
+    raise DeliveryError("delivery patch contains an unterminated quoted path")
+
+
+def _patch_path(raw: str, *, label: str = "patch path") -> str:
+    """Validate a decoded patch path without normalizing attacker input."""
+
+    if not raw or "\x00" in raw or "\\" in raw or "\n" in raw or "\r" in raw:
+        raise DeliveryError(f"{label} contains an unsafe path")
+    if any(ord(character) < 0x20 for character in raw):
+        raise DeliveryError(f"{label} contains a control character")
+    normalized = _reject_unsafe_delivery_path(raw, label=label)
+    if normalized != raw:
+        raise DeliveryError(f"{label} is not canonical: {raw}")
+    return normalized
+
+
+def _parse_diff_header(line: str) -> str:
+    payload = line[len("diff --git ") :]
+    if not payload:
+        raise DeliveryError("delivery patch contains an invalid diff header")
+    candidates: list[str] = []
+    if payload.startswith('"'):
+        left_raw, index = _decode_patch_quoted(payload)
+        if index >= len(payload) or not payload[index].isspace():
+            raise DeliveryError("delivery patch contains an invalid diff header")
+        while index < len(payload) and payload[index].isspace():
+            index += 1
+        if index >= len(payload) or payload[index] != '"':
+            raise DeliveryError("delivery patch contains an invalid diff header")
+        right_raw, index = _decode_patch_quoted(payload, index)
+        if payload[index:].strip():
+            raise DeliveryError("delivery patch contains an invalid diff header")
+        if not left_raw.startswith("a/") or not right_raw.startswith("b/"):
             raise DeliveryError("delivery patch contains an unsupported Git path header")
-        left = _reject_unsafe_delivery_path(fields[0][2:], label="patch path")
-        right = _reject_unsafe_delivery_path(fields[1][2:], label="patch path")
-        paths.extend((left, right))
-    return tuple(dict.fromkeys(paths))
+        left = _patch_path(left_raw[2:])
+        right = _patch_path(right_raw[2:])
+        if left != right:
+            raise DeliveryError("rename and copy patches are not supported for delivery")
+        return left
+
+    if '"' in payload or "\\" in payload:
+        raise DeliveryError("delivery patch contains an unsupported unquoted path escape")
+    # Git normally quotes paths containing whitespace, but valid producers can
+    # emit the unquoted form.  Find the separator by validating complete path
+    # candidates instead of splitting on every space.
+    for index, character in enumerate(payload):
+        if character != " " or not payload[index + 1 :].startswith("b/"):
+            continue
+        left_raw = payload[:index]
+        right_raw = payload[index + 1 :]
+        if not left_raw.startswith("a/"):
+            continue
+        try:
+            left = _patch_path(left_raw[2:])
+            right = _patch_path(right_raw[2:])
+        except DeliveryError:
+            continue
+        if left == right:
+            candidates.append(left)
+    if len(candidates) != 1:
+        raise DeliveryError("delivery patch contains an ambiguous or invalid path header")
+    return candidates[0]
+
+
+def _parse_marker_path(line: str, marker: str, expected_prefix: str) -> str | None:
+    payload = line[len(marker) :]
+    if not payload:
+        raise DeliveryError("delivery patch is missing a file path marker")
+    if payload.startswith('"'):
+        value, index = _decode_patch_quoted(payload)
+        if payload[index:].strip():
+            raise DeliveryError("delivery patch contains an invalid file path marker")
+    else:
+        # Git uses a tab delimiter for unquoted paths containing spaces in
+        # ---/+++ markers.  A literal tab in a path must be C-quoted.
+        if payload.endswith("\t") and payload.count("\t") == 1:
+            payload = payload[:-1]
+        if '"' in payload or "\\" in payload or "\t" in payload:
+            raise DeliveryError("delivery patch contains an unsupported path escape")
+        value = payload
+    if value == "/dev/null":
+        return None
+    if not value.startswith(expected_prefix):
+        raise DeliveryError("delivery patch file markers do not match its diff header")
+    return _patch_path(value[len(expected_prefix) :])
+
+
+def _parse_hunk(lines: Sequence[str], index: int) -> int:
+    match = _PATCH_HUNK_RE.fullmatch(lines[index])
+    if match is None:
+        raise DeliveryError("delivery patch contains an invalid hunk header")
+    expected_old = int(match.group(2) or "1")
+    expected_new = int(match.group(4) or "1")
+    old_count = 0
+    new_count = 0
+    body_lines = 0
+    index += 1
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("diff --git ") or line.startswith("@@ "):
+            break
+        if line.startswith(" "):
+            old_count += 1
+            new_count += 1
+            body_lines += 1
+            index += 1
+            continue
+        if line.startswith("+"):
+            new_count += 1
+            body_lines += 1
+            index += 1
+            continue
+        if line.startswith("-"):
+            old_count += 1
+            body_lines += 1
+            index += 1
+            continue
+        if line == "\\ No newline at end of file":
+            if body_lines == 0:
+                raise DeliveryError("delivery patch contains an invalid hunk marker")
+            index += 1
+            continue
+        raise DeliveryError("delivery patch contains an invalid hunk line")
+    if body_lines == 0 or old_count != expected_old or new_count != expected_new:
+        raise DeliveryError("delivery patch hunk line counts do not match its hunk header")
+    return index
+
+
+def _parse_patch(text: str) -> tuple[_ParsedPatchSection, ...]:
+    """Parse the complete supported Git patch grammar, failing closed."""
+
+    if not isinstance(text, str):
+        raise DeliveryError("delivery patch must be text")
+    if not text:
+        return ()
+    if "\r" in text:
+        # Normalize only for grammar inspection; Git itself still receives the
+        # original bytes.  Bare carriage returns cannot be path or hunk data.
+        if "\r" in text.replace("\r\n", ""):
+            raise DeliveryError("delivery patch contains unsupported line endings")
+        text = text.replace("\r\n", "\n")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        raise DeliveryError("delivery patch is empty")
+
+    sections: list[_ParsedPatchSection] = []
+    seen: set[str] = set()
+    index = 0
+    while index < len(lines):
+        if not lines[index].startswith("diff --git "):
+            raise DeliveryError("delivery patch must begin every section with a diff header")
+        path = _parse_diff_header(lines[index])
+        if path in seen:
+            raise DeliveryError("delivery patch contains duplicate diff sections or extra hunks")
+        seen.add(path)
+        index += 1
+        saw_file_markers = False
+        deleted = False
+        hunk_count = 0
+        while index < len(lines) and not lines[index].startswith("diff --git "):
+            line = lines[index]
+            if line.startswith(("GIT binary patch", "Binary files ")):
+                raise DeliveryError("binary delivery patches are not supported")
+            if line.startswith(("rename ", "copy ")):
+                raise DeliveryError("rename and copy delivery patches are not supported")
+            if line.startswith(("similarity index", "dissimilarity index")):
+                raise DeliveryError("rename and copy delivery patches are not supported")
+            if line.startswith("index "):
+                if _PATCH_INDEX_RE.fullmatch(line) is None:
+                    raise DeliveryError("delivery patch contains an invalid index header")
+                index += 1
+                continue
+            if re.fullmatch(r"(?:new file mode|deleted file mode|old mode|new mode) [0-7]{6}", line):
+                index += 1
+                continue
+            if line.startswith("--- "):
+                if saw_file_markers:
+                    raise DeliveryError("delivery patch contains duplicate file markers")
+                old_path = _parse_marker_path(line, "--- ", "a/")
+                index += 1
+                if index >= len(lines) or not lines[index].startswith("+++ "):
+                    raise DeliveryError("delivery patch is missing its +++ file marker")
+                new_path = _parse_marker_path(lines[index], "+++ ", "b/")
+                index += 1
+                if old_path is not None and old_path != path:
+                    raise DeliveryError("delivery patch old path does not match its diff header")
+                if new_path is not None and new_path != path:
+                    raise DeliveryError("delivery patch new path does not match its diff header")
+                if old_path is None and new_path is None:
+                    raise DeliveryError("delivery patch has no concrete destination path")
+                deleted = new_path is None
+                saw_file_markers = True
+                while index < len(lines) and lines[index].startswith("@@ "):
+                    index = _parse_hunk(lines, index)
+                    hunk_count += 1
+                continue
+            if line.startswith("+++ "):
+                raise DeliveryError("delivery patch contains an unexpected +++ file marker")
+            if line.startswith("@@ "):
+                raise DeliveryError("delivery patch contains a hunk without file markers")
+            if line == "\\ No newline at end of file":
+                raise DeliveryError("delivery patch contains an orphaned hunk marker")
+            raise DeliveryError("delivery patch contains unsupported Git patch metadata")
+        if not saw_file_markers or hunk_count == 0:
+            raise DeliveryError("delivery patch section is missing a file hunk")
+        sections.append(_ParsedPatchSection(path=path, deleted=deleted))
+    return tuple(sections)
+
+
+def _patch_header_paths(text: str) -> tuple[str, ...]:
+    """Validate and return every concrete path represented by a Git patch."""
+
+    sections = _parse_patch(text)
+    if any(section.deleted for section in sections):
+        raise DeliveryError("deletion delivery is not supported")
+    return tuple(section.path for section in sections)
 
 
 def _current_file_bytes(root: Path, relative: str) -> bytes | None:
@@ -725,27 +1102,61 @@ def _validate_patch(cycle: WorktreeCycle, patch: DeliveryPatch) -> None:
         raise DeliveryConflict("patch cycle_base_commit does not match cycle")
     if not patch.final_worktree_commit:
         raise DeliveryError("patch final worktree commit is missing")
+    if _final_commit(cycle, patch.final_worktree_commit) != patch.final_worktree_commit:
+        raise DeliveryError("patch final worktree commit is not canonical")
+    if patch.result not in {"success", "failure"}:
+        raise DeliveryError("delivery result must be success or failure")
     paths = tuple(_reject_unsafe_delivery_path(path, label="patch path") for path in patch.paths)
     if paths != patch.paths:
         raise DeliveryError("patch paths are not canonical")
+    if len(set(paths)) != len(paths):
+        raise DeliveryError("patch paths must be unique")
+    canonical_prompt = _discover_prompt_path(cycle)
+    if canonical_prompt is None:
+        raise AllowlistError("canonical Prompt path cannot be resolved")
+    if patch.prompt_path is None:
+        raise DeliveryError("allowlist manifest is missing the canonical Prompt path")
+    try:
+        manifest_prompt = _relative_path(
+            cycle.original_repo,
+            patch.prompt_path,
+            label="allowlist manifest Prompt path",
+        )
+    except AllowlistError as error:
+        raise DeliveryError("allowlist manifest contains an unsafe Prompt path") from error
+    if manifest_prompt != canonical_prompt:
+        raise DeliveryError("allowlist manifest Prompt path does not match cycle metadata")
     if set(patch.source_hashes) != set(paths) or set(patch.destination_hashes) != set(paths):
         raise DeliveryError("patch hash manifest does not cover exactly its paths")
-    if patch.allowlist_paths:
-        allowlist_paths = {
-            _reject_unsafe_delivery_path(path, label="allowlist path")
+    canonical_allowlist = set(
+        _canonical_allowlist_paths(cycle, result=patch.result, changed_paths=paths)
+    )
+    if patch.result == "failure" and canonical_prompt in paths:
+        raise AllowlistError("failure delivery cannot include the canonical Prompt")
+    try:
+        persisted_allowlist = tuple(
+            _reject_unsafe_delivery_path(path, label="allowlist manifest path")
             for path in patch.allowlist_paths
-        }
-    else:
-        defaults = FAILURE_ALLOWLIST if patch.result == "failure" else SUCCESS_ALLOWLIST
-        allowlist_paths = set(
-            _allowlist_paths(cycle, defaults, result=patch.result, changed_paths=paths)
         )
-    if not set(paths).issubset(allowlist_paths):
-        outside = sorted(set(paths) - allowlist_paths)
+    except AllowlistError as error:
+        raise DeliveryError("allowlist manifest contains an unsafe path") from error
+    if (
+        len(set(persisted_allowlist)) != len(persisted_allowlist)
+        or set(persisted_allowlist) != canonical_allowlist
+    ):
+        raise DeliveryError("allowlist manifest does not match the canonical cycle allowlist")
+    if not set(paths).issubset(canonical_allowlist):
+        outside = sorted(set(paths) - canonical_allowlist)
         raise AllowlistError(
             "patch contains paths outside the delivery allowlist: "
             + ", ".join(outside)
         )
+    for path, digest in patch.source_hashes.items():
+        if not isinstance(path, str) or (digest is not None and not _is_digest(digest)):
+            raise DeliveryError("patch source hash manifest contains an invalid digest")
+    for path, digest in patch.destination_hashes.items():
+        if not isinstance(path, str) or not _is_digest(digest):
+            raise DeliveryError("patch destination hash manifest contains an invalid digest")
     header_paths = _patch_header_paths(patch.text)
     if set(header_paths) != set(paths):
         if patch.text or paths:
@@ -753,7 +1164,9 @@ def _validate_patch(cycle: WorktreeCycle, patch: DeliveryPatch) -> None:
 
 
 def _check_sources(cycle: WorktreeCycle, patch: DeliveryPatch, expected: Mapping[str, object] | None) -> None:
-    expected_hashes: dict[str, object] = dict(expected or patch.source_hashes)
+    expected_hashes: dict[str, object] = dict(
+        patch.source_hashes if expected is None else expected
+    )
     normalized_expected: dict[str, object] = {}
     for raw_path, digest in expected_hashes.items():
         path = _relative_path(cycle.original_repo, raw_path, label="source hash path")
@@ -907,7 +1320,6 @@ def apply_delivery_patch(
     # so a concurrent user edit cannot slip between the checks.
     _check_sources(cycle, prepared, expected_source_hashes)
     snapshots = _snapshot_targets(cycle.original_repo, prepared.paths)
-    applied = False
     try:
         result = _git(
             cycle.original_repo,
@@ -918,7 +1330,6 @@ def apply_delivery_patch(
             input_data=prepared.text,
             check=False,
         )
-        applied = True
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", "replace").strip()
             raise DeliveryConflict(f"delivery patch application failed: {detail or 'git apply failed'}")

@@ -66,3 +66,23 @@ rtk conda run -n kds python -m pytest tests -q
 - this report
 
 No real credential or Authorization value was read, stored, or committed.
+
+## Fix round 1
+
+Addressed the delivery review findings with regression coverage for:
+
+- complete fail-closed Git patch grammar (required section headers and hunks,
+  quoted/unquoted paths with spaces, and rejection of binary, rename, copy,
+  malformed, duplicate, and unsafe structures);
+- canonical allowlist derivation from cycle metadata and result, with exact
+  persisted-manifest consistency checks;
+- failure deliveries rejecting the canonical Prompt even when named by its
+  explicit path;
+- rejection of deletion deliveries and mandatory destination existence/hash
+  verification;
+- worktree paths that are outside the original repository using Windows-safe
+  case normalization and path-boundary checks.
+
+The delivery parser now validates every patch section before `git apply`, and
+the application path snapshots exact targets and restores them after any
+application or destination-verification failure.
