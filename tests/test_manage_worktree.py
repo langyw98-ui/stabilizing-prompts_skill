@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from scripts import manage_worktree
 from scripts.manage_worktree import (
     FAILURE_ALLOWLIST,
     SUCCESS_ALLOWLIST,
@@ -32,6 +33,14 @@ def git(repo: Path, *args: str, check: bool = True) -> str:
         encoding="utf-8",
     )
     return result.stdout.strip()
+
+
+def snapshot_workspace(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and ".git" not in path.parts
+    }
 
 
 def make_repo(path: Path) -> tuple[Path, str]:
@@ -189,6 +198,104 @@ def test_source_hash_preflight_rejects_changed_target_without_mutation(
         preflight_patch(completed_cycle, patch)
 
     assert target.read_bytes() == before
+
+
+def test_preflight_rejects_complete_allowlisted_patch_with_tampered_text_and_hashes(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST - {".gitignore"})
+    prompt_path = "prompts/classify.md"
+    assert "+candidate prompt" in patch.text
+    crafted_text = patch.text.replace("+candidate prompt", "+attacker prompt", 1)
+    crafted_hashes = dict(patch.destination_hashes)
+    crafted_hashes[prompt_path] = hashlib.sha256(b"attacker prompt\n").hexdigest()
+    crafted = replace(
+        patch,
+        text=crafted_text,
+        paths=tuple(reversed(patch.paths)),
+        destination_hashes=crafted_hashes,
+    )
+    before = snapshot_workspace(completed_cycle.original_repo)
+
+    with pytest.raises(DeliveryError, match="canonical|allowlist"):
+        preflight_patch(completed_cycle, crafted)
+
+    assert snapshot_workspace(completed_cycle.original_repo) == before
+
+
+def test_preflight_rejects_cycle_worktree_head_change(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST - {".gitignore"})
+    worktree_prompt = completed_cycle.worktree / "prompts" / "classify.md"
+    worktree_prompt.write_text("new committed candidate\n", encoding="utf-8")
+    git(completed_cycle.worktree, "add", "prompts/classify.md")
+    git(completed_cycle.worktree, "commit", "-m", "change candidate after patch build")
+    before = snapshot_workspace(completed_cycle.original_repo)
+
+    with pytest.raises(DeliveryError, match="canonical|commit|worktree"):
+        preflight_patch(completed_cycle, patch)
+
+    assert snapshot_workspace(completed_cycle.original_repo) == before
+
+
+def test_preflight_rejects_unstaged_cycle_target_change(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST - {".gitignore"})
+    worktree_prompt = completed_cycle.worktree / "prompts" / "classify.md"
+    worktree_prompt.write_text("new unstaged candidate\n", encoding="utf-8")
+    before = snapshot_workspace(completed_cycle.original_repo)
+
+    with pytest.raises(DeliveryError, match="canonical|worktree|target"):
+        preflight_patch(completed_cycle, patch)
+
+    assert snapshot_workspace(completed_cycle.original_repo) == before
+
+
+def test_apply_rechecks_cycle_worktree_near_application(
+    completed_cycle: WorktreeCycle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST - {".gitignore"})
+    worktree_prompt = completed_cycle.worktree / "prompts" / "classify.md"
+    original_check_sources = manage_worktree._check_sources
+    calls = 0
+
+    def mutate_after_source_check(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        original_check_sources(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            worktree_prompt.write_text("TOCTOU candidate\n", encoding="utf-8")
+
+    monkeypatch.setattr(manage_worktree, "_check_sources", mutate_after_source_check)
+    before = snapshot_workspace(completed_cycle.original_repo)
+
+    with pytest.raises(DeliveryError, match="canonical|worktree|target"):
+        apply_delivery_patch(completed_cycle, patch)
+
+    assert calls == 1
+    assert snapshot_workspace(completed_cycle.original_repo) == before
+
+
+def test_delivery_does_not_fallback_to_uncommitted_prompt_contract(
+    repo: tuple[Path, str],
+) -> None:
+    original, prompt_id = repo
+    contract = original / ".prompt-evals" / prompt_id / "prompt-contract.yaml"
+    git(original, "rm", "-f", str(contract.relative_to(original)))
+    git(original, "commit", "-m", "remove prompt contract")
+    cycle = create_cycle(original, prompt_id)
+    contract.parent.mkdir(parents=True, exist_ok=True)
+    contract.write_text("prompt_path: prompts/classify.md\n", encoding="utf-8")
+    prompt = cycle.worktree / "prompts" / "classify.md"
+    prompt.write_text("candidate prompt\n", encoding="utf-8")
+    git(cycle.worktree, "add", "prompts/classify.md")
+    git(cycle.worktree, "commit", "-m", "candidate without base contract")
+
+    with pytest.raises(DeliveryError, match="canonical Prompt|allowlist"):
+        build_delivery_patch(cycle, {"prompt"})
 
 
 def test_preflight_rejects_crafted_unallowlisted_patch(

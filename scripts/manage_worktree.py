@@ -269,20 +269,14 @@ def _base_contract_prompt_path(cycle: "WorktreeCycle") -> tuple[bool, str | None
 
 
 def _discover_prompt_path(cycle: "WorktreeCycle") -> str | None:
-    contract = (
-        cycle.original_repo
-        / ".prompt-evals"
-        / (cycle.prompt_id or "")
-        / "prompt-contract.yaml"
-    )
     base_has_contract, base_prompt = _base_contract_prompt_path(cycle)
     if base_has_contract:
         contract_prompt = base_prompt
-    elif contract.is_file():
-        # A cycle created before its contract was committed may still use the
-        # current contract, but a committed base contract always wins.
-        contract_prompt = _parse_contract_prompt_path(cycle.original_repo, contract)
     else:
+        # A current-workspace contract is not a cycle trust anchor.  The
+        # contract must have been generated, confirmed, and committed before
+        # delivery; an uncommitted file must never provide the canonical
+        # Prompt path.
         contract_prompt = None
 
     if cycle.prompt_path is not None:
@@ -530,6 +524,11 @@ def _canonical_allowlist_paths(
 
     if result not in {"success", "failure"}:
         raise DeliveryError("delivery result must be success or failure")
+    base_has_contract, _ = _base_contract_prompt_path(cycle)
+    if not base_has_contract:
+        raise AllowlistError(
+            "canonical Prompt path cannot be resolved without committed prompt-contract.yaml"
+        )
     prompt = _discover_prompt_path(cycle)
     if prompt is None:
         raise AllowlistError("canonical Prompt path cannot be resolved")
@@ -626,6 +625,77 @@ def _final_commit(cycle: WorktreeCycle, value: str | None) -> str:
     if ancestry.returncode != 0:
         raise DeliveryConflict("final worktree commit is not based on the cycle base commit")
     return resolved
+
+
+def _assert_cycle_base(cycle: WorktreeCycle) -> None:
+    """Verify the immutable cycle base still anchors both repositories."""
+
+    try:
+        resolved = _git_text(
+            cycle.original_repo,
+            "rev-parse",
+            "--verify",
+            f"{cycle.cycle_base_commit}^{{commit}}",
+        )
+        original_head = _git_text(cycle.original_repo, "rev-parse", "--verify", "HEAD")
+        worktree_base = _git_text(
+            cycle.worktree,
+            "rev-parse",
+            "--verify",
+            f"{cycle.cycle_base_commit}^{{commit}}",
+        )
+    except WorktreeError as error:
+        raise DeliveryConflict("cycle base commit cannot be verified") from error
+    if resolved != cycle.cycle_base_commit or worktree_base != cycle.cycle_base_commit:
+        raise DeliveryConflict("cycle base commit is not an immutable canonical commit")
+    if original_head != cycle.cycle_base_commit:
+        raise DeliveryConflict("original repository HEAD moved after cycle creation")
+
+
+def _current_worktree_head(cycle: WorktreeCycle) -> str:
+    """Return the current cycle worktree HEAD after checking its identity."""
+
+    try:
+        worktree_root = Path(
+            _git_text(cycle.worktree, "rev-parse", "--show-toplevel")
+        ).resolve(strict=False)
+        branch = _git_text(cycle.worktree, "branch", "--show-current")
+        head = _git_text(cycle.worktree, "rev-parse", "--verify", "HEAD")
+    except WorktreeError as error:
+        raise DeliveryConflict("cycle worktree identity cannot be verified") from error
+    if worktree_root != cycle.worktree:
+        raise DeliveryConflict("cycle worktree path is not the recorded worktree")
+    if branch != cycle.branch:
+        raise DeliveryConflict("cycle worktree branch does not match cycle metadata")
+    return _final_commit(cycle, head)
+
+
+def _assert_worktree_clean(cycle: WorktreeCycle, final: str) -> None:
+    """Reject tracked worktree edits relative to its current committed HEAD."""
+
+    for arguments in (
+        ("diff", "--quiet", final, "--"),
+        ("diff", "--cached", "--quiet", final, "--"),
+    ):
+        result = _git(cycle.worktree, *arguments, check=False)
+        if result.returncode == 1:
+            raise DeliveryConflict("cycle worktree content changed after its final commit")
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            raise DeliveryError(f"unable to inspect cycle worktree content: {detail}")
+
+
+def _assert_worktree_snapshot(cycle: WorktreeCycle, patch: "DeliveryPatch") -> None:
+    """Check the cycle HEAD and every delivered target immediately around apply."""
+
+    final = _current_worktree_head(cycle)
+    if final != patch.final_worktree_commit:
+        raise DeliveryConflict("cycle worktree HEAD changed after canonical patch generation")
+    _assert_worktree_clean(cycle, final)
+    for path, expected in patch.destination_hashes.items():
+        actual = _current_hash(cycle.worktree, path)
+        if actual != expected:
+            raise DeliveryConflict(f"cycle worktree target changed: {path}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1097,89 +1167,76 @@ def _index_changed(root: Path, relative: str) -> bool:
     return False
 
 
-def _validate_patch(cycle: WorktreeCycle, patch: DeliveryPatch) -> None:
-    if patch.cycle_base_commit != cycle.cycle_base_commit:
-        raise DeliveryConflict("patch cycle_base_commit does not match cycle")
-    if not patch.final_worktree_commit:
-        raise DeliveryError("patch final worktree commit is missing")
-    if _final_commit(cycle, patch.final_worktree_commit) != patch.final_worktree_commit:
-        raise DeliveryError("patch final worktree commit is not canonical")
-    if patch.result not in {"success", "failure"}:
+def _canonical_delivery_patch(cycle: WorktreeCycle, *, result: str) -> DeliveryPatch:
+    """Regenerate delivery data solely from trusted cycle/worktree state."""
+
+    if result not in {"success", "failure"}:
         raise DeliveryError("delivery result must be success or failure")
-    paths = tuple(_reject_unsafe_delivery_path(path, label="patch path") for path in patch.paths)
-    if paths != patch.paths:
-        raise DeliveryError("patch paths are not canonical")
-    if len(set(paths)) != len(paths):
-        raise DeliveryError("patch paths must be unique")
-    canonical_prompt = _discover_prompt_path(cycle)
-    if canonical_prompt is None:
-        raise AllowlistError("canonical Prompt path cannot be resolved")
-    if patch.prompt_path is None:
-        raise DeliveryError("allowlist manifest is missing the canonical Prompt path")
-    try:
-        manifest_prompt = _relative_path(
-            cycle.original_repo,
-            patch.prompt_path,
-            label="allowlist manifest Prompt path",
-        )
-    except AllowlistError as error:
-        raise DeliveryError("allowlist manifest contains an unsafe Prompt path") from error
-    if manifest_prompt != canonical_prompt:
-        raise DeliveryError("allowlist manifest Prompt path does not match cycle metadata")
-    if set(patch.source_hashes) != set(paths) or set(patch.destination_hashes) != set(paths):
-        raise DeliveryError("patch hash manifest does not cover exactly its paths")
-    canonical_allowlist = set(
-        _canonical_allowlist_paths(cycle, result=patch.result, changed_paths=paths)
-    )
-    if patch.result == "failure" and canonical_prompt in paths:
-        raise AllowlistError("failure delivery cannot include the canonical Prompt")
-    try:
-        persisted_allowlist = tuple(
-            _reject_unsafe_delivery_path(path, label="allowlist manifest path")
-            for path in patch.allowlist_paths
-        )
-    except AllowlistError as error:
-        raise DeliveryError("allowlist manifest contains an unsafe path") from error
+    _assert_cycle_base(cycle)
+    final = _current_worktree_head(cycle)
+    _assert_worktree_clean(cycle, final)
+    return build_delivery_patch(cycle, final_commit=final, result=result)
+
+
+def _assert_patch_matches_canonical(
+    persisted: DeliveryPatch,
+    canonical: DeliveryPatch,
+) -> None:
+    """Require every persisted patch field to match regenerated bytes/data."""
+
+    canonical_prompt = canonical.prompt_path
     if (
-        len(set(persisted_allowlist)) != len(persisted_allowlist)
-        or set(persisted_allowlist) != canonical_allowlist
+        persisted.result == "failure"
+        and canonical_prompt is not None
+        and canonical_prompt in persisted.paths
     ):
+        raise AllowlistError("failure delivery cannot include the canonical Prompt")
+    if persisted.cycle_base_commit != canonical.cycle_base_commit:
+        raise DeliveryConflict("patch cycle_base_commit does not match immutable cycle metadata")
+    if persisted.final_worktree_commit != canonical.final_worktree_commit:
+        raise DeliveryConflict("patch final commit does not match the current cycle worktree HEAD")
+    if persisted.result != canonical.result:
+        raise DeliveryError("patch result does not match canonical delivery metadata")
+    if persisted.paths != canonical.paths:
+        if any(path not in canonical.allowlist_paths for path in persisted.paths):
+            raise AllowlistError("patch paths do not match the canonical delivery allowlist")
+        raise DeliveryError("patch paths do not match the canonical cycle diff")
+    if tuple(persisted.source_hashes.items()) != tuple(canonical.source_hashes.items()):
+        raise DeliveryError("patch source hashes do not match canonical cycle content")
+    if tuple(persisted.destination_hashes.items()) != tuple(canonical.destination_hashes.items()):
+        raise DeliveryError("patch destination hashes do not match canonical cycle content")
+    if persisted.prompt_path != canonical.prompt_path:
+        raise DeliveryError("allowlist manifest Prompt path does not match canonical cycle metadata")
+    if persisted.allowlist_paths != canonical.allowlist_paths:
         raise DeliveryError("allowlist manifest does not match the canonical cycle allowlist")
-    if not set(paths).issubset(canonical_allowlist):
-        outside = sorted(set(paths) - canonical_allowlist)
-        raise AllowlistError(
-            "patch contains paths outside the delivery allowlist: "
-            + ", ".join(outside)
-        )
-    for path, digest in patch.source_hashes.items():
-        if not isinstance(path, str) or (digest is not None and not _is_digest(digest)):
-            raise DeliveryError("patch source hash manifest contains an invalid digest")
-    for path, digest in patch.destination_hashes.items():
-        if not isinstance(path, str) or not _is_digest(digest):
-            raise DeliveryError("patch destination hash manifest contains an invalid digest")
-    header_paths = _patch_header_paths(patch.text)
-    if set(header_paths) != set(paths):
-        if patch.text or paths:
-            raise DeliveryError("patch manifest paths do not match patch content")
+    if persisted.text != canonical.text:
+        raise DeliveryError("patch text does not match the canonical cycle diff")
 
 
 def _check_sources(cycle: WorktreeCycle, patch: DeliveryPatch, expected: Mapping[str, object] | None) -> None:
-    expected_hashes: dict[str, object] = dict(
-        patch.source_hashes if expected is None else expected
-    )
-    normalized_expected: dict[str, object] = {}
-    for raw_path, digest in expected_hashes.items():
-        path = _relative_path(cycle.original_repo, raw_path, label="source hash path")
-        if path == "prompt":
-            prompt = _discover_prompt_path(cycle)
-            if prompt is None:
-                raise DeliveryConflict("source hash prompt path cannot be resolved")
-            path = prompt
-        normalized_expected[path] = digest
+    # ``patch.source_hashes`` is safe here only because callers first compare
+    # the patch with a newly generated canonical patch.  An optional external
+    # map may constrain the check, but it can never replace canonical hashes.
+    expected_hashes: dict[str, object] = dict(patch.source_hashes)
+    if expected is not None:
+        normalized_expected: dict[str, object] = {}
+        for raw_path, digest in expected.items():
+            try:
+                path = _relative_path(cycle.original_repo, raw_path, label="source hash path")
+            except AllowlistError as error:
+                raise DeliveryConflict("provided source hash path is unsafe") from error
+            if path == "prompt":
+                prompt = _discover_prompt_path(cycle)
+                if prompt is None:
+                    raise DeliveryConflict("source hash prompt path cannot be resolved")
+                path = prompt
+            normalized_expected[path] = digest
+        if tuple(normalized_expected.items()) != tuple(expected_hashes.items()):
+            raise DeliveryConflict("provided source hashes do not match canonical cycle content")
     for path in patch.paths:
-        if path not in normalized_expected:
+        if path not in expected_hashes:
             raise DeliveryConflict(f"source hash is missing for {path}")
-        expected_digest = normalized_expected[path]
+        expected_digest = expected_hashes[path]
         if expected_digest is not None and not isinstance(expected_digest, str):
             raise DeliveryConflict(f"source hash is invalid for {path}")
         actual = _current_hash(cycle.original_repo, path)
@@ -1200,16 +1257,23 @@ def preflight_patch(
     """Validate allowlisted paths, source hashes, and ``git apply --check``."""
 
     if patch is None:
-        patch = build_delivery_patch(cycle)
-    if isinstance(patch, (str, Path)):
-        raise DeliveryError("a patch file requires its patch manifest metadata")
-    if not isinstance(patch, DeliveryPatch):
-        raise TypeError("preflight_patch expects a DeliveryPatch")
-    _validate_patch(cycle, patch)
+        canonical = _canonical_delivery_patch(cycle, result="success")
+    else:
+        if isinstance(patch, (str, Path)):
+            raise DeliveryError("a patch file requires its patch manifest metadata")
+        if not isinstance(patch, DeliveryPatch):
+            raise TypeError("preflight_patch expects a DeliveryPatch")
+        if not isinstance(patch.result, str) or patch.result not in {"success", "failure"}:
+            raise DeliveryError("delivery result must be success or failure")
+        # Every patch payload field is treated as untrusted persisted data.
+        # Regenerate the entire object from the immutable cycle and compare it
+        # before using any supplied text, path, or hash for Git operations.
+        canonical = _canonical_delivery_patch(cycle, result=patch.result)
+        _assert_patch_matches_canonical(patch, canonical)
     # Source checks intentionally happen immediately before Git's check.  The
     # application path repeats them after this function and before apply.
-    _check_sources(cycle, patch, expected_source_hashes)
-    if patch.text:
+    _check_sources(cycle, canonical, expected_source_hashes)
+    if canonical.text:
         result = _git(
             cycle.original_repo,
             "apply",
@@ -1217,13 +1281,13 @@ def preflight_patch(
             "--whitespace=nowarn",
             "--no-3way",
             "-",
-            input_data=patch.text,
+            input_data=canonical.text,
             check=False,
         )
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", "replace").strip()
             raise DeliveryConflict(f"delivery patch conflict: {detail or 'git apply --check failed'}")
-    return patch
+    return canonical
 
 
 @dataclass(frozen=True, slots=True)
@@ -1313,6 +1377,12 @@ def apply_delivery_patch(
         patch,
         expected_source_hashes=expected_source_hashes,
     )
+    # Preflight may have returned to the caller after a persisted artifact was
+    # checked.  Regenerate once more immediately before any application so a
+    # changed cycle HEAD or target cannot become a stale delivery input.
+    latest = _canonical_delivery_patch(cycle, result=prepared.result)
+    _assert_patch_matches_canonical(prepared, latest)
+    prepared = latest
     if not prepared.text:
         return prepared
 
@@ -1321,6 +1391,11 @@ def apply_delivery_patch(
     _check_sources(cycle, prepared, expected_source_hashes)
     snapshots = _snapshot_targets(cycle.original_repo, prepared.paths)
     try:
+        # These checks are intentionally adjacent to the mutating Git command;
+        # they also run again after application so a concurrent worktree edit
+        # triggers rollback rather than being silently accepted.
+        _check_sources(cycle, prepared, expected_source_hashes)
+        _assert_worktree_snapshot(cycle, prepared)
         result = _git(
             cycle.original_repo,
             "apply",
@@ -1333,6 +1408,7 @@ def apply_delivery_patch(
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", "replace").strip()
             raise DeliveryConflict(f"delivery patch application failed: {detail or 'git apply failed'}")
+        _assert_worktree_snapshot(cycle, prepared)
         for path, expected in prepared.destination_hashes.items():
             actual = _current_hash(cycle.original_repo, path)
             if actual != expected:

@@ -27,9 +27,9 @@ Implemented `scripts/manage_worktree.py` with:
 
 - immutable `WorktreeCycle` state and `create_cycle(...)` rooted at the
   original workspace `HEAD`;
-- symbolic `"prompt"` allowlist resolution through the canonical
-  `prompt-contract.yaml` path (with a single changed-Markdown fallback only
-  when no contract exists), never as a literal path;
+- symbolic `"prompt"` allowlist resolution through the canonical, committed
+  `prompt-contract.yaml` path, never as a literal path or an uncommitted
+  contract fallback;
 - success and failure allowlists, with failure delivery excluding the
   production Prompt;
 - base-to-final-commit binary patch generation and path filtering that keeps
@@ -86,3 +86,23 @@ Addressed the delivery review findings with regression coverage for:
 The delivery parser now validates every patch section before `git apply`, and
 the application path snapshots exact targets and restores them after any
 application or destination-verification failure.
+
+## Fix round 2
+
+Closed the remaining critical trust-boundary issue.  `preflight_patch(...)` and
+`apply_delivery_patch(...)` now regenerate a canonical patch and manifest from
+the trusted cycle metadata, immutable `cycle_base_commit`, current cycle
+worktree HEAD/content, and the Ruling 1 allowlist.  The persisted patch text,
+paths, source hashes, destination hashes, Prompt path, allowlist paths, and
+commit identities must match the regenerated values item-for-item; persisted
+delivery fields are never used as the source of truth for Git application.
+
+The checks fail closed when the original HEAD, cycle worktree HEAD/branch,
+committed worktree target, or committed Prompt contract changes.  Source and
+worktree checks are repeated adjacent to application and after application,
+while exact target snapshots and destination hashes retain rollback behavior.
+Regression coverage includes a complete legal allowlisted patch with forged
+text and hashes, changed/unstaged cycle targets, worktree-adjacent TOCTOU, and
+an uncommitted `prompt-contract.yaml` fallback.  Final delivery therefore
+requires the contract to have been generated, confirmed, and committed before
+the cycle's immutable base.
