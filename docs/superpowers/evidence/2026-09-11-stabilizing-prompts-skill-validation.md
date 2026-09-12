@@ -99,6 +99,71 @@ Full case validation exited 0 with counts `dev=1`, `validation=2`,
 `acceptance=2`, and dataset SHA-256
 `5d277e28b9b8e7a8c27b110d47c06d5034fa7161d2450a5a3a57ef93d4f53d09`.
 
+### Current endpoint smoke (migrated endpoint)
+
+The controller-reported production identity probe passed for the exact
+configured identity `dbirks/Qwen3.8-27B-W4A16-AutoRound`. No raw model response,
+credential value, or authorization header was emitted. The current safe client
+configuration was:
+
+```yaml
+base_url: http://192.168.8.17:8000/v1
+model: dbirks/Qwen3.8-27B-W4A16-AutoRound
+temperature: 0.0
+timeout: 30
+max_retries: 2
+extra_body:
+  enable_thinking: false
+  enable_reasoning: false
+  enable_search: false
+omitted_sampling_parameters:
+  - top_p
+  - seed
+  - presence_penalty
+  - frequency_penalty
+  - logprobs
+  - top_logprobs
+  - logit_bias
+  - n
+  - max_completion_tokens
+  - reasoning_effort
+  - reasoning
+  - stop_sequences
+```
+
+The current fixed-client construction check exited 0 with
+`client-settings-status: verified`; its safe configuration SHA-256 was
+`1cb27d35b75624521c182572a2dca939c99cc9746ca2d0246d062ecdfd2a6436`.
+
+The one-development-case fixture was committed at
+`b51ca78e8c67f1fd2172623ce74a7c23eeba6269`. Renderer and production Pydantic
+Schema preflight passed (`target_app.production:Decision`; renderer-message
+SHA-256 `627b82ecbfc9c8ba3ce774106ba4864cd83302bb1146abbba93c36c561241b54`).
+The production runner attempted the fixed
+`with_structured_output(method="function_calling", include_raw=True)` path with
+the fixed Schema, then exited 2 because the current LAN service returned
+`transport_error:http_status_502`.
+
+The sanitized runner manifest reported:
+
+```text
+manifest status: incomplete
+slots: 5
+pending: 4
+classifications: transport_error=1
+manifest SHA-256: 135193696952bfc333cb581092b9174c2179bc11757d8c8b8fd4bb9827945cd1
+```
+
+No parsed response or protocol result was observed because no response envelope
+was returned. The configured 30-second timeout was verified at construction,
+but no live timeout event was observed—the request failed with HTTP 502 before
+the timeout classification. Live redaction could not be exercised without a
+response; the run emitted no credential, authorization header, or raw response,
+and offline redaction tests remain the available redaction evidence. This
+current smoke is **not completed** and remains blocked by the external model
+service gate (`HTTP 502`); no alternate model, endpoint, or credential was
+tried.
+
 ### Historical pre-migration attempt (old endpoint)
 
 The following identity and smoke results are retained from the pre-migration
