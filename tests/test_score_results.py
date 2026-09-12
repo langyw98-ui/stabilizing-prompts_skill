@@ -38,12 +38,6 @@ class AliasedDecision(BaseModel):
     reason: str
 
 
-class DecisionWithSecretPrivateState(BaseModel):
-    action: str
-    reason: str
-    _authorization_token: str = PrivateAttr(default="expected-token")
-
-
 def _case(case_id: str, *, priority: str = "normal") -> dict[str, object]:
     return {
         "id": case_id,
@@ -125,23 +119,7 @@ def test_field_diff_preserves_production_schema_field_order():
     ]
 
 
-def test_field_diff_reports_redacted_model_state_when_private_attr_differs():
-    expected = DecisionWithSecretPrivateState(action="accept", reason="matched")
-    actual = DecisionWithSecretPrivateState(action="accept", reason="matched")
-    expected._authorization_token = "expected-secret-token"
-    actual._authorization_token = "actual-secret-token"
-
-    differences = field_diff(expected, actual)
-
-    assert differences
-    assert differences[0]["path"] == "$model_state"
-    rendered = repr(differences)
-    assert "expected-secret-token" not in rendered
-    assert "actual-secret-token" not in rendered
-    assert "REDACTED" in rendered
-
-
-def test_scoring_uses_complete_pydantic_object_equality():
+def test_scoring_ignores_private_state_and_matches_online_serialization():
     run = new_manifest(
         cases=[_case("private")],
         repeats=1,
@@ -166,8 +144,21 @@ def test_scoring_uses_complete_pydantic_object_equality():
 
     metrics = score_run(run, DecisionWithPrivateState)
 
-    assert metrics.pass_count == 0
-    assert metrics.business_error_count == 1
+    assert metrics.pass_count == 1
+    assert metrics.business_error_count == 0
+    assert metrics.case_score("private").field_diffs == ((),)
+
+
+def test_declared_field_difference_keeps_accurate_nonempty_diff():
+    expected = DecisionWithPrivateState(action="accept", reason="matched")
+    actual = DecisionWithPrivateState(action="reject", reason="matched")
+    actual._source = "candidate"
+
+    differences = field_diff(expected, actual)
+
+    assert differences == [
+        {"path": "action", "expected": "accept", "actual": "reject"}
+    ]
 
 
 def test_scoring_reconstructs_persisted_alias_normalized_objects():

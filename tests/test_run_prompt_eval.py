@@ -11,7 +11,7 @@ import openai
 import pytest
 import yaml
 from langchain_core.messages import AIMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from scripts.run_prompt_eval import (
     SlotResult,
@@ -32,6 +32,14 @@ from scripts.validate_cases import EvalCase, ValidatedCase
 class Decision(BaseModel):
     action: str
     reason: str
+
+
+class DecisionWithRuntimeState(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    action: str
+    reason: str
+    _cache: str = PrivateAttr(default="expected")
 
 
 def case(case_id: str) -> SimpleNamespace:
@@ -713,3 +721,15 @@ def test_safe_serialize_uses_recursion_stack_and_redacts_shared_references() -> 
     cycle: list[object] = []
     cycle.append(cycle)
     assert _safe_serialize(cycle) == ["[RECURSIVE]"]
+
+
+def test_model_persistence_uses_declared_canonical_fields_only() -> None:
+    expected = DecisionWithRuntimeState(action="accept", reason="matched")
+    actual = DecisionWithRuntimeState(action="accept", reason="matched")
+    actual._cache = "candidate"
+    actual.runtime_marker = "candidate-only"
+
+    assert _safe_serialize(expected) == _safe_serialize(actual) == {
+        "action": "accept",
+        "reason": "matched",
+    }

@@ -31,6 +31,7 @@ try:
         NON_SCORING_KINDS,
         RunManifest,
         SlotResult,
+        _safe_serialize as _runtime_safe_serialize,
         _schema_import_reference as _runtime_schema_import_reference,
         load_manifest,
         redact_secret,
@@ -42,6 +43,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct-script compatibility
         NON_SCORING_KINDS,
         RunManifest,
         SlotResult,
+        _safe_serialize as _runtime_safe_serialize,
         _schema_import_reference as _runtime_schema_import_reference,
         load_manifest,
         redact_secret,
@@ -212,46 +214,17 @@ def _safe_value(value: object) -> object:
 
 
 def _model_mapping(value: BaseModel) -> Mapping[str, object]:
-    try:
-        dumped = value.model_dump(mode="python", by_alias=False)
-    except Exception as error:  # pragma: no cover - defensive for custom models
-        raise ScoreError(f"unable to serialize production schema object: {error}") from None
-    if not isinstance(dumped, Mapping):  # pragma: no cover - pydantic contract
+    """Return canonical JSON data for declared Schema fields only."""
+
+    dumped = _runtime_safe_serialize(value)
+    if not isinstance(dumped, Mapping):  # pragma: no cover - defensive contract
         raise ScoreError("production schema object did not serialize to an object")
-    return dumped
-
-
-def _model_state(value: BaseModel) -> dict[str, object]:
-    """Capture Pydantic equality state omitted by ``model_dump``.
-
-    Pydantic compares private attributes, extra fields, and user-added
-    ``__dict__`` state in addition to declared fields.  Keep those components
-    under stable names so a business mismatch never loses its evidence merely
-    because the differing state is not a public model field.
-    """
-
-    field_names = set(getattr(type(value), "model_fields", {}))
-    raw_dict = getattr(value, "__dict__", {})
-    internal: Mapping[object, object]
-    if isinstance(raw_dict, Mapping):
-        internal = {
-            key: item
-            for key, item in raw_dict.items()
-            if key not in field_names
-        }
-    else:
-        internal = {}
-    private = getattr(value, "__pydantic_private__", None)
-    extra = getattr(value, "__pydantic_extra__", None)
+    field_names = getattr(type(value), "model_fields", {})
     return {
-        "private": private if isinstance(private, Mapping) else {},
-        "extra": extra if isinstance(extra, Mapping) else {},
-        "internal": internal,
+        name: dumped[name]
+        for name in field_names
+        if isinstance(name, str) and name in dumped
     }
-
-
-def _model_state_path(path: str) -> str:
-    return f"{path}.$model_state" if path else "$model_state"
 
 
 def _path_for_key(path: str, key: object) -> str:
@@ -298,20 +271,6 @@ def _diff_values(expected: object, actual: object, path: str, output: list[dict[
                 )
             else:
                 _diff_values(expected_map[key], actual_map[key], child_path, output)
-        expected_state = _model_state(expected)
-        actual_state = _model_state(actual)
-        try:
-            state_differs = expected_state != actual_state
-        except Exception:
-            state_differs = True
-        if state_differs:
-            output.append(
-                {
-                    "path": _model_state_path(path),
-                    "expected": _safe_value(expected_state),
-                    "actual": _safe_value(actual_state),
-                }
-            )
         return
 
     if isinstance(expected, Mapping) and isinstance(actual, Mapping):
@@ -390,24 +349,16 @@ def field_diff(expected: BaseModel, actual: BaseModel) -> list[dict[str, object]
         raise TypeError("field_diff expects two Pydantic BaseModel objects")
     output: list[dict[str, object]] = []
     _diff_values(expected, actual, "", output)
-    if not output:
-        try:
-            objects_differ = expected != actual
-        except Exception:
-            objects_differ = True
-        if objects_differ:
-            output.append(
-                {
-                    "path": "$model_state",
-                    "expected": _safe_value(
-                        {"fields": _model_mapping(expected), **_model_state(expected)}
-                    ),
-                    "actual": _safe_value(
-                        {"fields": _model_mapping(actual), **_model_state(actual)}
-                    ),
-                }
-            )
     return output
+
+
+def _canonical_objects_equal(expected: BaseModel, actual: BaseModel) -> bool:
+    """Compare only canonical serialization of declared production fields."""
+
+    return (
+        type(expected) is type(actual)
+        and _model_mapping(expected) == _model_mapping(actual)
+    )
 
 
 def _validate_complete_object(
@@ -743,7 +694,11 @@ def score_run(
             # The complete production-object comparison is authoritative.  A
             # stale/mislabeled persisted kind cannot manufacture a pass or hide
             # a business mismatch.
-            kind = "pass" if expected == actual else "business_error"
+            kind = (
+                "pass"
+                if _canonical_objects_equal(expected, actual)
+                else "business_error"
+            )
         grouped.setdefault(slot.case_id, []).append((kind, result, differences))
 
     case_scores: list[CaseScore] = []

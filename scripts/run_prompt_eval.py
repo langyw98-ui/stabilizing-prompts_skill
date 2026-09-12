@@ -146,6 +146,26 @@ def _schema_import_reference(
     return f"{module}:{qualname}"
 
 
+def _canonical_model_dump(value: BaseModel) -> Mapping[str, object]:
+    """Serialize only production Schema fields using canonical field names."""
+
+    try:
+        dumped = value.model_dump(mode="json", by_alias=False)
+    except Exception:
+        try:
+            dumped = value.model_dump(mode="python", by_alias=False)
+        except Exception:
+            return {}
+    if not isinstance(dumped, Mapping):
+        return {}
+    fields = getattr(type(value), "model_fields", {})
+    return {
+        name: dumped[name]
+        for name in fields
+        if isinstance(name, str) and name in dumped
+    }
+
+
 def _safe_serialize(value: object, _seen: set[int] | None = None) -> object:
     """Convert runtime values to JSON-compatible values before redaction.
 
@@ -167,12 +187,9 @@ def _safe_serialize(value: object, _seen: set[int] | None = None) -> object:
     if isinstance(value, BaseModel):
         seen.add(value_id)
         try:
-            dumped = value.model_dump(mode="json")
+            dumped = _canonical_model_dump(value)
         except Exception:
-            try:
-                dumped = value.model_dump(mode="python")
-            except Exception:
-                dumped = safe_error(value)
+            dumped = safe_error(value)
         try:
             return _safe_serialize(dumped, seen)
         finally:
@@ -913,15 +930,31 @@ def _model_data(value: object) -> object:
     return _safe_serialize(value)
 
 
-def _expected_data(manifest: RunManifest, case_id: str) -> object | None:
+def _expected_data(
+    manifest: RunManifest,
+    case_id: str,
+    schema: type[BaseModel] | None = None,
+) -> object | None:
     payload = manifest.case_data.get(case_id)
+    expected: object | None = None
     if isinstance(payload, Mapping):
         if "expected" in payload:
-            return payload["expected"]
-        expect = payload.get("expect")
-        if isinstance(expect, Mapping) and "output" in expect:
-            return expect["output"]
-    return None
+            expected = payload["expected"]
+        else:
+            expect = payload.get("expect")
+            if isinstance(expect, Mapping) and "output" in expect:
+                expected = expect["output"]
+    if schema is not None and isinstance(expected, Mapping):
+        try:
+            expected = schema.model_validate(
+                expected,
+                extra="forbid",
+                by_alias=True,
+                by_name=True,
+            )
+        except ValidationError:
+            return expected
+    return _model_data(expected) if isinstance(expected, BaseModel) else expected
 
 
 def _restore_eval_case(case_id: str, payload: object) -> EvalCase:
@@ -1004,7 +1037,7 @@ def _slot_result_from_response(
                     slot_key=slot.key,
                 )
     actual_data = _model_data(parsed)
-    expected_data = _expected_data(manifest, slot.case_id)
+    expected_data = _expected_data(manifest, slot.case_id, schema)
     kind = "pass" if expected_data is not None and actual_data == expected_data else "business_error"
     return SlotResult(
         kind=kind,

@@ -306,15 +306,15 @@ def prepare_call(prompt_path, case) -> dict:
 
 `prepare_call` 返回 `messages` 和 `schema`；`schema` 必须是生产 Pydantic `BaseModel` 类型。模型、地址、Token、`temperature=0.0`、关闭 thinking/reasoning/search、超时、重试和 `include_raw=True` 均由固定客户端与通用 runner 控制。`include_raw=True` 只保留 LangChain 的原始消息与解析错误，不改变发给模型的 function calling 请求。V1 不支持 `parse_response`、`check_result`、部分字段断言、数值容差、无序集合特殊比较或多个合法预期。
 
-通用 runner 负责调用槽位、固定 `ChatOpenAI` 调用、原始 `AIMessage` 保存、错误分类和完整 Pydantic 对象比较。适配器 smoke test 必须证明原 Prompt 能通过该边界完成一次真实渲染、function calling 和生产 Schema 实例化。
+通用 runner 负责调用槽位、固定 `ChatOpenAI` 调用、原始 `AIMessage` 保存、错误分类和生产 Schema 声明字段的规范序列化比较。适配器 smoke test 必须证明原 Prompt 能通过该边界完成一次真实渲染、function calling 和生产 Schema 实例化。
 
 如果工程调用链无法注入候选 Prompt 或固定客户端，Skill 可以在评测目录生成最薄的兼容层，但必须继续直接导入生产渲染器和 Schema。无法等价复现时应停止并说明差异，不能给出通过结论。
 
 ## 10. 确定性断言与评分
 
-Skill 不使用 LLM Judge。案例的完整 `expect.output` 先由生产 Pydantic Schema 构造为预期对象；模型结果由 `ChatOpenAI.with_structured_output` 构造后，从 `include_raw=True` 返回值的 `parsed` 字段取得同一 Pydantic 类型的实际对象。两者直接进行完整对象相等比较。
+Skill 不使用 LLM Judge。案例的完整 `expect.output` 先由生产 Pydantic Schema 构造为预期对象；模型结果由 `ChatOpenAI.with_structured_output` 构造后，从 `include_raw=True` 返回值的 `parsed` 字段取得同一 Pydantic 类型的实际对象。两者只比较生产 Schema 声明字段通过规范序列化得到的完整数据，并使用规范字段名（不使用别名）表示结果。
 
-字段集合、类型、默认值、别名、必填、可空和结构约束全部由生产 Schema 决定，不另建断言 DSL。V1 不允许省略字段规避评分，也不提供自定义判定器。对象不相等时，scorer 读取两个 Pydantic 对象的字段生成具体字段路径、期望值和实际值差异；字段展开只用于报告，不改变对象相等这一评分依据。
+字段集合、类型、默认值、别名、必填、可空和结构约束全部由生产 Schema 决定，不另建断言 DSL。V1 不允许省略字段规避评分，也不提供自定义判定器。规范序列化数据不相等时，scorer 读取声明字段生成具体字段路径、期望值和实际值差异；字段展开只用于报告，不改变规范数据比较这一评分依据。`PrivateAttr`、缓存及其他 runtime-only state 不持久化、不计分，也不生成字段差异。
 
 错误分成两层：
 
@@ -328,8 +328,8 @@ Skill 不使用 LLM Judge。案例的完整 `expect.output` 先由生产 Pydanti
 
 1. `parse_error`：已取得原始 `AIMessage`，但缺少结构化 function call、目标载荷缺失或载荷无法解码；
 2. `schema_error`：结构化载荷存在且可解码，但 `with_structured_output` 无法用生产 Pydantic Schema 构造对象；
-3. `business_error`：实际与预期均为同一生产 Pydantic 类型，但完整对象不相等；
-4. `pass`：实际与预期 Pydantic 对象完全相等。
+3. `business_error`：实际与预期均为同一生产 Pydantic 类型，但声明字段的规范序列化数据不相等；
+4. `pass`：实际与预期的声明字段规范序列化数据完全相等。
 
 错误分类以明确证据为准。连接、超时、HTTP 408、429 或 5xx 进入可恢复的 `transport_error`；其他由 `ChatOpenAI` 或 OpenAI SDK 抛出的异常统一进入非评分 `setup_error`。结构化调用正常返回时，结果必须是同时包含 `raw`、`parsed` 和 `parsing_error` 的字典，否则进入 `protocol_error`。只有取得原始 `AIMessage` 后才进入 Prompt 评分：没有预期 function call 时记为 `parse_error: missing_payload`；拒答、截断或不可解码载荷记录为 `parse_error` 的对应细分原因；Pydantic `ValidationError` 中的 `json_invalid` 归为 `parse_error`，其他 Pydantic `ValidationError` 归为 `schema_error`，不得匹配异常文本分类。`message.content` 为 `None` 但 `tool_calls` 中存在可由生产 Schema 构造的结果时正常评分。
 
@@ -525,7 +525,7 @@ stability_regression_count
 
 - `prompt-id` 生成和路径碰撞；
 - 三套案例的 ID、语义族和格式校验；
-- 完整生产 Pydantic 对象相等比较和字段差异报告；
+- 生产 Schema 声明字段的规范序列化比较和字段差异报告；
 - 结构化调用返回值不符合字典契约、原始消息缺失、结构化载荷缺失、解析失败、Schema 失败和业务失败分类；
 - 30 秒超时、最多 2 次重试、固定调用槽位中断与恢复；
 - manifest 兼容性和两类回归计算；
@@ -563,7 +563,7 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 |---|---|---|
 | 个人 Skill `SKILL.md` | 触发、决策、工作流和门禁 | 项目业务规则、Token 回显、具体 Prompt 内容 |
 | `scripts/local_model_client.py` | 固定 `ChatOpenAI`、`temperature=0.0`、关闭 thinking/reasoning/search、30 秒超时和 2 次重试 | 项目配置覆盖、模型选择、参数搜索、报告业务结论 |
-| 通用 runner/scorer | Pydantic function calling、固定槽位、恢复执行、完整对象比较、错误分类、指标和基线比较 | 推断业务真值、修改验收预期、实现通用断言语言 |
+| 通用 runner/scorer | Pydantic function calling、固定槽位、恢复执行、声明字段规范序列化比较、错误分类、指标和基线比较 | 推断业务真值、修改验收预期、实现通用断言语言 |
 | `scripts/manage_worktree.py` | 隔离 worktree、同步补丁预检和哈希校验 | 自动合并、覆盖用户修改、提交原工作区 |
 | 项目 `prompt-contract.yaml` | 已确认业务契约和证据 | 模型生成的未经确认结论 |
 | 项目三套数据集 | 输入、预期、优先级、维度和语义族 | 调优中自动迁就候选、跨集合放置近邻案例 |
@@ -585,7 +585,7 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 7. 模型地址、名称、`temperature=0.0`、关闭 thinking/reasoning/search、30 秒超时和 2 次重试固定在受跟踪的个人 Skill 客户端中；Token 只从 Skill 根目录 `.local/model-credentials.json` 读取，且不出现在日志、异常、manifest、报告或目标工程；
 8. 原 Prompt、候选 Prompt 使用相同固定请求行为和兼容 manifest；
 9. 开发集、验证集和验收集隔离，验收结果不反馈到本周期；
-10. 案例完整预期与模型结果均由同一生产 Pydantic Schema 构造，并以完整对象相等判定正确性；Schema 合法性、稳定性、门禁回归和完全稳定性回归分别计量；严格改善只用于验证集候选选择，验收集只要求达标且相对原 Prompt 无回归；
+10. 案例完整预期与模型结果均由同一生产 Pydantic Schema 构造，并以声明字段规范序列化数据相等判定正确性；PrivateAttr、缓存和其他 runtime-only state 不参与持久化或评分；Schema 合法性、稳定性、门禁回归和完全稳定性回归分别计量；严格改善只用于验证集候选选择，验收集只要求达标且相对原 Prompt 无回归；
 11. 传输失败不计入 Prompt 指标，固定槽位可恢复补齐，未完成时不形成结论；
 12. Skill 不使用 LLM Judge，不处理无法确定判分的 Prompt；
 13. 结构化调用正常返回但不满足 `raw`、`parsed`、`parsing_error` 字典契约时计为 `protocol_error`；取得原始消息后缺少结构化载荷才计为 `parse_error`；自动调优只写临时候选，未经用户最终确认不在 worktree 中替换生产 Prompt；

@@ -4,9 +4,9 @@ This reference preserves sections 10 and 11 of the approved design.
 
 ## 10. 确定性断言与评分
 
-Skill 不使用 LLM Judge。案例的完整 `expect.output` 先由生产 Pydantic Schema 构造为预期对象；模型结果由 `ChatOpenAI.with_structured_output` 构造后，从 `include_raw=True` 返回值的 `parsed` 字段取得同一 Pydantic 类型的实际对象。两者直接进行完整对象相等比较。
+Skill 不使用 LLM Judge。案例的完整 `expect.output` 先由生产 Pydantic Schema 构造为预期对象；模型结果由 `ChatOpenAI.with_structured_output` 构造后，从 `include_raw=True` 返回值的 `parsed` 字段取得同一 Pydantic 类型的实际对象。两者只比较生产 Schema 声明字段通过规范序列化得到的完整数据，并使用规范字段名（不使用别名）表示结果。
 
-字段集合、类型、默认值、别名、必填、可空和结构约束全部由生产 Schema 决定，不另建断言 DSL。V1 不允许省略字段规避评分，也不提供自定义判定器。对象不相等时，scorer 读取两个 Pydantic 对象的字段生成具体字段路径、期望值和实际值差异；字段展开只用于报告，不改变对象相等这一评分依据。
+字段集合、类型、默认值、别名、必填、可空和结构约束全部由生产 Schema 决定，不另建断言 DSL。V1 不允许省略字段规避评分，也不提供自定义判定器。规范序列化数据不相等时，scorer 读取声明字段生成具体字段路径、期望值和实际值差异；字段展开只用于报告，不改变规范数据比较这一评分依据。`PrivateAttr`、缓存及其他 runtime-only state 不持久化、不计分，也不生成字段差异。
 
 错误分成两层：
 
@@ -20,8 +20,8 @@ Skill 不使用 LLM Judge。案例的完整 `expect.output` 先由生产 Pydanti
 
 1. `parse_error`：已取得原始 `AIMessage`，但缺少结构化 function call、目标载荷缺失或载荷无法解码；
 2. `schema_error`：结构化载荷存在且可解码，但 `with_structured_output` 无法用生产 Pydantic Schema 构造对象；
-3. `business_error`：实际与预期均为同一生产 Pydantic 类型，但完整对象不相等；
-4. `pass`：实际与预期 Pydantic 对象完全相等。
+3. `business_error`：实际与预期均为同一生产 Pydantic 类型，但声明字段的规范序列化数据不相等；
+4. `pass`：实际与预期的声明字段规范序列化数据完全相等。
 
 错误分类以明确证据为准。连接、超时、HTTP 408、429 或 5xx 进入可恢复的 `transport_error`；其他由 `ChatOpenAI` 或 OpenAI SDK 抛出的异常统一进入非评分 `setup_error`。结构化调用正常返回时，结果必须是同时包含 `raw`、`parsed` 和 `parsing_error` 的字典，否则进入 `protocol_error`。只有取得原始 `AIMessage` 后才进入 Prompt 评分：没有预期 function call 时记为 `parse_error: missing_payload`；拒答、截断或不可解码载荷记录为 `parse_error` 的对应细分原因；Pydantic `ValidationError` 中的 `json_invalid` 归为 `parse_error`，其他 Pydantic `ValidationError` 归为 `schema_error`，不得匹配异常文本分类。`message.content` 为 `None` 但 `tool_calls` 中存在可由生产 Schema 构造的结果时正常评分。
 

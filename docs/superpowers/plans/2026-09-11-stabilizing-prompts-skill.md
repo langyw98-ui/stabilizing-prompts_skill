@@ -34,7 +34,7 @@
 - `scripts/validate_workspace.py`: Git boundary checks, `kds` validation, prompt identity, dirty dependency checks, and prompt ID generation.
 - `scripts/validate_cases.py`: YAML models, uniqueness/leakage checks, production Schema validation, and dataset hashing.
 - `scripts/run_prompt_eval.py`: adapter loading, immutable manifests, fixed slots, retries/resume, invocation, classification, and raw-result persistence.
-- `scripts/score_results.py`: exact Pydantic comparison, field diffs, and per-run metrics.
+- `scripts/score_results.py`: exact canonical declared-field comparison, field diffs, and per-run metrics.
 - `scripts/compare_runs.py`: manifest compatibility, regression counts, and phase-specific gates.
 - `scripts/manage_worktree.py`: isolated cycle creation, allowlisted patch generation, preflight, application, rollback, and hash verification.
 - `references/business-contract.md`: required contract fields and evidence rules.
@@ -465,6 +465,12 @@ rtk git commit -m "feat: run resumable prompt evaluations"
 **Interfaces:**
 - Consumes: completed `RunManifest` objects, their recorded Schema import reference, and the production Pydantic Schema.
 - Produces: `RunMetrics`, `CaseScore`, `Comparison`, `score_run(manifest, schema)`, `compare_runs(baseline, candidate, phase)`, and `evaluate_gate(comparison, phase)`.
+
+Exact equality and field diffs cover only production Pydantic Schema declared
+fields represented by canonical serialization with field names. `PrivateAttr`,
+caches, and other runtime-only state are not persisted, scored, or included in
+diffs; online runner classification and persisted scoring must share this
+semantics.
 
 - [ ] **Step 1: Write failing scoring tests**
 
