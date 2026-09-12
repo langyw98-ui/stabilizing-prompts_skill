@@ -543,7 +543,7 @@ stability_regression_count
 
 测试 transport 不能通过项目配置进入生产运行路径。生产客户端仍只允许固定局域网模型。
 
-Python 工程集成测试在隔离的临时仓库中验证固定 Conda `kds` 环境、生产渲染器和 Pydantic Schema 导入、拒绝其他 Python 环境、相关与无关脏文件处理、`tune` 内部初始化阶段连续进入候选调优、从 `cycle_base_commit` 生成白名单补丁和最终同步、未暂存未提交的同步结果，以及 `verify` 不修改规范资产且不能运行验收集。
+Python 工程集成测试在隔离的临时仓库中验证固定 Conda `kds` 环境、生产渲染器和 Pydantic Schema 导入、拒绝其他 Python 环境、相关与无关脏文件处理、从 `cycle_base_commit` 生成白名单补丁和最终同步、未暂存未提交的同步结果，以及 `verify` 不修改规范资产且不能运行验收集。Task 9 的 fixture orchestration 只调用这些真实生产 leaf CLI/module，并通过显式的测试专用 client 边界注入离线 transport；它不实现第二套生产 `tune`/`verify` 编排，也不代表已经覆盖 `SKILL.md` 的整体状态机。Task 9 对固定生产客户端的身份和请求设置不作覆盖声明，该证据由 Task 4 和 Task 10 提供。
 
 发布前必须使用固定局域网模型完成至少一次端到端 smoke test，确认模型身份、`temperature=0.0`、关闭 thinking/reasoning/search、Pydantic function calling、`include_raw=True`、超时、结构化返回契约与缺失载荷分类、基线与候选请求一致性，以及 Token 不进入输出。日常离线测试不依赖局域网服务。
 

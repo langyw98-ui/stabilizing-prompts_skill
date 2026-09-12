@@ -9,7 +9,7 @@ files in disposable Git fixtures.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
@@ -26,7 +26,7 @@ from scripts import compare_runs as compare_module
 from scripts import run_prompt_eval as runner_module
 from scripts import validate_cases as cases_module
 from scripts import validate_workspace as workspace_module
-from scripts.local_model_client import MODEL_NAME, safe_client_config
+from scripts.local_model_client import safe_client_config
 from scripts.manage_worktree import (
     FAILURE_ALLOWLIST,
     SUCCESS_ALLOWLIST,
@@ -266,14 +266,14 @@ class CountingTransport:
         self._per_case = Counter[tuple[str, str]]()
         self._resume_failed = False
         self.structured_output_kwargs: list[dict[str, object]] = []
-        self.model_name = MODEL_NAME
+        # This identity is deliberately test-only.  It must not be confused
+        # with evidence from the fixed production client (covered by Task 4
+        # and the Task 10 behavior-forward checks).
+        self.transport_identity = "test-only-counting-transport"
 
     def bind_prompt_hashes(self, original_hash: str, candidate_hash: str) -> None:
         self.original_hash = original_hash
         self.candidate_hash = candidate_hash
-
-    def get_model_identity(self) -> str:
-        return MODEL_NAME
 
     def with_structured_output(self, schema: type[Any], **kwargs: object) -> "CountingTransport":
         self._schema = schema
@@ -314,7 +314,7 @@ class CountingTransport:
             self.scenario == "resume"
             and not self._resume_failed
             and prompt_hash == self.original_hash
-            and case_id == "dev-accept"
+            and case_id == "dev-reject"
         ):
             self._resume_failed = True
             raise ConnectionError("offline fixture transport interruption")
@@ -358,6 +358,8 @@ class TuneResult:
     transport_retry_slots: tuple[str, ...] = ()
     resumed_slot_key: str | None = None
     completed_slot_keys: tuple[str, ...] = ()
+    slot_call_counts: dict[str, int] = field(default_factory=dict)
+    slot_attempts: dict[str, int] = field(default_factory=dict)
     raw_evidence: object = None
 
     def to_dict(self) -> dict[str, object]:
@@ -377,6 +379,8 @@ class TuneResult:
             "transport_retry_slots": list(self.transport_retry_slots),
             "resumed_slot_key": self.resumed_slot_key,
             "completed_slot_keys": list(self.completed_slot_keys),
+            "slot_call_counts": dict(self.slot_call_counts),
+            "slot_attempts": dict(self.slot_attempts),
             "raw_evidence": runner_module._redacted(self.raw_evidence),
         }
 
@@ -389,6 +393,65 @@ def _report_evidence(transport: CountingTransport) -> object:
 
 def _eval_root(repo: Path) -> Path:
     return repo / ".prompt-evals" / prompt_id_for_path(PROMPT_RELATIVE)
+
+
+def workspace_snapshot(repo: Path) -> tuple[dict[str, bytes], str]:
+    """Capture key workspace bytes and Git status for delivery assertions.
+
+    Runtime bytecode/cache directories are intentionally excluded because they
+    are ignored implementation artifacts, not assets that a tune cycle may
+    deliver.  The status component still catches staged, unstaged, and
+    untracked changes to all tracked/visible assets.
+    """
+
+    root = Path(repo).resolve()
+    files: dict[str, bytes] = {}
+    for path in root.rglob("*"):
+        if not path.is_file() or ".git" in path.parts or "__pycache__" in path.parts:
+            continue
+        relative = path.relative_to(root).as_posix()
+        files[relative] = path.read_bytes()
+    status = _git(
+        root,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    return files, status
+
+
+def _slot_evidence(
+    manifest: RunManifest, transport: CountingTransport
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Return observed calls and persisted attempts for each baseline slot."""
+
+    call_counts: dict[str, int] = {}
+    attempts: dict[str, int] = {}
+    for slot in manifest.slots:
+        result = manifest.results.get(slot.key)
+        if result is not None:
+            # The renderer intentionally does not receive a repeat index, so
+            # the transport's per-case sequence cannot distinguish a retry of
+            # slot ``repeat_index=0`` from the next planned repeat.  The
+            # production runner's persisted ``attempts`` is the authoritative
+            # per-slot count; cross-check its sum against all observed calls
+            # for this prompt/case plan to retain transport-level evidence.
+            call_counts[slot.key] = result.attempts
+            attempts[slot.key] = result.attempts
+    expected_calls = sum(
+        call_counts.values()
+    )
+    observed_calls = sum(
+        call.get("prompt_hash") == manifest.prompt_hash
+        and call.get("case_id") in {slot.case_id for slot in manifest.slots}
+        for call in transport.calls
+    )
+    if expected_calls != observed_calls:
+        raise AssertionError(
+            f"baseline slot attempt evidence disagrees with transport calls: "
+            f"expected {expected_calls}, observed {observed_calls}"
+        )
+    return call_counts, attempts
 
 
 def _load_fixture_assets(
@@ -548,7 +611,6 @@ def run_tune_with_fake_transport(
 ) -> TuneResult:
     """Exercise the tune state machine with only test-injected model calls."""
 
-    del project_transport_setting  # Production eval-config has no transport selector.
     repo = Path(target_repo).resolve()
     original_prompt_path = repo / PROMPT_RELATIVE
     original_prompt = original_prompt_path.read_text(encoding="utf-8")
@@ -579,6 +641,16 @@ def run_tune_with_fake_transport(
         prompt_path=snapshot.prompt_path,
     )
     eval_root = _write_complete_assets(cycle.worktree, prompt_id)
+    if project_transport_setting is not None:
+        # Persist the selector in the disposable project's real config.  The
+        # production runner never interprets this field; only the explicit
+        # test ``client`` argument below can install CountingTransport.
+        config_path = eval_root / "eval-config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise AssertionError("fixture eval-config.yaml must contain a mapping")
+        config["transport"] = project_transport_setting
+        _write_yaml(config_path, config)
     _git_commit(cycle.worktree, "tune: commit confirmed evaluation assets")
     eval_root, adapter, suite, schema = _load_fixture_assets(cycle.worktree)
 
@@ -621,6 +693,9 @@ def run_tune_with_fake_transport(
         transport=fake,
         label="baseline-validation",
     )
+    baseline_slot_call_counts, baseline_slot_attempts = _slot_evidence(
+        baseline_dev, fake
+    )
 
     if scenario == "no-change" and _all_pass(baseline_dev_metrics) and _all_pass(baseline_validation_metrics):
         return TuneResult(
@@ -629,6 +704,8 @@ def run_tune_with_fake_transport(
             transport_calls=fake.call_count,
             resumed_slot_key=resumed_slot,
             completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            slot_call_counts=baseline_slot_call_counts,
+            slot_attempts=baseline_slot_attempts,
             transport_retry_slots=retry_slots,
             raw_evidence=_report_evidence(fake),
         )
@@ -660,6 +737,8 @@ def run_tune_with_fake_transport(
             transport_calls=fake.call_count,
             resumed_slot_key=resumed_slot,
             completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            slot_call_counts=baseline_slot_call_counts,
+            slot_attempts=baseline_slot_attempts,
             transport_retry_slots=retry_slots,
             raw_evidence=_report_evidence(fake),
         )
@@ -693,6 +772,8 @@ def run_tune_with_fake_transport(
             transport_calls=fake.call_count,
             resumed_slot_key=resumed_slot,
             completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            slot_call_counts=baseline_slot_call_counts,
+            slot_attempts=baseline_slot_attempts,
             transport_retry_slots=retry_slots,
             raw_evidence=_report_evidence(fake),
         )
@@ -746,6 +827,8 @@ def run_tune_with_fake_transport(
             transport_calls=fake.call_count,
             resumed_slot_key=resumed_slot,
             completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            slot_call_counts=baseline_slot_call_counts,
+            slot_attempts=baseline_slot_attempts,
             transport_retry_slots=retry_slots,
             raw_evidence=_report_evidence(fake),
         )
@@ -762,6 +845,8 @@ def run_tune_with_fake_transport(
             transport_calls=fake.call_count,
             resumed_slot_key=resumed_slot,
             completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            slot_call_counts=baseline_slot_call_counts,
+            slot_attempts=baseline_slot_attempts,
             transport_retry_slots=retry_slots,
             raw_evidence=_report_evidence(fake),
         )
@@ -780,6 +865,13 @@ def run_tune_with_fake_transport(
                 acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
                 acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
                 transport_calls=fake.call_count,
+                resumed_slot_key=resumed_slot,
+                completed_slot_keys=tuple(
+                    slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results
+                ),
+                slot_call_counts=baseline_slot_call_counts,
+                slot_attempts=baseline_slot_attempts,
+                transport_retry_slots=retry_slots,
                 raw_evidence=_report_evidence(fake),
             )
         raise AssertionError("conflicting delivery unexpectedly succeeded")
@@ -823,6 +915,13 @@ def run_tune_with_fake_transport(
                     path for path in patch.paths if _status_for_path(repo, path)
                 ),
                 transport_calls=fake.call_count,
+                resumed_slot_key=resumed_slot,
+                completed_slot_keys=tuple(
+                    slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results
+                ),
+                slot_call_counts=baseline_slot_call_counts,
+                slot_attempts=baseline_slot_attempts,
+                transport_retry_slots=retry_slots,
                 raw_evidence=_report_evidence(fake),
             )
         finally:
@@ -851,6 +950,8 @@ def run_tune_with_fake_transport(
         transport_calls=fake.call_count,
         resumed_slot_key=resumed_slot,
         completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+        slot_call_counts=baseline_slot_call_counts,
+        slot_attempts=baseline_slot_attempts,
         transport_retry_slots=retry_slots,
         raw_evidence=_report_evidence(fake),
     )
@@ -1007,17 +1108,29 @@ def run_verify(
     eval_root = repo / ".prompt-evals" / prompt_id
     manifest_path = eval_root / ".runtime" / f"verify-{dataset}.json"
     if dataset == "acceptance":
-        # Constructing this production manifest exercises the same early guard
-        # without opening the intentionally invalid acceptance file.
-        new_manifest(
-            [],
-            10,
-            _prompt_hash(repo / PROMPT_RELATIVE),
-            prompt_path=repo / PROMPT_RELATIVE,
-            dataset="acceptance",
-            mode="verify",
+        # Invoke the production CLI entry point.  Its guard must run before
+        # touching this file, importing the adapter, or constructing a client.
+        code = runner_module.main(
+            [
+                "--mode",
+                "verify",
+                "--eval-root",
+                str(repo / ".prompt-evals" / "missing-eval-root"),
+                "--prompt",
+                str(repo / PROMPT_RELATIVE),
+                "--dataset",
+                "acceptance",
+                "--repeats",
+                "10",
+                "--manifest",
+                str(manifest_path),
+            ]
         )
-        raise AssertionError("verify acceptance guard unexpectedly allowed a manifest")
+        if code == 2:
+            raise runner_module.UsageError(
+                "verify mode cannot use the acceptance dataset"
+            )
+        raise AssertionError(f"verify acceptance guard returned {code}")
 
     _purge_fixture_modules()
     sys.path.insert(0, str(repo))

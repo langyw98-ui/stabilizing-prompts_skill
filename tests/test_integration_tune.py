@@ -10,6 +10,7 @@ from tests.integration_support import (
     assert_delivered_files_unstaged_or_untracked,
     build_target_repo,
     run_tune_with_fake_transport,
+    workspace_snapshot,
 )
 
 
@@ -30,6 +31,7 @@ def test_tune_initializes_and_delivers_only_after_acceptance_and_confirmation(
     assert isinstance(result, TuneResult)
     assert result.acceptance_activities == 1
     assert result.delivered_prompt_hash == result.frozen_candidate_hash
+    assert result.transport_calls == len(result.raw_evidence)
     assert_delivered_files_unstaged_or_untracked(target_repo, result.delivered_paths)
     assert (target_repo / "prompts" / "classify.md").read_text(encoding="utf-8") == result.candidate_prompt
 
@@ -78,13 +80,16 @@ def test_equal_perfect_acceptance_is_allowed_and_delivers(target_repo: Path) -> 
 
 
 def test_acceptance_failure_never_delivers_candidate(target_repo: Path) -> None:
+    before = workspace_snapshot(target_repo)
     result = run_tune_with_fake_transport(target_repo, scenario="acceptance-failure")
 
     assert result.stop_reason == "acceptance_failed"
     assert result.acceptance_activities == 1
     assert result.delivered_prompt_hash is None
+    assert result.delivered_paths == ()
     assert result.candidate_prompt is not None
     assert (target_repo / "prompts" / "classify.md").read_text(encoding="utf-8") == result.original_prompt
+    assert workspace_snapshot(target_repo) == before
 
 
 def test_acceptance_failure_can_sync_only_confirmed_assets(target_repo: Path) -> None:
@@ -103,22 +108,30 @@ def test_acceptance_failure_can_sync_only_confirmed_assets(target_repo: Path) ->
 
 
 def test_delivery_confirmation_decline_preserves_original_workspace(target_repo: Path) -> None:
+    before = workspace_snapshot(target_repo)
     result = run_tune_with_fake_transport(target_repo, confirm_delivery=False)
 
     assert result.stop_reason == "delivery_not_confirmed"
     assert result.acceptance_activities == 1
     assert result.delivered_prompt_hash is None
+    assert result.delivered_paths == ()
     assert (target_repo / "prompts" / "classify.md").read_text(encoding="utf-8") == result.original_prompt
+    assert workspace_snapshot(target_repo) == before
 
 
 def test_original_workspace_conflict_stops_without_overwriting_user_edit(
     target_repo: Path,
 ) -> None:
+    before = workspace_snapshot(target_repo)
     result = run_tune_with_fake_transport(target_repo, scenario="conflict")
 
     assert result.stop_reason == "delivery_conflict"
     assert result.delivered_prompt_hash is None
+    assert result.delivered_paths == ()
     assert (target_repo / "prompts" / "classify.md").read_text(encoding="utf-8") == "user edit wins\n"
+    expected = dict(before[0])
+    expected["prompts/classify.md"] = (target_repo / "prompts" / "classify.md").read_bytes()
+    assert workspace_snapshot(target_repo) == (expected, " M prompts/classify.md\n")
 
 
 def test_interrupted_slot_resumes_same_identity_without_extra_slot(target_repo: Path) -> None:
@@ -129,6 +142,12 @@ def test_interrupted_slot_resumes_same_identity_without_extra_slot(target_repo: 
     assert result.resumed_slot_key in result.completed_slot_keys
     assert result.transport_retry_slots == (result.resumed_slot_key,)
     assert result.acceptance_activities == 1
+    assert result.slot_call_counts[result.resumed_slot_key] == 2
+    assert result.slot_attempts[result.resumed_slot_key] == 2
+    complete_slots = set(result.completed_slot_keys) - {result.resumed_slot_key}
+    assert complete_slots
+    assert all(result.slot_call_counts[key] == 1 for key in complete_slots)
+    assert all(result.slot_attempts[key] == 1 for key in complete_slots)
 
 
 def test_dirty_unrelated_file_is_preserved_while_critical_dependency_is_rejected(
@@ -154,10 +173,16 @@ def test_fake_transport_is_test_injected_and_not_project_selectable(target_repo:
     result = run_tune_with_fake_transport(
         target_repo,
         transport=transport,
-        project_transport_setting="real-only",
+        project_transport_setting="fake",
     )
 
     assert result.stop_reason == "delivered"
     assert transport.call_count == result.transport_calls
     eval_config = next(target_repo.glob(".prompt-evals/*/eval-config.yaml"))
-    assert "transport" not in eval_config.read_text(encoding="utf-8")
+    assert "transport: fake" in eval_config.read_text(encoding="utf-8")
+    assert transport.transport_identity == "test-only-counting-transport"
+    assert transport.structured_output_kwargs
+    assert all(
+        kwargs == {"method": "function_calling", "include_raw": True}
+        for kwargs in transport.structured_output_kwargs
+    )

@@ -716,8 +716,12 @@ rtk git commit -m "feat: define stabilizing prompts workflow"
 - Create: `tests/test_behavior_contract.py`
 
 **Interfaces:**
-- Consumes: the full Skill scripts with a test-only injected fake HTTP transport.
-- Produces: isolated evidence for initialization, baseline, candidate selection, acceptance ownership, failure delivery, and workspace safety.
+- Consumes: the production leaf scripts/modules with a fixture-only, test-only
+  client injection boundary.
+- Produces: isolated evidence for renderer/schema wiring, baseline and
+  candidate leaf execution, acceptance ownership, failure delivery, and
+  workspace safety; it does not implement the `SKILL.md` tune/verify state
+  machine.
 
 - [ ] **Step 1: Build a minimal committed target-repository fixture**
 
@@ -754,7 +758,14 @@ Expected: FAIL until fixture orchestration and all cross-module paths are connec
 
 - [ ] **Step 4: Add only the fixture helpers and CLI wiring required for the tests**
 
-Wire the existing modules without duplicating production Schema, parsing, comparison, or worktree logic. Cover no-change exit, regression rejection, equal-perfect acceptance, interrupted-slot resume, dirty unrelated files, dirty critical dependencies, patch collision, rollback, failure-asset synchronization, and token redaction.
+Wire the existing production leaf modules/CLIs without duplicating production
+Schema, parsing, comparison, or worktree logic. Fixture helpers may sequence
+those leaf calls for offline evidence, but must not add a production Python
+`tune`/`verify` orchestrator. Cover no-change exit, regression rejection,
+equal-perfect acceptance, interrupted-slot resume, dirty unrelated files, dirty
+critical dependencies, patch collision, rollback, failure-asset
+synchronization, and token redaction. Task 10 behavior-forward tests remain the
+coverage for the actual `SKILL.md` orchestration.
 
 - [ ] **Step 5: Run the complete offline suite**
 
