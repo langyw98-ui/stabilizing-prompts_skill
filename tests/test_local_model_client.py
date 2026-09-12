@@ -29,7 +29,7 @@ def test_fixed_client_configuration(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     module.build_client(_credentials(tmp_path))
 
     assert captured["api_key"] == "unit-test-secret"
-    assert captured["base_url"] == "http://192.168.168.230:8000/v1"
+    assert captured["base_url"] == "http://192.168.8.17:8000/v1"
     assert captured["model"] == "dbirks/Qwen3.8-27B-W4A16-AutoRound"
     assert captured["temperature"] == 0.0
     assert captured["timeout"] == 30
@@ -104,6 +104,52 @@ def test_probe_returns_matching_model_identity() -> None:
 
     assert probe.model == module.MODEL_NAME
     assert probe.matched is True
+
+
+def test_probe_falls_back_to_list_after_retrieve_failure() -> None:
+    calls: list[str] = []
+
+    def retrieve(_model: str) -> object:
+        calls.append("retrieve")
+        raise RuntimeError("retrieve unavailable")
+
+    def list_models() -> list[SimpleNamespace]:
+        calls.append("list")
+        return [SimpleNamespace(id=module.MODEL_NAME)]
+
+    client = SimpleNamespace(
+        root_client=SimpleNamespace(
+            models=SimpleNamespace(retrieve=retrieve, list=list_models)
+        )
+    )
+
+    probe = module.probe_model(client)
+
+    assert calls == ["retrieve", "list"]
+    assert probe.model == module.MODEL_NAME
+    assert probe.matched is True
+
+
+def test_probe_retrieve_and_list_fail_with_sanitized_error() -> None:
+    sentinel = "retrieve-list-secret"
+
+    def retrieve(_model: str) -> object:
+        raise RuntimeError(f"Authorization: Bearer {sentinel}")
+
+    def list_models() -> object:
+        raise RuntimeError(f"Authorization: Bearer {sentinel}")
+
+    client = SimpleNamespace(
+        root_client=SimpleNamespace(
+            models=SimpleNamespace(retrieve=retrieve, list=list_models)
+        )
+    )
+
+    with pytest.raises(module.ModelProbeError) as exc_info:
+        module.probe_model(client)
+
+    assert str(exc_info.value) == "model probe request failed"
+    assert sentinel not in str(exc_info.value)
 
 
 def test_redact_secret_handles_nested_values_and_headers() -> None:

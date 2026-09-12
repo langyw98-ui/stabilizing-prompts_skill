@@ -17,7 +17,7 @@ from typing import Any
 from langchain_openai import ChatOpenAI
 
 
-BASE_URL = "http://192.168.168.230:8000/v1"
+BASE_URL = "http://192.168.8.17:8000/v1"
 MODEL_NAME = "dbirks/Qwen3.8-27B-W4A16-AutoRound"
 EXTRA_BODY: dict[str, bool] = {
     "enable_thinking": False,
@@ -269,8 +269,9 @@ def _probe_from_models(owner: object) -> str | None:
         try:
             response = retrieve(MODEL_NAME)
         except Exception:
-            raise ModelProbeError("model probe request failed") from None
-        return _require_expected_identity(_response_identities(response))
+            pass
+        else:
+            return _require_expected_identity(_response_identities(response))
     list_models = getattr(models, "list", None)
     if callable(list_models):
         try:

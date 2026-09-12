@@ -99,6 +99,12 @@ Full case validation exited 0 with counts `dev=1`, `validation=2`,
 `acceptance=2`, and dataset SHA-256
 `5d277e28b9b8e7a8c27b110d47c06d5034fa7161d2450a5a3a57ef93d4f53d09`.
 
+### Historical pre-migration attempt (old endpoint)
+
+The following identity and smoke results are retained from the pre-migration
+attempt, which used the old endpoint `http://192.168.168.230:8000/v1`. They are
+historical evidence only and are not the current client configuration.
+
 The fixed model identity probe returned a failure (command exit 1) before an
 identity could be accepted. The real runner then entered the production
 structured-output path and exited 2 because the LAN service returned
@@ -121,7 +127,8 @@ were verified; offline redaction coverage remains the only redaction evidence.
 This smoke is **not completed** and is blocked by the external model-service
 gate (`HTTP 502`); no alternate model, endpoint, or credential was tried.
 
-The safe fixed-client configuration used for the attempt is:
+The safe fixed-client configuration used for that historical attempt (old
+endpoint) is:
 
 ```yaml
 base_url: http://192.168.168.230:8000/v1

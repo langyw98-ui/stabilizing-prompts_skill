@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Run every Python command through `conda run -n kds python`; do not discover or switch to `.venv`, uv, Poetry, or another environment.
-- The fixed model is `dbirks/Qwen3.8-27B-W4A16-AutoRound` at `http://192.168.168.230:8000/v1`.
+- The fixed model is `dbirks/Qwen3.8-27B-W4A16-AutoRound` at `http://192.168.8.17:8000/v1`.
 - Use `temperature=0.0`, `max_retries=2`, a 30-second timeout, and `extra_body={"enable_thinking": False, "enable_reasoning": False, "enable_search": False}`; do not send other sampling parameters.
 - Never emit the Authorization Token or Authorization header in commands, exceptions, logs, manifests, reports, fixtures, or target repositories.
 - Store the only real credential, when locally configured by the user, at the Skill-root path `.local/model-credentials.json`; the root `.gitignore` must exclude exactly that file, and installation must not copy it implicitly.
@@ -307,7 +307,7 @@ def test_fixed_client_configuration(monkeypatch):
     captured = {}
     monkeypatch.setattr(module, "ChatOpenAI", lambda **kwargs: captured.update(kwargs) or object())
     module.build_client(credentials_path=temporary_credentials_path)
-    assert captured["base_url"] == "http://192.168.168.230:8000/v1"
+    assert captured["base_url"] == "http://192.168.8.17:8000/v1"
     assert captured["model"] == "dbirks/Qwen3.8-27B-W4A16-AutoRound"
     assert captured["temperature"] == 0.0
     assert captured["timeout"] == 30
@@ -331,7 +331,7 @@ Expected: FAIL because the client module does not exist.
 - [ ] **Step 3: Implement the immutable client configuration**
 
 ```python
-BASE_URL = "http://192.168.168.230:8000/v1"
+BASE_URL = "http://192.168.8.17:8000/v1"
 MODEL_NAME = "dbirks/Qwen3.8-27B-W4A16-AutoRound"
 EXTRA_BODY = {"enable_thinking": False, "enable_reasoning": False, "enable_search": False}
 

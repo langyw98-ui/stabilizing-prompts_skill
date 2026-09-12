@@ -99,7 +99,7 @@ Skill 保持默认的隐式发现能力，也允许用户通过 `$stabilizing-pr
 
 `scripts/local_model_client.py` 使用 `langchain_openai.ChatOpenAI`，并固定以下连接与调用信息：
 
-- `base_url`：`http://192.168.168.230:8000/v1`，由 `ChatOpenAI` 调用其 `/chat/completions` 路径；
+- `base_url`：`http://192.168.8.17:8000/v1`，由 `ChatOpenAI` 调用其 `/chat/completions` 路径；
 - 模型：`dbirks/Qwen3.8-27B-W4A16-AutoRound`；
 - Authorization Token：只从 Skill 根目录 `.local/model-credentials.json` 读取；该文件的 JSON 对象只能包含一个非空字符串字段 `authorization_token`，且文件不可跟踪；
 - `temperature=0.0`；
