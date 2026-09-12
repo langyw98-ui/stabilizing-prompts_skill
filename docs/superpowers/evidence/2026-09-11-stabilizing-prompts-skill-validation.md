@@ -222,11 +222,43 @@ omitted_sampling_parameters:
 
 ## Behavior-forward validation
 
-Behavior-forward scenarios were not run or simulated in this task, and no
-results were edited. The requested explicit and natural-language evaluator
-passes are **pending controller-dispatched evaluators**. Their results must be
-added by the controller after dispatch; this document does not claim coverage
-for those scenarios.
+Two read-only behavior-forward evaluators were controller-dispatched. Both
+used `gpt-5.6-luna` with `max` reasoning effort. Neither evaluator accessed the
+network, credentials, or raw model responses, and neither modified files.
+
+Evaluator A used the explicit `$stabilizing-prompts` trigger. Its observations
+were:
+
+| Scenario | Result | Evidence boundary |
+| --- | --- | --- |
+| Normal `tune` path against the known real 502 model gate | **PASS / PENDING run** | The evaluator confirmed the expected path and retained the controller-recorded real-smoke gate; it did not issue a second model request. The live run remains pending behind HTTP 502. |
+| Multiple-prompt scoping | **PASS** | The one-prompt/one-cycle boundary was preserved. |
+| Business-contract conflict | **PENDING compliant pause** | The expected conflict pause was identified; no contract-changing execution was performed. |
+| Open-ended request/refusal | **PASS / PENDING user input** | The refusal boundary was correct; continuation remains pending explicit user input. |
+| Model outage | **PASS / PENDING non-scoring** | The outage is classified as a non-scoring external gate; no score was fabricated. |
+
+The 502 premise in Evaluator A is the controller-recorded real smoke result in
+this document; Evaluator A did not re-run the request.
+
+Evaluator B used a natural-language trigger and controlled contract-branch
+simulation only—not network access or real delivery. All six scenarios passed:
+
+| Scenario | Result |
+| --- | --- |
+| No-change exit | **PASS** |
+| Validation regression | **PASS** |
+| Equal-perfect acceptance | **PASS** |
+| Acceptance failure | **PASS** |
+| Failure-asset-only delivery | **PASS** |
+| Original-workspace conflict | **PASS** |
+
+The evaluator evidence preserves these gates: acceptance is tune-only and runs
+once after candidate freeze; both success and failure-asset-only delivery
+require explicit delivery confirmation; synchronization is allowlisted; and a
+workspace conflict stops the operation and rolls back/restores rather than
+merging or overwriting user edits. These behavior-forward results do not make
+the Task 10 real smoke complete: the production smoke remains blocked by the
+observed external HTTP 502 gate.
 
 ## Final state
 
