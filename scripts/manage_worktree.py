@@ -268,6 +268,46 @@ def _base_contract_prompt_path(cycle: "WorktreeCycle") -> tuple[bool, str | None
     return True, _parse_contract_data(cycle.original_repo, data)
 
 
+def _commit_contract_prompt_path(
+    cycle: "WorktreeCycle", commit: str
+) -> tuple[bool, str | None]:
+    """Read the canonical Prompt path from a committed cycle contract."""
+
+    prefix = _evaluation_prefix(cycle)
+    if prefix is None:
+        return False, None
+    relative = f"{prefix}prompt-contract.yaml"
+    result = _git(cycle.worktree, "show", f"{commit}:{relative}", check=False)
+    if result.returncode != 0:
+        return False, None
+    if yaml is None:
+        raise DeliveryError("cannot resolve prompt allowlist without PyYAML")
+    try:
+        data = yaml.safe_load(result.stdout.decode("utf-8"))
+    except Exception as error:
+        raise DeliveryError(f"invalid prompt-contract.yaml: {error}") from error
+    return True, _parse_contract_data(cycle.original_repo, data)
+
+
+def _assert_prompt_contract_identity(cycle: "WorktreeCycle", final: str) -> None:
+    """Permit contract metadata updates but never a canonical path redirect."""
+
+    base_exists, base_prompt = _base_contract_prompt_path(cycle)
+    final_exists, final_prompt = _commit_contract_prompt_path(cycle, final)
+    if not base_exists or base_prompt is None:
+        raise AllowlistError(
+            "canonical Prompt path cannot be resolved without committed prompt-contract.yaml"
+        )
+    if not final_exists or final_prompt != base_prompt:
+        raise DeliveryConflict(
+            "committed prompt-contract.yaml redirected or removed the canonical Prompt path"
+        )
+    if cycle.prompt_path is not None:
+        explicit = _relative_path(cycle.original_repo, cycle.prompt_path, label="prompt path")
+        if explicit != base_prompt:
+            raise DeliveryConflict("cycle Prompt path does not match prompt-contract.yaml")
+
+
 def _discover_prompt_path(cycle: "WorktreeCycle") -> str | None:
     base_has_contract, base_prompt = _base_contract_prompt_path(cycle)
     if base_has_contract:
@@ -405,8 +445,7 @@ def _changed_paths(cycle: WorktreeCycle, final_commit: str) -> tuple[str, ...]:
         cycle.worktree,
         "diff",
         "--name-status",
-        "--find-renames",
-        "--find-copies",
+        "--no-renames",
         "-z",
         cycle.cycle_base_commit,
         final_commit,
@@ -423,10 +462,7 @@ def _changed_paths(cycle: WorktreeCycle, final_commit: str) -> tuple[str, ...]:
         index += 1
         if index >= len(fields) or not fields[index]:
             raise DeliveryError("Git returned a malformed changed-path list")
-        kind = status[:1]
-        if kind in {"R", "C"}:
-            raise DeliveryError("rename and copy changes are not supported for delivery")
-        if kind not in {"A", "D", "M"} or len(status) != 1:
+        if status not in {"A", "D", "M"}:
             raise DeliveryError(f"unsupported Git change status: {status}")
         raw_path = os.fsdecode(fields[index])
         index += 1
@@ -783,6 +819,7 @@ def build_delivery_patch(
     if result not in {"success", "failure"}:
         raise DeliveryError("delivery result must be success or failure")
     final = _final_commit(cycle, final_commit)
+    _assert_prompt_contract_identity(cycle, final)
     changed = _changed_paths(cycle, final)
     canonical = _canonical_allowlist_paths(
         cycle,
@@ -829,10 +866,10 @@ def build_delivery_patch(
             detail = result_patch.stderr.decode("utf-8", "replace").strip()
             raise DeliveryError(f"unable to build delivery patch: {detail}")
         patch_text = result_patch.stdout.decode("utf-8", "surrogateescape")
-        # Parse the generated patch too.  This keeps the builder and the
-        # persisted-artifact preflight on exactly the same fail-closed grammar
-        # and rejects selected deletions before any manifest is returned.
-        _patch_header_paths(patch_text)
+        # Let Git parse the generated patch and require the actual section
+        # paths to be exactly the selected delivery paths.
+        if _native_patch_paths(cycle.original_repo, patch_text) != selected:
+            raise DeliveryError("generated patch paths do not match selected delivery paths")
     return DeliveryPatch(
         text=patch_text,
         paths=selected,
@@ -846,292 +883,45 @@ def build_delivery_patch(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _ParsedPatchSection:
-    path: str
-    deleted: bool
+def _native_patch_paths(root: Path, text: str) -> tuple[str, ...]:
+    """Ask Git to parse a patch and report its concrete paths.
 
-
-_PATCH_INDEX_RE = re.compile(
-    r"^index [0-9a-fA-F]{7,64}\.\.[0-9a-fA-F]{7,64}(?: [0-7]{6})?$"
-)
-_PATCH_HUNK_RE = re.compile(
-    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
-)
-
-
-def _decode_patch_quoted(payload: str, start: int = 0) -> tuple[str, int]:
-    """Decode one Git C-style quoted path and return its end offset."""
-
-    if start >= len(payload) or payload[start] != '"':
-        raise DeliveryError("delivery patch contains an invalid quoted path")
-    data = bytearray()
-    index = start + 1
-    escapes = {
-        "a": 0x07,
-        "b": 0x08,
-        "t": 0x09,
-        "n": 0x0A,
-        "v": 0x0B,
-        "f": 0x0C,
-        "r": 0x0D,
-        "\\": 0x5C,
-        '"': 0x22,
-        "?": 0x3F,
-    }
-    while index < len(payload):
-        character = payload[index]
-        if character == '"':
-            try:
-                return data.decode("utf-8"), index + 1
-            except UnicodeDecodeError as error:
-                raise DeliveryError("delivery patch path is not valid UTF-8") from error
-        if character == "\\":
-            index += 1
-            if index >= len(payload):
-                raise DeliveryError("delivery patch contains an incomplete path escape")
-            escaped = payload[index]
-            if escaped in escapes:
-                data.append(escapes[escaped])
-                index += 1
-                continue
-            if escaped == "x":
-                digits = payload[index + 1 : index + 3]
-                if len(digits) != 2 or not re.fullmatch(r"[0-9a-fA-F]{2}", digits):
-                    raise DeliveryError("delivery patch contains an invalid path escape")
-                data.append(int(digits, 16))
-                index += 3
-                continue
-            if escaped in "01234567":
-                end = index + 1
-                while end < len(payload) and end < index + 3 and payload[end] in "01234567":
-                    end += 1
-                data.append(int(payload[index:end], 8))
-                index = end
-                continue
-            raise DeliveryError("delivery patch contains an unsupported path escape")
-        if ord(character) < 0x20:
-            raise DeliveryError("delivery patch path contains a control character")
-        data.extend(character.encode("utf-8"))
-        index += 1
-    raise DeliveryError("delivery patch contains an unterminated quoted path")
-
-
-def _patch_path(raw: str, *, label: str = "patch path") -> str:
-    """Validate a decoded patch path without normalizing attacker input."""
-
-    if not raw or "\x00" in raw or "\\" in raw or "\n" in raw or "\r" in raw:
-        raise DeliveryError(f"{label} contains an unsafe path")
-    if any(ord(character) < 0x20 for character in raw):
-        raise DeliveryError(f"{label} contains a control character")
-    normalized = _reject_unsafe_delivery_path(raw, label=label)
-    if normalized != raw:
-        raise DeliveryError(f"{label} is not canonical: {raw}")
-    return normalized
-
-
-def _parse_diff_header(line: str) -> str:
-    payload = line[len("diff --git ") :]
-    if not payload:
-        raise DeliveryError("delivery patch contains an invalid diff header")
-    candidates: list[str] = []
-    if payload.startswith('"'):
-        left_raw, index = _decode_patch_quoted(payload)
-        if index >= len(payload) or not payload[index].isspace():
-            raise DeliveryError("delivery patch contains an invalid diff header")
-        while index < len(payload) and payload[index].isspace():
-            index += 1
-        if index >= len(payload) or payload[index] != '"':
-            raise DeliveryError("delivery patch contains an invalid diff header")
-        right_raw, index = _decode_patch_quoted(payload, index)
-        if payload[index:].strip():
-            raise DeliveryError("delivery patch contains an invalid diff header")
-        if not left_raw.startswith("a/") or not right_raw.startswith("b/"):
-            raise DeliveryError("delivery patch contains an unsupported Git path header")
-        left = _patch_path(left_raw[2:])
-        right = _patch_path(right_raw[2:])
-        if left != right:
-            raise DeliveryError("rename and copy patches are not supported for delivery")
-        return left
-
-    if '"' in payload or "\\" in payload:
-        raise DeliveryError("delivery patch contains an unsupported unquoted path escape")
-    # Git normally quotes paths containing whitespace, but valid producers can
-    # emit the unquoted form.  Find the separator by validating complete path
-    # candidates instead of splitting on every space.
-    for index, character in enumerate(payload):
-        if character != " " or not payload[index + 1 :].startswith("b/"):
-            continue
-        left_raw = payload[:index]
-        right_raw = payload[index + 1 :]
-        if not left_raw.startswith("a/"):
-            continue
-        try:
-            left = _patch_path(left_raw[2:])
-            right = _patch_path(right_raw[2:])
-        except DeliveryError:
-            continue
-        if left == right:
-            candidates.append(left)
-    if len(candidates) != 1:
-        raise DeliveryError("delivery patch contains an ambiguous or invalid path header")
-    return candidates[0]
-
-
-def _parse_marker_path(line: str, marker: str, expected_prefix: str) -> str | None:
-    payload = line[len(marker) :]
-    if not payload:
-        raise DeliveryError("delivery patch is missing a file path marker")
-    if payload.startswith('"'):
-        value, index = _decode_patch_quoted(payload)
-        if payload[index:].strip():
-            raise DeliveryError("delivery patch contains an invalid file path marker")
-    else:
-        # Git uses a tab delimiter for unquoted paths containing spaces in
-        # ---/+++ markers.  A literal tab in a path must be C-quoted.
-        if payload.endswith("\t") and payload.count("\t") == 1:
-            payload = payload[:-1]
-        if '"' in payload or "\\" in payload or "\t" in payload:
-            raise DeliveryError("delivery patch contains an unsupported path escape")
-        value = payload
-    if value == "/dev/null":
-        return None
-    if not value.startswith(expected_prefix):
-        raise DeliveryError("delivery patch file markers do not match its diff header")
-    return _patch_path(value[len(expected_prefix) :])
-
-
-def _parse_hunk(lines: Sequence[str], index: int) -> int:
-    match = _PATCH_HUNK_RE.fullmatch(lines[index])
-    if match is None:
-        raise DeliveryError("delivery patch contains an invalid hunk header")
-    expected_old = int(match.group(2) or "1")
-    expected_new = int(match.group(4) or "1")
-    old_count = 0
-    new_count = 0
-    body_lines = 0
-    index += 1
-    while index < len(lines):
-        line = lines[index]
-        if line.startswith("diff --git ") or line.startswith("@@ "):
-            break
-        if line.startswith(" "):
-            old_count += 1
-            new_count += 1
-            body_lines += 1
-            index += 1
-            continue
-        if line.startswith("+"):
-            new_count += 1
-            body_lines += 1
-            index += 1
-            continue
-        if line.startswith("-"):
-            old_count += 1
-            body_lines += 1
-            index += 1
-            continue
-        if line == "\\ No newline at end of file":
-            if body_lines == 0:
-                raise DeliveryError("delivery patch contains an invalid hunk marker")
-            index += 1
-            continue
-        raise DeliveryError("delivery patch contains an invalid hunk line")
-    if body_lines == 0 or old_count != expected_old or new_count != expected_new:
-        raise DeliveryError("delivery patch hunk line counts do not match its hunk header")
-    return index
-
-
-def _parse_patch(text: str) -> tuple[_ParsedPatchSection, ...]:
-    """Parse the complete supported Git patch grammar, failing closed."""
+    Git remains responsible for the patch grammar.  ``--numstat -z`` returns
+    one NUL-delimited record per section, preserving spaces and other valid
+    path characters without a second, incomplete parser in this module.
+    """
 
     if not isinstance(text, str):
         raise DeliveryError("delivery patch must be text")
     if not text:
         return ()
-    if "\r" in text:
-        # Normalize only for grammar inspection; Git itself still receives the
-        # original bytes.  Bare carriage returns cannot be path or hunk data.
-        if "\r" in text.replace("\r\n", ""):
-            raise DeliveryError("delivery patch contains unsupported line endings")
-        text = text.replace("\r\n", "\n")
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
-    if not lines:
-        raise DeliveryError("delivery patch is empty")
-
-    sections: list[_ParsedPatchSection] = []
-    seen: set[str] = set()
-    index = 0
-    while index < len(lines):
-        if not lines[index].startswith("diff --git "):
-            raise DeliveryError("delivery patch must begin every section with a diff header")
-        path = _parse_diff_header(lines[index])
-        if path in seen:
-            raise DeliveryError("delivery patch contains duplicate diff sections or extra hunks")
-        seen.add(path)
-        index += 1
-        saw_file_markers = False
-        deleted = False
-        hunk_count = 0
-        while index < len(lines) and not lines[index].startswith("diff --git "):
-            line = lines[index]
-            if line.startswith(("GIT binary patch", "Binary files ")):
-                raise DeliveryError("binary delivery patches are not supported")
-            if line.startswith(("rename ", "copy ")):
-                raise DeliveryError("rename and copy delivery patches are not supported")
-            if line.startswith(("similarity index", "dissimilarity index")):
-                raise DeliveryError("rename and copy delivery patches are not supported")
-            if line.startswith("index "):
-                if _PATCH_INDEX_RE.fullmatch(line) is None:
-                    raise DeliveryError("delivery patch contains an invalid index header")
-                index += 1
-                continue
-            if re.fullmatch(r"(?:new file mode|deleted file mode|old mode|new mode) [0-7]{6}", line):
-                index += 1
-                continue
-            if line.startswith("--- "):
-                if saw_file_markers:
-                    raise DeliveryError("delivery patch contains duplicate file markers")
-                old_path = _parse_marker_path(line, "--- ", "a/")
-                index += 1
-                if index >= len(lines) or not lines[index].startswith("+++ "):
-                    raise DeliveryError("delivery patch is missing its +++ file marker")
-                new_path = _parse_marker_path(lines[index], "+++ ", "b/")
-                index += 1
-                if old_path is not None and old_path != path:
-                    raise DeliveryError("delivery patch old path does not match its diff header")
-                if new_path is not None and new_path != path:
-                    raise DeliveryError("delivery patch new path does not match its diff header")
-                if old_path is None and new_path is None:
-                    raise DeliveryError("delivery patch has no concrete destination path")
-                deleted = new_path is None
-                saw_file_markers = True
-                while index < len(lines) and lines[index].startswith("@@ "):
-                    index = _parse_hunk(lines, index)
-                    hunk_count += 1
-                continue
-            if line.startswith("+++ "):
-                raise DeliveryError("delivery patch contains an unexpected +++ file marker")
-            if line.startswith("@@ "):
-                raise DeliveryError("delivery patch contains a hunk without file markers")
-            if line == "\\ No newline at end of file":
-                raise DeliveryError("delivery patch contains an orphaned hunk marker")
-            raise DeliveryError("delivery patch contains unsupported Git patch metadata")
-        if not saw_file_markers or hunk_count == 0:
-            raise DeliveryError("delivery patch section is missing a file hunk")
-        sections.append(_ParsedPatchSection(path=path, deleted=deleted))
-    return tuple(sections)
-
-
-def _patch_header_paths(text: str) -> tuple[str, ...]:
-    """Validate and return every concrete path represented by a Git patch."""
-
-    sections = _parse_patch(text)
-    if any(section.deleted for section in sections):
-        raise DeliveryError("deletion delivery is not supported")
-    return tuple(section.path for section in sections)
+    result = _git(
+        root,
+        "apply",
+        "--numstat",
+        "-z",
+        "--no-3way",
+        "--whitespace=nowarn",
+        "-",
+        input_data=text,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise DeliveryError(f"Git rejected the delivery patch: {detail or 'invalid patch'}")
+    paths: list[str] = []
+    for record in result.stdout.split(b"\x00"):
+        if not record:
+            continue
+        fields = record.split(b"\t", 2)
+        if len(fields) != 3 or fields[0] == b"-" or fields[1] == b"-":
+            raise DeliveryError("binary delivery patches are not supported")
+        try:
+            raw_path = os.fsdecode(fields[2])
+        except UnicodeError as error:
+            raise DeliveryError("delivery patch path is not valid for this filesystem") from error
+        paths.append(_normalize_relative(raw_path, label="patch path"))
+    return tuple(paths)
 
 
 def _current_file_bytes(root: Path, relative: str) -> bytes | None:
@@ -1178,39 +968,29 @@ def _canonical_delivery_patch(cycle: WorktreeCycle, *, result: str) -> DeliveryP
     return build_delivery_patch(cycle, final_commit=final, result=result)
 
 
-def _assert_patch_matches_canonical(
-    persisted: DeliveryPatch,
+def _assert_supplied_patch_paths(
+    cycle: WorktreeCycle,
+    supplied: DeliveryPatch,
     canonical: DeliveryPatch,
 ) -> None:
-    """Require every persisted patch field to match regenerated bytes/data."""
+    """Reject extra persisted paths while keeping canonical data authoritative.
 
-    canonical_prompt = canonical.prompt_path
-    if (
-        persisted.result == "failure"
-        and canonical_prompt is not None
-        and canonical_prompt in persisted.paths
-    ):
-        raise AllowlistError("failure delivery cannot include the canonical Prompt")
-    if persisted.cycle_base_commit != canonical.cycle_base_commit:
-        raise DeliveryConflict("patch cycle_base_commit does not match immutable cycle metadata")
-    if persisted.final_worktree_commit != canonical.final_worktree_commit:
-        raise DeliveryConflict("patch final commit does not match the current cycle worktree HEAD")
-    if persisted.result != canonical.result:
+    A persisted patch is useful as an internal transport object, but it is not
+    trusted.  Only its requested result and path shape are checked; the
+    canonical patch regenerated from the cycle is what the caller applies.
+    Git parses the supplied text to catch extra sections without reproducing
+    Git's patch grammar in Python.
+    """
+
+    if supplied.result != canonical.result:
         raise DeliveryError("patch result does not match canonical delivery metadata")
-    if persisted.paths != canonical.paths:
-        if any(path not in canonical.allowlist_paths for path in persisted.paths):
+    if supplied.paths != canonical.paths:
+        if any(path not in canonical.allowlist_paths for path in supplied.paths):
             raise AllowlistError("patch paths do not match the canonical delivery allowlist")
         raise DeliveryError("patch paths do not match the canonical cycle diff")
-    if tuple(persisted.source_hashes.items()) != tuple(canonical.source_hashes.items()):
-        raise DeliveryError("patch source hashes do not match canonical cycle content")
-    if tuple(persisted.destination_hashes.items()) != tuple(canonical.destination_hashes.items()):
-        raise DeliveryError("patch destination hashes do not match canonical cycle content")
-    if persisted.prompt_path != canonical.prompt_path:
-        raise DeliveryError("allowlist manifest Prompt path does not match canonical cycle metadata")
-    if persisted.allowlist_paths != canonical.allowlist_paths:
-        raise DeliveryError("allowlist manifest does not match the canonical cycle allowlist")
-    if persisted.text != canonical.text:
-        raise DeliveryError("patch text does not match the canonical cycle diff")
+    actual_paths = _native_patch_paths(cycle.original_repo, supplied.text)
+    if actual_paths != canonical.paths:
+        raise DeliveryError("patch sections do not match canonical delivery paths")
 
 
 def _check_sources(cycle: WorktreeCycle, patch: DeliveryPatch, expected: Mapping[str, object] | None) -> None:
@@ -1265,11 +1045,10 @@ def preflight_patch(
             raise TypeError("preflight_patch expects a DeliveryPatch")
         if not isinstance(patch.result, str) or patch.result not in {"success", "failure"}:
             raise DeliveryError("delivery result must be success or failure")
-        # Every patch payload field is treated as untrusted persisted data.
-        # Regenerate the entire object from the immutable cycle and compare it
-        # before using any supplied text, path, or hash for Git operations.
+        # Regenerate from cycle state.  The persisted object is only checked
+        # for its result and path shape; its text and hashes are never applied.
         canonical = _canonical_delivery_patch(cycle, result=patch.result)
-        _assert_patch_matches_canonical(patch, canonical)
+        _assert_supplied_patch_paths(cycle, patch, canonical)
     # Source checks intentionally happen immediately before Git's check.  The
     # application path repeats them after this function and before apply.
     _check_sources(cycle, canonical, expected_source_hashes)
@@ -1377,11 +1156,10 @@ def apply_delivery_patch(
         patch,
         expected_source_hashes=expected_source_hashes,
     )
-    # Preflight may have returned to the caller after a persisted artifact was
-    # checked.  Regenerate once more immediately before any application so a
-    # changed cycle HEAD or target cannot become a stale delivery input.
+    # Preflight may return before a mutating user action.  Regenerate once more
+    # immediately before application so the current cycle state, not a stale
+    # transport object, supplies the bytes and hashes.
     latest = _canonical_delivery_patch(cycle, result=prepared.result)
-    _assert_patch_matches_canonical(prepared, latest)
     prepared = latest
     if not prepared.text:
         return prepared
@@ -1395,7 +1173,13 @@ def apply_delivery_patch(
         # they also run again after application so a concurrent worktree edit
         # triggers rollback rather than being silently accepted.
         _check_sources(cycle, prepared, expected_source_hashes)
+        _assert_cycle_base(cycle)
+        _assert_prompt_contract_identity(cycle, prepared.final_worktree_commit)
         _assert_worktree_snapshot(cycle, prepared)
+        # Keep the original HEAD and committed Prompt identity checks directly
+        # next to Git's mutating command as the final stale-state guard.
+        _assert_cycle_base(cycle)
+        _assert_prompt_contract_identity(cycle, prepared.final_worktree_commit)
         result = _git(
             cycle.original_repo,
             "apply",

@@ -24,6 +24,7 @@
 - Only validation selection requires a strict metric improvement. Acceptance requires thresholds and no regression, not strict improvement.
 - Candidate prompt files remain under `.runtime/`; replace the production prompt only after acceptance passes and the user confirms delivery.
 - `cycle_base_commit` is the original workspace `HEAD` when the worktree is created. Every delivery patch starts there and is filtered through the delivery allowlist.
+- Task 7 uses the approved local single-user, non-adversarial threat model: protect accidental edits, concurrent/stale cycle state, path mistakes, unexpected files, apply failures, and hash mismatches; do not add repository locks, cryptographic trust, or a custom complete patch parser to resist a local actor who can rewrite tracked code, Git state, manifests, patches, or hashes. Delivery regenerates the patch from trusted cycle state at delivery time.
 - Use TDD for every Python behavior and make one focused commit after each task.
 
 ## File Map
@@ -615,7 +616,9 @@ class WorktreeCycle:
     cycle_base_commit: str
 ```
 
-Generate diffs from `cycle_base_commit`, parse changed paths, reject anything outside the appropriate allowlist, run `git apply --check`, verify source hashes immediately before application, snapshot only exact targets, apply without staging, verify destination hashes, and restore exact snapshots after any application or verification error. Never delete the worktree or branch automatically.
+At delivery time, regenerate the patch from the immutable `cycle_base_commit`, the current cycle worktree `HEAD`, and committed worktree content. Obtain Git's actual changed paths with `--name-status -z`/`--name-only -z` (or an equivalent native command), derive the result-specific allowlist, and require the selected path set to equal the paths represented by the generated patch; any extra path or patch section is rejected. Immediately before applying, re-check the original workspace `HEAD == cycle_base_commit` and that the committed `prompt-contract.yaml` still names the cycle's canonical Prompt path (only current Prompt hash and other non-path fields may change). Run `git apply --check`, snapshot only exact target paths, apply without staging, verify actual result paths and destination hashes, and restore exact snapshots after any application or verification error. Persisted patch text, manifest fields, and hashes may be retained as transport artifacts but are not trust anchors. Never delete the worktree or branch automatically.
+
+Do not add a custom complete Git patch parser or adversarial tamper-proofing. Low-cost correctness checks still cover the generated patch's path set, deletion rejection, failure-result Prompt exclusion, worktree boundary, original HEAD/cycle identity, committed Prompt-path identity, clean apply, post-apply path/hash verification, rollback, and unstaged/uncommitted delivery.
 
 - [ ] **Step 4: Run worktree tests**
 

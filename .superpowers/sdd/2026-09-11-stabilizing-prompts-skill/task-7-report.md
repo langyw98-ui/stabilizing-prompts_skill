@@ -106,3 +106,22 @@ text and hashes, changed/unstaged cycle targets, worktree-adjacent TOCTOU, and
 an uncommitted `prompt-contract.yaml` fallback.  Final delivery therefore
 requires the contract to have been generated, confirmed, and committed before
 the cycle's immutable base.
+
+## Fix round 3
+
+Re-aligned Task 7 with Ruling 6's local single-user, non-adversarial threat
+model. Delivery now treats the cycle base, current committed worktree HEAD,
+and committed target content as the trusted state and regenerates the patch at
+delivery time. Git-reported changed paths are checked against the derived
+result allowlist and the generated patch path set; an extra patch section or
+file is rejected. Immediately before apply, the original `HEAD` and committed
+canonical Prompt path are rechecked; only non-path contract fields such as the
+current Prompt hash may change. The apply sequence remains `git apply --check`,
+exact-target snapshot, unstaged apply, actual path/destination-hash validation,
+and rollback on any failure.
+
+The fix removes adversarial-only persisted patch/hash/manifest trust machinery
+and the custom complete patch grammar. It retains low-cost correctness
+coverage for allowlist paths, deletion, failure Prompt exclusion, worktree
+boundaries, conflicts, rollback, and unstaged/uncommitted delivery. No real
+credential or Authorization value was read, stored, or committed.

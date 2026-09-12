@@ -49,6 +49,12 @@ Agent 在一次业务流程中可能多次调用 LLM。即使单次调用正确�
 
 如果目标不符合支持范围，Skill 应说明原因并停止，不得退化为主观评审。
 
+### 2.3 交付威胁模型与非目标
+
+交付同步采用本地单用户、非对抗性威胁模型。它保护个人使用中常见的误操作、并发编辑、过期周期状态、路径错误、意外变更文件、补丁无法应用以及应用或校验失败导致的数据损坏；它不试图抵抗能够任意修改 Skill 代码、Git 仓库、周期状态、补丁、补丁清单或哈希的本地攻击者。该边界不承诺消除所有理论上的 TOCTOU 间隔。
+
+因此，交付实现不使用仓库锁或密码学信任锚，不构造自定义的完整 Git 补丁解析器，也不把持久化补丁或哈希清单当作敌对环境下的证明。交付时从可信的 `cycle_base_commit`、当前周期 worktree `HEAD` 和已提交目标内容重新生成补丁；使用 Git 报告的实际变更路径核对派生白名单和补丁路径；应用前立即复核原工作区 `HEAD` 与提交版本的规范 `prompt-contract.yaml` 中的 canonical Prompt path；应用后校验实际路径和内容哈希，任何失败都恢复精确目标快照。
+
 ## 3. Skill 安装与组成
 
 Skill 作为个人级 Codex Skill 安装在 `$CODEX_HOME/skills`；未设置 `CODEX_HOME` 时使用 `~/.codex/skills`：
@@ -162,9 +168,9 @@ src/agent-a/prompts/classify.md
 - Skill 不自动 stash、不复制相关脏文件，也不替用户创建临时提交；
 - 已确认的契约、三套数据集、适配器和配置先在 worktree 中提交，再建立基线。
 
-中间候选只作为 `.runtime/` 中的临时文件，不提交、不交付。最终验收通过并经用户确认后，Skill 在 worktree 中替换生产 Prompt，更新 `prompt-contract.yaml` 中的当前 Prompt 哈希，追加 `optimization-history.yaml` 并提交。随后从 `cycle_base_commit` 到最终提交生成差异，并通过交付白名单过滤为 Git 补丁。评测资产提交和最终结果提交的名称及数量属于实现细节。
+中间候选只作为 `.runtime/` 中的临时文件，不提交、不交付。最终验收通过并经用户确认后，Skill 在 worktree 中替换生产 Prompt，更新 `prompt-contract.yaml` 中的当前 Prompt 哈希（只允许更新当前 Prompt 的非路径字段），追加 `optimization-history.yaml` 并提交。随后从 `cycle_base_commit` 到当前周期 worktree `HEAD` 在交付时重新生成差异，并通过交付白名单过滤为 Git 补丁。评测资产提交和最终结果提交的名称及数量属于实现细节。
 
-同步回原工作区前必须执行严格补丁预检。补丁无法干净应用、目标文件已变化或待新增路径发生冲突时停止，不自动三方合并或覆盖。同步成功后的文件保持未暂存、未提交，并校验内容哈希。应用或校验异常时恢复同步前保存的目标文件状态。Skill 不自动删除 worktree 或内部调优分支。
+同步回原工作区前，先以 Git 的 `--name-status -z` 或 `--name-only -z`（或等价原生命令）得到实际变更路径，再确认它们严格等于本次选择的可交付路径；补丁中的每个 section/文件路径也必须与该集合完全一致，任何额外路径一律停止。预检必须立即确认原工作区 `HEAD == cycle_base_commit`，并确认提交版本的 `prompt-contract.yaml` 仍指向周期开始时的 canonical Prompt path；只允许当前 Prompt hash 等非路径字段变化。随后执行 `git apply --check`，对精确目标做快照，在不暂存的情况下应用补丁，再校验实际路径和内容哈希。补丁无法干净应用、目标文件已变化或待新增路径发生冲突时停止，不自动三方合并或覆盖；应用或校验异常时恢复同步前保存的精确目标状态。同步成功后的文件保持未暂存、未提交。Skill 不自动删除 worktree 或内部调优分支。
 
 默认同步的可交付资产只有：最终生产 Prompt、契约、配置、三套案例、`adapter.py`、`optimization-history.yaml` 和必要的 `.gitignore` 增量。原始响应、缓存、临时候选和完整运行报告不进入原工作区。
 
@@ -508,8 +514,9 @@ stability_regression_count
 - 契约、案例、Python 命令、门禁、适配器、生产关键依赖或固定客户端请求行为变化：结束旧周期并重新建立基线；
 - 最终验收失败：结束本周期，不交付失败候选；
 - 失败周期只有在再次获得用户确认后，才能向原工作区同步已确认评测资产和新增的 `optimization-history.yaml` 记录；
-- 补丁预检冲突：停止，不自动合并或覆盖；
-- 补丁应用或哈希校验异常：恢复同步前保存的目标文件状态；
+- 交付时无法从 `cycle_base_commit` 和当前已提交 worktree `HEAD` 重新生成补丁、Git 报告的实际路径不等于派生白名单路径、存在额外 section/文件，或提交版本的 canonical Prompt path 被重定向：停止，不采用持久化补丁、清单或哈希作为信任锚；
+- 补丁预检冲突、原工作区 `HEAD` 不再等于 `cycle_base_commit`、目标文件已变化或待新增路径发生冲突：停止，不自动合并或覆盖；
+- `git apply --check`、补丁应用、实际路径验证或哈希校验异常：恢复同步前保存的精确目标文件状态；
 - 用户取消：保留原工作区和生产 Prompt，不进行最终同步。
 
 ## 16. Skill 自身的测试方法
@@ -530,7 +537,8 @@ stability_regression_count
 - 30 秒超时、最多 2 次重试、固定调用槽位中断与恢复；
 - manifest 兼容性和两类回归计算；
 - Token 和 Authorization 不进入任何输出；
-- worktree 创建、补丁预检、冲突停止和同步恢复；
+- worktree 创建、白名单路径过滤、Git 实际变更路径与补丁 section 完全匹配、canonical Prompt path 绑定、补丁预检、冲突停止和精确目标同步恢复；
+- 交付只从可信周期状态重新生成补丁，不把持久化补丁、manifest 或哈希当作敌对篡改防护；覆盖原工作区 `HEAD` 漂移、提交契约路径重定向、额外路径、删除、失败结果不含 Prompt、worktree 边界、`git apply --check` 失败、应用后路径/哈希校验失败和未暂存未提交结果；
 - 中间候选不会进入提交或同步资产。
 
 测试 transport 不能通过项目配置进入生产运行路径。生产客户端仍只允许固定局域网模型。
@@ -595,7 +603,7 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 17. 模型不可用、契约冲突、回归、无改善、终验失败或同步冲突时能按明确停止条件退出；
 18. 失败周期未经再次确认不修改原工作区；确认后也只能同步已确认评测资产和新增失败历史；
 19. 开启新周期前，上一周期同步的评测资产必须已经由用户提交到目标仓库；
-20. 开发集和验证集基线完全通过时以 `no_change_needed` 结束，不生成候选、不运行验收集；成功或失败交付补丁都从 `cycle_base_commit` 生成并经过白名单过滤；Skill 自身通过 `quick_validate.py`、离线脚本测试、临时工程集成测试、真实局域网 smoke test 和 Codex 行为前向测试。
+20. 开发集和验证集基线完全通过时以 `no_change_needed` 结束，不生成候选、不运行验收集；成功或失败交付补丁都在交付时从 `cycle_base_commit` 和当前已提交 worktree `HEAD` 重新生成，Git 报告的实际路径与选定白名单路径及补丁 section 必须完全一致，且经过 canonical Prompt path、`git apply --check`、精确快照、应用后路径/哈希校验和失败恢复；Skill 自身通过 `quick_validate.py`、离线脚本测试、临时工程集成测试、真实局域网 smoke test 和 Codex 行为前向测试。
 
 ## 19. 明确决策
 
@@ -616,4 +624,5 @@ Codex 行为前向测试使用现实请求，且不给评测者预期答案、�
 - 终验失败不交付候选或生产 Prompt 修改；经用户再次确认后，可以同步已确认评测资产和新增失败历史；
 - `bootstrap` 只作为 `tune` 的内部初始化阶段，并在同一 worktree 和周期中连续进入候选调优；`verify` 默认直接在当前工作区只读运行；
 - `cycle_base_commit` 是创建 worktree 时原工作区的 `HEAD`；成功结果或经确认允许交付的失败周期资产都从该提交生成白名单补丁，同步回原工作区但不暂存、不提交，冲突时不自动合并；
+- Task 7 交付使用本地单用户、非对抗性威胁模型：保护误操作、并发编辑、过期状态、路径错误、意外文件和应用失败；不防御可同时任意修改 Skill、仓库、补丁、manifest 和哈希的本地攻击者，不使用锁、密码学信任或自定义完整补丁解析器；每次交付从可信周期状态 fresh-generate，并在 apply 前立即复核原始 `HEAD` 与提交契约的 canonical Prompt path，apply 后校验实际路径和哈希并在失败时 rollback；
 - 每个工程使用根目录 `.prompt-evals/`，每个 Prompt 使用“可读 slug + 12 位路径哈希”的独立子目录。

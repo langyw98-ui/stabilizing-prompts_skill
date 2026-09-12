@@ -35,6 +35,14 @@ This reference preserves sections 12–15 of the approved design.
 
 交付生产 Prompt 是独立的最终用户确认动作。同步前后通过候选哈希、worktree 提交和补丁内容证明落盘内容就是已经终验的候选，不在同步后重新打开本周期调优。
 
+### 12.3 交付安全边界
+
+交付采用本地单用户、非对抗性威胁模型：保护误操作、并发编辑、过期周期状态、路径错误、意外变更文件、补丁无法应用以及应用/校验失败；不防御能够任意修改 Skill 代码、Git 仓库、周期状态、补丁、manifest 或哈希的本地攻击者，也不承诺消除所有理论 TOCTOU 间隔。实现不使用仓库锁、密码学信任或自定义完整 Git 补丁解析器。
+
+交付时从可信的 `cycle_base_commit`、当前周期 worktree `HEAD` 和已提交文件内容 fresh-generate 补丁。Git `--name-status -z`/`--name-only -z`（或等价原生命令）报告的实际路径必须与派生的结果白名单和生成补丁 section 的路径集合完全一致；额外 section/文件一律停止。持久化 patch、manifest 和 hash 仅作为可选传递产物，不是敌对篡改环境下的信任锚。
+
+apply 前立即确认原工作区 `HEAD == cycle_base_commit`，并确认提交版本的 `prompt-contract.yaml` 仍指向周期开始时的 canonical Prompt path；只允许更新当前 Prompt hash 等非路径字段。随后执行 `git apply --check`，snapshot 精确目标，使用不暂存的 apply，验证实际结果路径和 destination hash；任何应用或验证异常都 rollback 到精确 snapshot。成功后目标文件仍为 unstaged/uncommitted，worktree 和 branch 不自动清理。
+
 ### 12.2 `verify`
 
 用于只读验证：
@@ -119,6 +127,7 @@ This reference preserves sections 12–15 of the approved design.
 - 契约、案例、Python 命令、门禁、适配器、生产关键依赖或固定客户端请求行为变化：结束旧周期并重新建立基线；
 - 最终验收失败：结束本周期，不交付失败候选；
 - 失败周期只有在再次获得用户确认后，才能向原工作区同步已确认评测资产和新增的 `optimization-history.yaml` 记录；
-- 补丁预检冲突：停止，不自动合并或覆盖；
-- 补丁应用或哈希校验异常：恢复同步前保存的目标文件状态；
+- 无法从可信周期状态重新生成补丁、实际路径不等于选定白名单路径、存在额外 patch section/文件，或提交契约重定向 canonical Prompt path：停止，不采用持久化 patch、manifest 或 hash 替代 fresh generation；
+- 补丁预检冲突、原工作区 `HEAD` 漂移、目标文件变化或新增路径冲突：停止，不自动合并或覆盖；
+- `git apply --check`、补丁应用、实际路径验证或哈希校验异常：恢复同步前保存的精确目标状态；
 - 用户取消：保留原工作区和生产 Prompt，不进行最终同步。

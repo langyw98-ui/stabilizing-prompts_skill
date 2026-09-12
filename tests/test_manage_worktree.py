@@ -19,7 +19,6 @@ from scripts.manage_worktree import (
     build_delivery_patch,
     create_cycle,
     preflight_patch,
-    _patch_header_paths,
 )
 
 
@@ -200,45 +199,6 @@ def test_source_hash_preflight_rejects_changed_target_without_mutation(
     assert target.read_bytes() == before
 
 
-def test_preflight_rejects_complete_allowlisted_patch_with_tampered_text_and_hashes(
-    completed_cycle: WorktreeCycle,
-) -> None:
-    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST - {".gitignore"})
-    prompt_path = "prompts/classify.md"
-    assert "+candidate prompt" in patch.text
-    crafted_text = patch.text.replace("+candidate prompt", "+attacker prompt", 1)
-    crafted_hashes = dict(patch.destination_hashes)
-    crafted_hashes[prompt_path] = hashlib.sha256(b"attacker prompt\n").hexdigest()
-    crafted = replace(
-        patch,
-        text=crafted_text,
-        paths=tuple(reversed(patch.paths)),
-        destination_hashes=crafted_hashes,
-    )
-    before = snapshot_workspace(completed_cycle.original_repo)
-
-    with pytest.raises(DeliveryError, match="canonical|allowlist"):
-        preflight_patch(completed_cycle, crafted)
-
-    assert snapshot_workspace(completed_cycle.original_repo) == before
-
-
-def test_preflight_rejects_cycle_worktree_head_change(
-    completed_cycle: WorktreeCycle,
-) -> None:
-    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST - {".gitignore"})
-    worktree_prompt = completed_cycle.worktree / "prompts" / "classify.md"
-    worktree_prompt.write_text("new committed candidate\n", encoding="utf-8")
-    git(completed_cycle.worktree, "add", "prompts/classify.md")
-    git(completed_cycle.worktree, "commit", "-m", "change candidate after patch build")
-    before = snapshot_workspace(completed_cycle.original_repo)
-
-    with pytest.raises(DeliveryError, match="canonical|commit|worktree"):
-        preflight_patch(completed_cycle, patch)
-
-    assert snapshot_workspace(completed_cycle.original_repo) == before
-
-
 def test_preflight_rejects_unstaged_cycle_target_change(
     completed_cycle: WorktreeCycle,
 ) -> None:
@@ -279,6 +239,90 @@ def test_apply_rechecks_cycle_worktree_near_application(
     assert snapshot_workspace(completed_cycle.original_repo) == before
 
 
+def test_apply_fresh_generates_from_latest_committed_cycle_head(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    stale = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST - {".gitignore"})
+    worktree_prompt = completed_cycle.worktree / "prompts" / "classify.md"
+    worktree_prompt.write_text("latest candidate\n", encoding="utf-8")
+    git(completed_cycle.worktree, "add", "prompts/classify.md")
+    git(completed_cycle.worktree, "commit", "-m", "replace candidate after patch build")
+
+    apply_delivery_patch(completed_cycle, stale)
+
+    assert (
+        completed_cycle.original_repo / "prompts" / "classify.md"
+    ).read_text(encoding="utf-8") == "latest candidate\n"
+
+
+def test_delivery_allows_current_prompt_hash_update_without_path_redirect(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    contract = (
+        completed_cycle.worktree
+        / ".prompt-evals"
+        / completed_cycle.prompt_id
+        / "prompt-contract.yaml"
+    )
+    contract.write_text(
+        "prompt_path: prompts/classify.md\ncurrent_prompt_hash: updated\n",
+        encoding="utf-8",
+    )
+    git(completed_cycle.worktree, "add", str(contract.relative_to(completed_cycle.worktree)))
+    git(completed_cycle.worktree, "commit", "-m", "record current prompt hash")
+
+    apply_delivery_patch(completed_cycle)
+
+    assert "current_prompt_hash: updated" in (
+        completed_cycle.original_repo
+        / ".prompt-evals"
+        / completed_cycle.prompt_id
+        / "prompt-contract.yaml"
+    ).read_text(encoding="utf-8")
+
+
+def test_delivery_rejects_committed_prompt_path_redirect(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    contract = (
+        completed_cycle.worktree
+        / ".prompt-evals"
+        / completed_cycle.prompt_id
+        / "prompt-contract.yaml"
+    )
+    contract.write_text("prompt_path: prompts/other.md\n", encoding="utf-8")
+    (completed_cycle.worktree / "prompts" / "other.md").write_text(
+        "candidate prompt\n", encoding="utf-8"
+    )
+    git(completed_cycle.worktree, "add", "-A")
+    git(completed_cycle.worktree, "commit", "-m", "redirect prompt contract")
+
+    with pytest.raises(DeliveryError, match="Prompt path|canonical"):
+        build_delivery_patch(completed_cycle)
+
+
+def test_delivery_rejects_original_head_drift(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    original = completed_cycle.original_repo
+    (original / "notes.txt").write_text("user commit\n", encoding="utf-8")
+    git(original, "add", "notes.txt")
+    git(original, "commit", "-m", "user commit during cycle")
+
+    with pytest.raises(DeliveryConflict, match="HEAD|cycle base"):
+        preflight_patch(completed_cycle)
+
+
+def test_preflight_rejects_extra_patch_section(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST - {".gitignore"})
+    crafted = replace(patch, text=patch.text + patch.text)
+
+    with pytest.raises(DeliveryError, match="path|section|patch"):
+        preflight_patch(completed_cycle, crafted)
+
+
 def test_delivery_does_not_fallback_to_uncommitted_prompt_contract(
     repo: tuple[Path, str],
 ) -> None:
@@ -298,37 +342,27 @@ def test_delivery_does_not_fallback_to_uncommitted_prompt_contract(
         build_delivery_patch(cycle, {"prompt"})
 
 
-def test_preflight_rejects_crafted_unallowlisted_patch(
-    completed_cycle: WorktreeCycle,
-) -> None:
-    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST - {".gitignore"})
-    crafted = replace(
-        patch,
-        paths=patch.paths + ("unrelated.txt",),
-        source_hashes={**patch.source_hashes, "unrelated.txt": None},
-        destination_hashes={**patch.destination_hashes, "unrelated.txt": None},
-    )
-
-    with pytest.raises(ValueError, match="allowlist"):
-        preflight_patch(completed_cycle, crafted)
-
-
 def test_apply_verification_failure_rolls_back_exact_targets(
     completed_cycle: WorktreeCycle,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST - {".gitignore"})
     original = completed_cycle.original_repo
     tracked_before = (original / "prompts" / "classify.md").read_bytes()
-    tampered = replace(
-        patch,
-        destination_hashes={
-            path: ("0" * 64 if digest is not None else None)
-            for path, digest in patch.destination_hashes.items()
-        },
-    )
+    original_assert = manage_worktree._assert_worktree_snapshot
+    calls = 0
 
-    with pytest.raises(ValueError, match="destination hash"):
-        apply_delivery_patch(completed_cycle, tampered)
+    def fail_after_apply(cycle: WorktreeCycle, prepared: object) -> None:
+        nonlocal calls
+        calls += 1
+        original_assert(cycle, prepared)
+        if calls == 2:
+            raise DeliveryError("post-apply verification failure")
+
+    monkeypatch.setattr(manage_worktree, "_assert_worktree_snapshot", fail_after_apply)
+
+    with pytest.raises(DeliveryError, match="verification failure"):
+        apply_delivery_patch(completed_cycle, patch)
 
     assert (original / "prompts" / "classify.md").read_bytes() == tracked_before
     assert not (original / ".prompt-evals" / completed_cycle.prompt_id / "eval-config.yaml").exists()
@@ -362,108 +396,6 @@ def test_patch_records_source_and_destination_hashes(
     assert patch.destination_hashes[prompt_path] == hashlib.sha256(
         (completed_cycle.worktree / prompt_path).read_bytes()
     ).hexdigest()
-
-
-def test_patch_parser_rejects_hunk_without_diff_header() -> None:
-    text = """--- a/prompts/classify.md
-+++ b/prompts/classify.md
-@@ -1 +1 @@
--original prompt
-+candidate prompt
-"""
-
-    with pytest.raises(DeliveryError, match="header"):
-        _patch_header_paths(text)
-
-
-def test_patch_parser_rejects_binary_patch_marker() -> None:
-    text = """diff --git a/prompts/classify.md b/prompts/classify.md
-new file mode 100644
-index 0000000..1111111
-GIT binary patch
-literal 4
-text
-"""
-
-    with pytest.raises(DeliveryError, match="binary"):
-        _patch_header_paths(text)
-
-
-def test_patch_parser_rejects_rename_and_copy_metadata() -> None:
-    for marker in ("rename from prompts/classify.md", "copy from prompts/classify.md"):
-        text = f"""diff --git a/prompts/classify.md b/prompts/classify.md
-{marker}
-"""
-        with pytest.raises(DeliveryError, match="rename|copy"):
-            _patch_header_paths(text)
-
-
-def test_patch_parser_rejects_extra_hunk_without_matching_body() -> None:
-    text = """diff --git a/prompts/classify.md b/prompts/classify.md
-index 1111111..2222222 100644
---- a/prompts/classify.md
-+++ b/prompts/classify.md
-@@ -1 +1 @@
--original prompt
-+candidate prompt
-@@ -99 +99 @@
-"""
-
-    with pytest.raises(DeliveryError, match="hunk"):
-        _patch_header_paths(text)
-
-
-def test_patch_parser_accepts_quoted_and_unquoted_paths_with_spaces() -> None:
-    quoted = """diff --git \"a/prompts/classify prompt.md\" \"b/prompts/classify prompt.md\"
-index 1111111..2222222 100644
---- \"a/prompts/classify prompt.md\"
-+++ \"b/prompts/classify prompt.md\"
-@@ -1 +1 @@
--original prompt
-+candidate prompt
-"""
-    unquoted = """diff --git a/prompts/classify prompt.md b/prompts/classify prompt.md
-index 1111111..2222222 100644
---- a/prompts/classify prompt.md
-+++ b/prompts/classify prompt.md
-@@ -1 +1 @@
--original prompt
-+candidate prompt
-"""
-
-    assert _patch_header_paths(quoted) == ("prompts/classify prompt.md",)
-    assert _patch_header_paths(unquoted) == ("prompts/classify prompt.md",)
-
-
-def test_preflight_rejects_tampered_persisted_allowlist_metadata(
-    completed_cycle: WorktreeCycle,
-) -> None:
-    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST)
-    tampered = replace(
-        patch,
-        allowlist_paths=patch.allowlist_paths + ("unrelated.txt",),
-    )
-
-    with pytest.raises(DeliveryError, match="allowlist manifest"):
-        preflight_patch(completed_cycle, tampered)
-
-
-def test_failure_preflight_rejects_explicit_canonical_prompt_path(
-    completed_cycle: WorktreeCycle,
-) -> None:
-    success = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST)
-    canonical_prompt = "prompts/classify.md"
-    crafted = replace(
-        success,
-        result="failure",
-        paths=(canonical_prompt,),
-        source_hashes={canonical_prompt: success.source_hashes[canonical_prompt]},
-        destination_hashes={canonical_prompt: success.destination_hashes[canonical_prompt]},
-        allowlist_paths=(canonical_prompt,),
-    )
-
-    with pytest.raises(DeliveryError, match="Prompt|prompt"):
-        preflight_patch(completed_cycle, crafted)
 
 
 def test_build_rejects_deleting_canonical_prompt(
