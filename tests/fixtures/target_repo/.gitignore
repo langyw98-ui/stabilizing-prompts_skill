@@ -1,0 +1,4 @@
+.prompt-evals/**/reports/
+.prompt-evals/**/.runtime/
+__pycache__/
+*.pyc

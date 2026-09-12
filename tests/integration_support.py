@@ -1,0 +1,1063 @@
+"""Test-only orchestration and transport boundary for offline integration tests.
+
+The production scripts intentionally have no fake-transport configuration.  This
+module injects a ChatOpenAI-shaped client through the public ``client`` argument
+or a temporary monkeypatch around the runner CLI, and keeps all target-repository
+files in disposable Git fixtures.
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass, replace
+import hashlib
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any, Literal
+
+import yaml
+from langchain_core.messages import AIMessage
+
+from scripts import compare_runs as compare_module
+from scripts import run_prompt_eval as runner_module
+from scripts import validate_cases as cases_module
+from scripts import validate_workspace as workspace_module
+from scripts.local_model_client import MODEL_NAME, safe_client_config
+from scripts.manage_worktree import (
+    FAILURE_ALLOWLIST,
+    SUCCESS_ALLOWLIST,
+    DeliveryConflict,
+    DeliveryError,
+    WorktreeCycle,
+    apply_delivery_patch,
+    build_delivery_patch,
+    create_cycle,
+)
+from scripts.run_prompt_eval import (
+    RunManifest,
+    execute_run,
+    load_adapter,
+    load_manifest,
+    new_manifest,
+    persist_manifest,
+    pending_slots,
+)
+from scripts.score_results import RunMetrics, score_run
+from scripts.validate_cases import CaseSuite, EvalCase, load_case_suite
+from scripts.validate_workspace import WorkspaceError, prompt_id_for_path, validate_workspace
+
+
+FIXTURE_SOURCE = Path(__file__).parent / "fixtures" / "target_repo"
+PROMPT_RELATIVE = "prompts/classify.md"
+DEPENDENCY_RELATIVE = "target_app/production.py"
+
+
+def _git(repo: Path, *args: str, check: bool = True) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise AssertionError(f"git {' '.join(args)} failed: {detail}")
+    return result.stdout
+
+
+def _git_commit(repo: Path, message: str) -> None:
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", message)
+
+
+def _purge_fixture_modules() -> None:
+    """Prevent a prior temporary target package from leaking into a new test."""
+
+    for name in tuple(sys.modules):
+        if name == "target_app" or name.startswith("target_app."):
+            sys.modules.pop(name, None)
+
+
+def _initial_contract(repo: Path, prompt_id: str) -> Path:
+    path = repo / ".prompt-evals" / prompt_id / "prompt-contract.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "prompt_path: prompts/classify.md\n"
+        "schema: target_app.production:Decision\n"
+        "renderer: target_app.production:assemble_call\n"
+        "purpose: deterministic request classification\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _case(
+    case_id: str,
+    family: str,
+    message: str,
+    *,
+    action: Literal["accept", "reject"] = "accept",
+    priority: Literal["normal", "critical"] = "normal",
+) -> dict[str, object]:
+    return {
+        "id": case_id,
+        "semantic_family": family,
+        "source": ["target_app/production.py"],
+        "input": {
+            "variables": {"message": message},
+            "context": {"case": case_id},
+        },
+        "expect": {
+            "output": {
+                "action": action,
+                "reason": f"fixture-{case_id}",
+            }
+        },
+        "priority": priority,
+        "dimensions": ["routing", "deterministic-fixture"],
+        "rationale": "the fixture contract fixes this complete production decision",
+    }
+
+
+def _case_sets() -> dict[str, list[dict[str, object]]]:
+    return {
+        "dev": [
+            _case("dev-accept", "routing-dev-accept", "development accept"),
+            _case(
+                "dev-reject",
+                "routing-dev-reject",
+                "development reject",
+                action="reject",
+            ),
+        ],
+        "validation": [
+            _case(
+                "validation-accept",
+                "routing-validation-accept",
+                "validation accept",
+            ),
+            _case(
+                "validation-reject",
+                "routing-validation-reject",
+                "validation reject",
+                action="reject",
+            ),
+        ],
+        "acceptance": [
+            _case(
+                "acceptance-accept",
+                "routing-acceptance-accept",
+                "acceptance accept",
+            ),
+            _case(
+                "acceptance-reject",
+                "routing-acceptance-reject",
+                "acceptance reject",
+                action="reject",
+            ),
+        ],
+        "external": [
+            _case(
+                "external-accept",
+                "routing-external-accept",
+                "external accept",
+            ),
+        ],
+    }
+
+
+def _write_yaml(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+
+
+def _adapter_source() -> str:
+    return (
+        "from __future__ import annotations\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "_repo = Path(__file__).resolve().parents[2]\n"
+        "if str(_repo) not in sys.path:\n"
+        "    sys.path.insert(0, str(_repo))\n"
+        "from target_app.production import assemble_call\n"
+        "\n"
+        "def prepare_call(prompt_path, case):\n"
+        "    return assemble_call(prompt_path, case)\n"
+    )
+
+
+def _write_complete_assets(repo: Path, prompt_id: str) -> Path:
+    eval_root = repo / ".prompt-evals" / prompt_id
+    eval_root.mkdir(parents=True, exist_ok=True)
+    _initial_contract(repo, prompt_id)
+    _write_yaml(
+        eval_root / "eval-config.yaml",
+        {
+            "repeats": {"development": 5, "validation": 5, "acceptance": 10},
+            "thresholds": {"normal": {"development": 4, "acceptance": 9}},
+        },
+    )
+    for split, cases in _case_sets().items():
+        filename = "external-cases.yaml" if split == "external" else f"{split}-cases.yaml"
+        _write_yaml(eval_root / filename, cases)
+    (eval_root / "adapter.py").write_text(_adapter_source(), encoding="utf-8")
+    _write_yaml(eval_root / "optimization-history.yaml", {"cycles": []})
+    return eval_root
+
+
+def build_target_repo(path: Path, *, complete_assets: bool = False) -> Path:
+    """Copy and commit the minimal target fixture into a disposable repository."""
+
+    target = Path(path).resolve()
+    if target.exists():
+        raise AssertionError(f"target fixture destination already exists: {target}")
+    shutil.copytree(FIXTURE_SOURCE, target)
+    prompt_id = prompt_id_for_path(PROMPT_RELATIVE)
+    _initial_contract(target, prompt_id)
+    _git(target, "init")
+    _git(target, "config", "user.email", "integration-tests@example.invalid")
+    _git(target, "config", "user.name", "Offline Integration Tests")
+    _git_commit(target, "fixture: create production prompt target")
+    if complete_assets:
+        _write_complete_assets(target, prompt_id)
+        _git_commit(target, "fixture: add confirmed evaluation assets")
+    return target
+
+
+def _prompt_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _parse_message(message: object) -> tuple[str, str]:
+    content = getattr(message, "content", "")
+    text = content if isinstance(content, str) else str(content)
+    case_match = re.search(r"^case_id=([^\r\n]+)", text, re.MULTILINE)
+    hash_match = re.search(r"^prompt_hash=([^\r\n]+)", text, re.MULTILINE)
+    if case_match is None or hash_match is None:
+        raise AssertionError(f"production renderer metadata is missing: {text!r}")
+    return case_match.group(1), hash_match.group(1)
+
+
+class CountingTransport:
+    """Deterministic ChatOpenAI-shaped fake injected only by tests."""
+
+    def __init__(
+        self,
+        *,
+        scenario: str = "happy",
+        original_hash: str | None = None,
+        candidate_hash: str | None = None,
+        sentinel: str | None = None,
+    ) -> None:
+        self.scenario = scenario
+        self.original_hash = original_hash
+        self.candidate_hash = candidate_hash
+        self.sentinel = sentinel
+        self.call_count = 0
+        self.calls: list[dict[str, str | int]] = []
+        self.raw_evidence: list[AIMessage] = []
+        self._schema: type[Any] | None = None
+        self._per_case = Counter[tuple[str, str]]()
+        self._resume_failed = False
+        self.structured_output_kwargs: list[dict[str, object]] = []
+        self.model_name = MODEL_NAME
+
+    def bind_prompt_hashes(self, original_hash: str, candidate_hash: str) -> None:
+        self.original_hash = original_hash
+        self.candidate_hash = candidate_hash
+
+    def get_model_identity(self) -> str:
+        return MODEL_NAME
+
+    def with_structured_output(self, schema: type[Any], **kwargs: object) -> "CountingTransport":
+        self._schema = schema
+        self.structured_output_kwargs.append(dict(kwargs))
+        return self
+
+    @staticmethod
+    def _expected(case_id: str) -> tuple[str, str]:
+        action = "reject" if case_id.endswith("reject") else "accept"
+        return action, f"fixture-{case_id}"
+
+    def _is_wrong(self, prompt_hash: str, case_id: str) -> bool:
+        if self.scenario == "no-change":
+            return False
+        if (
+            prompt_hash == self.original_hash
+            and case_id.startswith(("dev-", "validation-"))
+            and case_id.endswith("accept")
+        ):
+            return True
+        if self.scenario == "regression":
+            return prompt_hash == self.candidate_hash and case_id == "validation-accept"
+        if self.scenario == "acceptance-failure":
+            return prompt_hash == self.candidate_hash and case_id == "acceptance-accept"
+        return False
+
+    def invoke(self, messages: object) -> object:
+        if self._schema is None:
+            raise AssertionError("structured schema was not configured")
+        if not isinstance(messages, (list, tuple)) or not messages:
+            raise AssertionError("production call did not provide messages")
+        case_id, prompt_hash = _parse_message(messages[0])
+        index = self._per_case[(prompt_hash, case_id)]
+        self._per_case[(prompt_hash, case_id)] += 1
+        self.call_count += 1
+        self.calls.append({"prompt_hash": prompt_hash, "case_id": case_id, "repeat": index})
+        if (
+            self.scenario == "resume"
+            and not self._resume_failed
+            and prompt_hash == self.original_hash
+            and case_id == "dev-accept"
+        ):
+            self._resume_failed = True
+            raise ConnectionError("offline fixture transport interruption")
+
+        action, reason = self._expected(case_id)
+        if self._is_wrong(prompt_hash, case_id):
+            action, reason = ("reject", "fixture-business-regression")
+        payload = {"action": action, "reason": reason}
+        raw_content = "fixture structured response"
+        if self.sentinel:
+            raw_content += f"\nAuthorization: Bearer {self.sentinel}"
+        raw = AIMessage(
+            content=raw_content,
+            tool_calls=[
+                {
+                    "name": self._schema.__name__,
+                    "args": payload,
+                    "id": f"fixture-call-{self.call_count}",
+                }
+            ],
+        )
+        self.raw_evidence.append(raw)
+        parsed = self._schema.model_validate(payload)
+        return {"raw": raw, "parsed": parsed, "parsing_error": None}
+
+
+@dataclass(frozen=True)
+class TuneResult:
+    stop_reason: str
+    original_prompt: str
+    candidate_prompt: str | None = None
+    original_workspace_status: dict[str, str] | None = None
+    acceptance_activities: int = 0
+    acceptance_baseline_perfect: bool = False
+    acceptance_candidate_perfect: bool = False
+    frozen_candidate_hash: str | None = None
+    delivered_prompt_hash: str | None = None
+    delivered_paths: tuple[str, ...] = ()
+    partially_delivered_paths: tuple[str, ...] = ()
+    transport_calls: int = 0
+    transport_retry_slots: tuple[str, ...] = ()
+    resumed_slot_key: str | None = None
+    completed_slot_keys: tuple[str, ...] = ()
+    raw_evidence: object = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "stop_reason": self.stop_reason,
+            "original_prompt": self.original_prompt,
+            "candidate_prompt": self.candidate_prompt,
+            "original_workspace_status": self.original_workspace_status,
+            "acceptance_activities": self.acceptance_activities,
+            "acceptance_baseline_perfect": self.acceptance_baseline_perfect,
+            "acceptance_candidate_perfect": self.acceptance_candidate_perfect,
+            "frozen_candidate_hash": self.frozen_candidate_hash,
+            "delivered_prompt_hash": self.delivered_prompt_hash,
+            "delivered_paths": list(self.delivered_paths),
+            "partially_delivered_paths": list(self.partially_delivered_paths),
+            "transport_calls": self.transport_calls,
+            "transport_retry_slots": list(self.transport_retry_slots),
+            "resumed_slot_key": self.resumed_slot_key,
+            "completed_slot_keys": list(self.completed_slot_keys),
+            "raw_evidence": runner_module._redacted(self.raw_evidence),
+        }
+
+
+def _report_evidence(transport: CountingTransport) -> object:
+    """Keep harness results at the same redacted boundary as reports."""
+
+    return runner_module._redacted(transport.raw_evidence)
+
+
+def _eval_root(repo: Path) -> Path:
+    return repo / ".prompt-evals" / prompt_id_for_path(PROMPT_RELATIVE)
+
+
+def _load_fixture_assets(
+    repo: Path,
+) -> tuple[Path, Any, CaseSuite, type[Any]]:
+    eval_root = _eval_root(repo)
+    _purge_fixture_modules()
+    adapter = load_adapter(eval_root)
+    raw = yaml.safe_load((eval_root / "dev-cases.yaml").read_text(encoding="utf-8"))
+    first_case = EvalCase.model_validate(raw[0])
+    call = adapter(repo / PROMPT_RELATIVE, first_case)
+    schema = call["schema"]
+    suite = load_case_suite(
+        tuple(eval_root / f"{split}-cases.yaml" for split in ("dev", "validation", "acceptance")),
+        schema,
+    )
+    return eval_root, adapter, suite, schema
+
+
+def _run_phase(
+    *,
+    eval_root: Path,
+    adapter: Any,
+    suite: CaseSuite,
+    schema: type[Any],
+    split: Literal["dev", "validation", "acceptance"],
+    prompt_path: Path,
+    canonical_prompt: Path,
+    cycle: WorktreeCycle,
+    transport: CountingTransport,
+    label: str,
+    resume: bool = False,
+) -> tuple[RunManifest, RunMetrics, str | None, tuple[str, ...]]:
+    repeats = 10 if split == "acceptance" else 5
+    cases = suite[split]
+    prompt_hash = _prompt_hash(prompt_path)
+    manifest_path = eval_root / ".runtime" / f"{label}.json"
+    manifest = new_manifest(
+        cases,
+        repeats,
+        prompt_hash,
+        prompt_path=prompt_path,
+        schema=schema,
+        manifest_path=manifest_path,
+        dataset=split,
+        mode="tune",
+        cycle_id=cycle.branch,
+        client_config=safe_client_config(),
+    )
+    result = execute_run(
+        manifest,
+        prompt_path=prompt_path,
+        prepare_call=adapter,
+        client=transport,
+        manifest_path=manifest_path,
+    )
+    resumed_slot: str | None = None
+    retry_slots: tuple[str, ...] = ()
+    if resume and pending_slots(result):
+        resumed_slot = pending_slots(result)[0].key
+        retry_slots = (resumed_slot,)
+        result = execute_run(
+            result,
+            prompt_path=prompt_path,
+            prepare_call=adapter,
+            client=transport,
+            manifest_path=manifest_path,
+        )
+    if result.status != "complete" or result.metrics is None:
+        raise AssertionError(f"fixture phase did not complete: {result.status}")
+    # Candidate files are runtime-only, but comparisons use the canonical
+    # production Prompt path.  Keep the content hash as the only Prompt
+    # identity difference, matching the manifest contract.
+    if result.prompt_path != str(canonical_prompt.resolve()):
+        result = replace(result, prompt_path=str(canonical_prompt.resolve()))
+        persist_manifest(result, manifest_path)
+    metrics = score_run(result, schema)
+    return result, metrics, resumed_slot, retry_slots
+
+
+def _all_pass(metrics: RunMetrics) -> bool:
+    return (
+        metrics.schema_valid_rate == 1
+        and metrics.run_accuracy == 1
+        and metrics.stable_case_rate == 1
+        and all(case.pass_count == case.total_responses for case in metrics.case_scores)
+    )
+
+
+def _status_for_path(repo: Path, relative: str) -> str:
+    return _git(repo, "status", "--short", "--", relative).rstrip()
+
+
+def assert_delivered_files_unstaged_or_untracked(repo: Path, paths: tuple[str, ...]) -> None:
+    """Ruling 2: inspect each delivered file, never Git's compact dir label."""
+
+    for relative in paths:
+        tracked = bool(
+            _git(repo, "ls-files", "--error-unmatch", "--", relative, check=False).strip()
+        )
+        status = _status_for_path(repo, relative)
+        assert status, f"delivered path has no Git status: {relative}"
+        if tracked:
+            assert status.startswith(" M"), f"tracked delivery was staged: {relative}: {status!r}"
+        else:
+            assert status.startswith("??"), f"new delivery is not untracked: {relative}: {status!r}"
+
+
+def _finish_success_delivery(
+    cycle: WorktreeCycle,
+    prompt_id: str,
+    candidate_prompt: str,
+    candidate_hash: str,
+) -> tuple[tuple[str, ...], str]:
+    worktree_prompt = cycle.worktree / PROMPT_RELATIVE
+    worktree_prompt.write_text(candidate_prompt, encoding="utf-8")
+    contract = cycle.worktree / ".prompt-evals" / prompt_id / "prompt-contract.yaml"
+    contract.write_text(
+        contract.read_text(encoding="utf-8")
+        + f"current_prompt_hash: {candidate_hash}\n",
+        encoding="utf-8",
+    )
+    _git_commit(cycle.worktree, "tune: commit accepted candidate")
+    patch = build_delivery_patch(cycle, SUCCESS_ALLOWLIST, result="success")
+    apply_delivery_patch(cycle, patch)
+    delivered_hash = _prompt_hash(cycle.original_repo / PROMPT_RELATIVE)
+    return patch.paths, delivered_hash
+
+
+def _finish_failure_delivery(
+    cycle: WorktreeCycle,
+    prompt_id: str,
+) -> tuple[str, ...]:
+    history = cycle.worktree / ".prompt-evals" / prompt_id / "optimization-history.yaml"
+    history.write_text(
+        "cycles:\n"
+        "  - stop_reason: acceptance_failed\n"
+        "    case: acceptance-accept\n",
+        encoding="utf-8",
+    )
+    _git_commit(cycle.worktree, "tune: commit failure history and confirmed assets")
+    patch = build_delivery_patch(cycle, FAILURE_ALLOWLIST, result="failure")
+    apply_delivery_patch(cycle, patch)
+    return patch.paths
+
+
+def run_tune_with_fake_transport(
+    target_repo: Path,
+    *,
+    scenario: str = "happy",
+    confirm_contract: bool = True,
+    confirm_delivery: bool = True,
+    confirm_failure_delivery: bool = False,
+    transport: CountingTransport | None = None,
+    project_transport_setting: str | None = None,
+    sentinel: str | None = None,
+) -> TuneResult:
+    """Exercise the tune state machine with only test-injected model calls."""
+
+    del project_transport_setting  # Production eval-config has no transport selector.
+    repo = Path(target_repo).resolve()
+    original_prompt_path = repo / PROMPT_RELATIVE
+    original_prompt = original_prompt_path.read_text(encoding="utf-8")
+    prompt_id = prompt_id_for_path(PROMPT_RELATIVE)
+    fake = transport or CountingTransport(scenario=scenario, sentinel=sentinel)
+
+    try:
+        snapshot = validate_workspace(repo, original_prompt_path, (repo / DEPENDENCY_RELATIVE,))
+    except WorkspaceError as error:
+        reason = "dependency_dirty" if "dependency" in str(error).casefold() else "preflight_failed"
+        return TuneResult(
+            stop_reason=reason,
+            original_prompt=original_prompt,
+            transport_calls=fake.call_count,
+            raw_evidence=_report_evidence(fake),
+        )
+    if not confirm_contract:
+        return TuneResult(
+            stop_reason="contract_not_confirmed",
+            original_prompt=original_prompt,
+            transport_calls=fake.call_count,
+            raw_evidence=_report_evidence(fake),
+        )
+
+    cycle = create_cycle(
+        repo,
+        prompt_id,
+        prompt_path=snapshot.prompt_path,
+    )
+    eval_root = _write_complete_assets(cycle.worktree, prompt_id)
+    _git_commit(cycle.worktree, "tune: commit confirmed evaluation assets")
+    eval_root, adapter, suite, schema = _load_fixture_assets(cycle.worktree)
+
+    candidate_prompt = (
+        "Classify the request as accept or reject.\n"
+        "Return the production decision with an explicit reason.\n"
+    )
+    candidate_path = eval_root / ".runtime" / "candidate.md"
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_path.write_text(candidate_prompt, encoding="utf-8")
+    candidate_hash = _prompt_hash(candidate_path)
+    # Git may normalize the fixture's line endings while checking out the
+    # isolated cycle worktree.  The transport keys baseline behavior to the
+    # bytes actually rendered by that production checkout, not to the
+    # pre-checkout source bytes in the original fixture repository.
+    fake.bind_prompt_hashes(_prompt_hash(cycle.worktree / PROMPT_RELATIVE), candidate_hash)
+
+    baseline_dev, baseline_dev_metrics, resumed_slot, retry_slots = _run_phase(
+        eval_root=eval_root,
+        adapter=adapter,
+        suite=suite,
+        schema=schema,
+        split="dev",
+        prompt_path=cycle.worktree / PROMPT_RELATIVE,
+        canonical_prompt=cycle.worktree / PROMPT_RELATIVE,
+        cycle=cycle,
+        transport=fake,
+        label="baseline-dev",
+        resume=scenario == "resume",
+    )
+    _baseline_validation, baseline_validation_metrics, _, _ = _run_phase(
+        eval_root=eval_root,
+        adapter=adapter,
+        suite=suite,
+        schema=schema,
+        split="validation",
+        prompt_path=cycle.worktree / PROMPT_RELATIVE,
+        canonical_prompt=cycle.worktree / PROMPT_RELATIVE,
+        cycle=cycle,
+        transport=fake,
+        label="baseline-validation",
+    )
+
+    if scenario == "no-change" and _all_pass(baseline_dev_metrics) and _all_pass(baseline_validation_metrics):
+        return TuneResult(
+            stop_reason="no_change_needed",
+            original_prompt=original_prompt,
+            transport_calls=fake.call_count,
+            resumed_slot_key=resumed_slot,
+            completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            transport_retry_slots=retry_slots,
+            raw_evidence=_report_evidence(fake),
+        )
+
+    candidate_dev, candidate_dev_metrics, _, _ = _run_phase(
+        eval_root=eval_root,
+        adapter=adapter,
+        suite=suite,
+        schema=schema,
+        split="dev",
+        prompt_path=candidate_path,
+        canonical_prompt=cycle.worktree / PROMPT_RELATIVE,
+        cycle=cycle,
+        transport=fake,
+        label="candidate-dev",
+    )
+    dev_comparison = compare_module.compare_runs(
+        baseline_dev,
+        candidate_dev,
+        "development",
+        schema=schema,
+    )
+    if not compare_module.evaluate_gate(dev_comparison, "development").passed:
+        return TuneResult(
+            stop_reason="development_failed",
+            original_prompt=original_prompt,
+            candidate_prompt=candidate_prompt,
+            frozen_candidate_hash=candidate_hash,
+            transport_calls=fake.call_count,
+            resumed_slot_key=resumed_slot,
+            completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            transport_retry_slots=retry_slots,
+            raw_evidence=_report_evidence(fake),
+        )
+
+    candidate_validation, candidate_validation_metrics, _, _ = _run_phase(
+        eval_root=eval_root,
+        adapter=adapter,
+        suite=suite,
+        schema=schema,
+        split="validation",
+        prompt_path=candidate_path,
+        canonical_prompt=cycle.worktree / PROMPT_RELATIVE,
+        cycle=cycle,
+        transport=fake,
+        label="candidate-validation",
+    )
+    del candidate_dev_metrics, candidate_validation_metrics
+    validation_comparison = compare_module.compare_runs(
+        _baseline_validation,
+        candidate_validation,
+        "validation",
+        schema=schema,
+    )
+    validation_gate = compare_module.evaluate_gate(validation_comparison, "validation")
+    if not validation_gate.passed:
+        return TuneResult(
+            stop_reason="validation_failed",
+            original_prompt=original_prompt,
+            candidate_prompt=candidate_prompt,
+            frozen_candidate_hash=candidate_hash,
+            transport_calls=fake.call_count,
+            resumed_slot_key=resumed_slot,
+            completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            transport_retry_slots=retry_slots,
+            raw_evidence=_report_evidence(fake),
+        )
+
+    acceptance_activities = 1
+    acceptance_baseline, acceptance_baseline_metrics, _, _ = _run_phase(
+        eval_root=eval_root,
+        adapter=adapter,
+        suite=suite,
+        schema=schema,
+        split="acceptance",
+        prompt_path=cycle.worktree / PROMPT_RELATIVE,
+        canonical_prompt=cycle.worktree / PROMPT_RELATIVE,
+        cycle=cycle,
+        transport=fake,
+        label="acceptance-baseline",
+    )
+    acceptance_candidate, acceptance_candidate_metrics, _, _ = _run_phase(
+        eval_root=eval_root,
+        adapter=adapter,
+        suite=suite,
+        schema=schema,
+        split="acceptance",
+        prompt_path=candidate_path,
+        canonical_prompt=cycle.worktree / PROMPT_RELATIVE,
+        cycle=cycle,
+        transport=fake,
+        label="acceptance-candidate",
+    )
+    acceptance_comparison = compare_module.compare_runs(
+        acceptance_baseline,
+        acceptance_candidate,
+        "acceptance",
+        schema=schema,
+    )
+    acceptance_gate = compare_module.evaluate_gate(acceptance_comparison, "acceptance")
+    if not acceptance_gate.passed:
+        delivered_paths: tuple[str, ...] = ()
+        if confirm_failure_delivery:
+            delivered_paths = _finish_failure_delivery(cycle, prompt_id)
+        return TuneResult(
+            stop_reason="acceptance_failed",
+            original_prompt=original_prompt,
+            candidate_prompt=candidate_prompt,
+            frozen_candidate_hash=candidate_hash,
+            acceptance_activities=acceptance_activities,
+            acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
+            acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
+            delivered_paths=delivered_paths,
+            delivered_prompt_hash=None,
+            transport_calls=fake.call_count,
+            resumed_slot_key=resumed_slot,
+            completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            transport_retry_slots=retry_slots,
+            raw_evidence=_report_evidence(fake),
+        )
+
+    if not confirm_delivery:
+        return TuneResult(
+            stop_reason="delivery_not_confirmed",
+            original_prompt=original_prompt,
+            candidate_prompt=candidate_prompt,
+            frozen_candidate_hash=candidate_hash,
+            acceptance_activities=acceptance_activities,
+            acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
+            acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
+            transport_calls=fake.call_count,
+            resumed_slot_key=resumed_slot,
+            completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            transport_retry_slots=retry_slots,
+            raw_evidence=_report_evidence(fake),
+        )
+
+    if scenario == "conflict":
+        original_prompt_path.write_text("user edit wins\n", encoding="utf-8")
+        try:
+            _finish_success_delivery(cycle, prompt_id, candidate_prompt, candidate_hash)
+        except DeliveryConflict:
+            return TuneResult(
+                stop_reason="delivery_conflict",
+                original_prompt=original_prompt,
+                candidate_prompt=candidate_prompt,
+                frozen_candidate_hash=candidate_hash,
+                acceptance_activities=acceptance_activities,
+                acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
+                acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
+                transport_calls=fake.call_count,
+                raw_evidence=_report_evidence(fake),
+            )
+        raise AssertionError("conflicting delivery unexpectedly succeeded")
+
+    if scenario == "rollback":
+        worktree_prompt = cycle.worktree / PROMPT_RELATIVE
+        worktree_prompt.write_text(candidate_prompt, encoding="utf-8")
+        contract = cycle.worktree / ".prompt-evals" / prompt_id / "prompt-contract.yaml"
+        contract.write_text(
+            contract.read_text(encoding="utf-8")
+            + f"current_prompt_hash: {candidate_hash}\n",
+            encoding="utf-8",
+        )
+        _git_commit(cycle.worktree, "tune: commit accepted candidate for rollback")
+        patch = build_delivery_patch(cycle, SUCCESS_ALLOWLIST, result="success")
+        original_assert = __import__("scripts.manage_worktree", fromlist=["_assert_worktree_snapshot"])._assert_worktree_snapshot
+        calls = 0
+
+        def fail_after_apply(current_cycle: WorktreeCycle, current_patch: object) -> None:
+            nonlocal calls
+            calls += 1
+            original_assert(current_cycle, current_patch)
+            if calls == 2:
+                raise DeliveryError("post-apply verification failure")
+
+        manage_module = __import__("scripts.manage_worktree", fromlist=["_assert_worktree_snapshot"])
+        manage_module._assert_worktree_snapshot = fail_after_apply
+        try:
+            apply_delivery_patch(cycle, patch)
+        except DeliveryError:
+            return TuneResult(
+                stop_reason="delivery_rollback",
+                original_prompt=original_prompt,
+                candidate_prompt=candidate_prompt,
+                frozen_candidate_hash=candidate_hash,
+                acceptance_activities=acceptance_activities,
+                acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
+                acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
+                delivered_paths=patch.paths,
+                partially_delivered_paths=tuple(
+                    path for path in patch.paths if _status_for_path(repo, path)
+                ),
+                transport_calls=fake.call_count,
+                raw_evidence=_report_evidence(fake),
+            )
+        finally:
+            manage_module._assert_worktree_snapshot = original_assert
+        raise AssertionError("rollback injection unexpectedly succeeded")
+
+    try:
+        delivered_paths, delivered_hash = _finish_success_delivery(
+            cycle,
+            prompt_id,
+            candidate_prompt,
+            candidate_hash,
+        )
+    except DeliveryConflict as error:
+        raise AssertionError(f"unexpected delivery conflict: {error}") from error
+    return TuneResult(
+        stop_reason="delivered",
+        original_prompt=original_prompt,
+        candidate_prompt=candidate_prompt,
+        acceptance_activities=acceptance_activities,
+        acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
+        acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
+        frozen_candidate_hash=candidate_hash,
+        delivered_prompt_hash=delivered_hash,
+        delivered_paths=delivered_paths,
+        transport_calls=fake.call_count,
+        resumed_slot_key=resumed_slot,
+        completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+        transport_retry_slots=retry_slots,
+        raw_evidence=_report_evidence(fake),
+    )
+
+
+@dataclass(frozen=True)
+class CliChainEvidence:
+    workspace_status: str
+    case_suite_status: str
+    run_status: str
+    score_status: str
+    comparison_status: str
+    schema_name: str
+    renderer_marker: str
+
+
+def _set_cycle_id(manifest_path: Path) -> None:
+    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    value["cycle_id"] = "offline-cli-cycle"
+    manifest_path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def run_cli_chain(target_repo: Path) -> CliChainEvidence:
+    """Call each documented CLI entry point with a test-injected client."""
+
+    repo = Path(target_repo).resolve()
+    prompt = repo / PROMPT_RELATIVE
+    prompt_id = prompt_id_for_path(PROMPT_RELATIVE)
+    eval_root = repo / ".prompt-evals" / prompt_id
+    runtime = eval_root / ".runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    _purge_fixture_modules()
+    sys.path.insert(0, str(repo))
+    try:
+        workspace_json = runtime / "cli-workspace.json"
+        workspace_code = workspace_module.main(
+            [
+                "--repo",
+                str(repo),
+                "--prompt",
+                PROMPT_RELATIVE,
+                "--mode",
+                "verify",
+                "--output",
+                str(workspace_json),
+            ]
+        )
+        case_json = runtime / "cli-cases.json"
+        case_code = cases_module.main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--schema",
+                "target_app.production:Decision",
+                "--output",
+                str(case_json),
+            ]
+        )
+        transport = CountingTransport(scenario="no-change")
+        old_build_client = runner_module.build_client
+        runner_module.build_client = lambda _path=None: transport
+        try:
+            baseline_manifest = runtime / "cli-baseline.json"
+            baseline_code = runner_module.main(
+                [
+                    "--mode",
+                    "verify",
+                    "--eval-root",
+                    str(eval_root),
+                    "--prompt",
+                    str(prompt),
+                    "--dataset",
+                    "dev",
+                    "--repeats",
+                    "5",
+                    "--manifest",
+                    str(baseline_manifest),
+                ]
+            )
+            _set_cycle_id(baseline_manifest)
+            candidate_manifest = runtime / "cli-candidate.json"
+            candidate_code = runner_module.main(
+                [
+                    "--mode",
+                    "verify",
+                    "--eval-root",
+                    str(eval_root),
+                    "--prompt",
+                    str(prompt),
+                    "--dataset",
+                    "dev",
+                    "--repeats",
+                    "5",
+                    "--manifest",
+                    str(candidate_manifest),
+                ]
+            )
+            _set_cycle_id(candidate_manifest)
+        finally:
+            runner_module.build_client = old_build_client
+        baseline_report = runtime / "cli-baseline-report.json"
+        candidate_report = runtime / "cli-candidate-report.json"
+        baseline_score_code = __import__("scripts.score_results", fromlist=["main"]).main(
+            ["--manifest", str(baseline_manifest), "--report", str(baseline_report)]
+        )
+        candidate_score_code = __import__("scripts.score_results", fromlist=["main"]).main(
+            ["--manifest", str(candidate_manifest), "--report", str(candidate_report)]
+        )
+        comparison_report = runtime / "cli-comparison.json"
+        comparison_code = compare_module.main(
+            [
+                "--baseline",
+                str(baseline_manifest),
+                "--candidate",
+                str(candidate_manifest),
+                "--phase",
+                "development",
+                "--report",
+                str(comparison_report),
+            ]
+        )
+    finally:
+        try:
+            sys.path.remove(str(repo))
+        except ValueError:
+            pass
+    workspace_payload = json.loads(workspace_json.read_text(encoding="utf-8"))
+    case_payload = json.loads(case_json.read_text(encoding="utf-8"))
+    baseline_payload = json.loads(baseline_manifest.read_text(encoding="utf-8"))
+    comparison_payload = json.loads(comparison_report.read_text(encoding="utf-8"))
+    return CliChainEvidence(
+        workspace_status="valid" if workspace_code == 0 and workspace_payload["status"] == "valid" else "error",
+        case_suite_status="valid" if case_code == 0 and case_payload["status"] == "valid" else "error",
+        run_status="complete" if baseline_code == 0 and candidate_code == 0 and baseline_payload["status"] == "complete" else "error",
+        score_status="complete" if baseline_score_code == 0 and candidate_score_code == 0 else "error",
+        comparison_status="passed" if comparison_code == 0 and comparison_payload["status"] == "passed" else "failed",
+        schema_name=str(baseline_payload.get("schema_import", "")).rsplit(":", 1)[-1],
+        renderer_marker="production-renderer" if any(
+            call.get("case_id") == "dev-accept" for call in transport.calls
+        ) else "missing",
+    )
+
+
+def run_verify(
+    target_repo: Path,
+    *,
+    dataset: Literal["dev", "validation", "external", "acceptance"],
+    transport: CountingTransport,
+) -> RunManifest:
+    """Run the real verify CLI, with acceptance rejected before file access."""
+
+    repo = Path(target_repo).resolve()
+    prompt_id = prompt_id_for_path(PROMPT_RELATIVE)
+    eval_root = repo / ".prompt-evals" / prompt_id
+    manifest_path = eval_root / ".runtime" / f"verify-{dataset}.json"
+    if dataset == "acceptance":
+        # Constructing this production manifest exercises the same early guard
+        # without opening the intentionally invalid acceptance file.
+        new_manifest(
+            [],
+            10,
+            _prompt_hash(repo / PROMPT_RELATIVE),
+            prompt_path=repo / PROMPT_RELATIVE,
+            dataset="acceptance",
+            mode="verify",
+        )
+        raise AssertionError("verify acceptance guard unexpectedly allowed a manifest")
+
+    _purge_fixture_modules()
+    sys.path.insert(0, str(repo))
+    old_build_client = runner_module.build_client
+    runner_module.build_client = lambda _path=None: transport
+    try:
+        code = runner_module.main(
+            [
+                "--mode",
+                "verify",
+                "--eval-root",
+                str(eval_root),
+                "--prompt",
+                str(repo / PROMPT_RELATIVE),
+                "--dataset",
+                dataset,
+                "--repeats",
+                "5",
+                "--manifest",
+                str(manifest_path),
+            ]
+        )
+    finally:
+        runner_module.build_client = old_build_client
+        try:
+            sys.path.remove(str(repo))
+        except ValueError:
+            pass
+    if code != 0:
+        raise AssertionError(f"verify CLI failed with exit code {code}")
+    return load_manifest(manifest_path)
+
+
+__all__ = [
+    "CliChainEvidence",
+    "CountingTransport",
+    "TuneResult",
+    "assert_delivered_files_unstaged_or_untracked",
+    "build_target_repo",
+    "run_cli_chain",
+    "run_tune_with_fake_transport",
+    "run_verify",
+]
