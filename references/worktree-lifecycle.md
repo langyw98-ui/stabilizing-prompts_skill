@@ -131,3 +131,46 @@ apply 前立即确认原工作区 `HEAD == cycle_base_commit`，并确认提交�
 - 补丁预检冲突、原工作区 `HEAD` 漂移、目标文件变化或新增路径冲突：停止，不自动合并或覆盖；
 - `git apply --check`、补丁应用、实际路径验证或哈希校验异常：恢复同步前保存的精确目标状态；
 - 用户取消：保留原工作区和生产 Prompt，不进行最终同步。
+
+## Workflow and delivery CLI contract
+
+The internal `bootstrap` work is not a separate command. It runs after
+worktree creation and before baseline construction in one `tune` cycle, using
+the same `WorktreeCycle` and immutable `cycle_base_commit`. The cycle is
+created with:
+
+```text
+manage_worktree.py create --repo PATH --prompt-id ID --state PATH
+```
+
+After the user confirms the contract/cases/adapter and the fixed local-model
+probe succeeds, the confirmed evaluation assets are committed in that
+worktree. Candidate files stay in `.runtime/`; reports and raw responses stay
+in ignored directories.
+
+At the end of the cycle, both result types require an explicit delivery
+confirmation. A successful result may include the frozen production Prompt;
+a failed result may synchronize only confirmed evaluation assets and compact
+failure history and must exclude the Prompt. Fresh delivery artifacts are
+generated with:
+
+```text
+manage_worktree.py build-patch --state PATH --out PATCH --out-manifest PATCH_JSON --result success|failure
+manage_worktree.py apply-patch --state PATH --patch PATCH --patch-manifest PATCH_JSON
+```
+
+`build-patch` derives the symbolic Prompt allowlist entry from the committed
+canonical path and derives all other paths from the result type. It must
+compare Git's actual changed paths and patch paths exactly with that allowlist;
+reports, runtime candidates, unrelated files, deletions, extra sections, and
+failure-result Prompt changes stop delivery. It regenerates from the trusted
+cycle base, committed worktree `HEAD`, and committed content at delivery time;
+persisted patch text, manifest fields, and hashes are transport artifacts, not
+adversarial trust anchors.
+
+Immediately before apply, re-check the original `HEAD == cycle_base_commit`
+and the committed contract's canonical Prompt path. Run `git apply --check`,
+snapshot exact targets, apply unstaged, and verify paths and destination
+hashes. Roll back exact snapshots on any failure. A successful apply leaves
+the original workspace files unstaged/uncommitted and never auto-deletes the
+worktree or branch.

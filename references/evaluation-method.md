@@ -82,3 +82,38 @@ stability_regression_count
 这些次数和阈值是本 Skill 的实用门禁，不代表统计显著性保证。每个 Prompt 可以在 `eval-config.yaml` 中声明更严格的重复次数或阈值。降低默认门禁必须在契约确认阶段由用户明确批准，调优循环不能自行降低。模型、地址、Token、`temperature=0.0`、关闭 thinking/reasoning/search、30 秒超时和 2 次重试不属于项目配置项。
 
 每次运行还生成不可变 manifest，至少记录周期 ID、`cycle_base_commit`、Prompt、契约、配置、案例、适配器和 Skill 执行脚本哈希、固定环境名 `kds`、实际 Python 命令和 Python 版本、固定客户端报告的模型身份、移除 Authorization Token 后的固定 `ChatOpenAI` 与结构化调用配置、明确省略的采样字段、调用槽位计划及开始、恢复和完成时间。manifest 不记录各 Python 包版本。基线与候选比较时，除 Prompt 哈希和运行时间外，其他已记录且影响结果的字段必须兼容，否则拒绝比较并要求建立新基线。
+
+## Evaluation CLI contract and phase ownership
+
+The runner, scorer, and comparator are the executable boundary for the
+workflow states:
+
+```text
+run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH
+score_results.py --manifest PATH --report PATH
+compare_runs.py --baseline PATH --candidate PATH --phase development|validation|acceptance --report PATH
+```
+
+The runner creates all fixed slots before invoking the adapter. The default
+plan is five repeats per development/validation case and ten per acceptance
+case. A transport retry may fill only its original slot; an exhausted slot is
+`incomplete` and prevents final metrics or a gate. Setup/protocol evidence is
+paused and non-scoring. The scorer consumes completed manifests and writes a
+token-free report; the comparator rejects incompatible identity, split, or
+client evidence before evaluating a gate.
+
+Phase responsibilities are deliberately isolated: development diagnoses and
+filters candidates, validation selects a strictly improving candidate, and
+acceptance is one paired final activity for the original Prompt and frozen
+candidate. `acceptance-cases.yaml` is never an input to `verify`, and
+`compare_runs.py` does not load case files. Equal-perfect acceptance is valid
+when all acceptance gates and both core metrics are at least as good as the
+original Prompt; acceptance failure ends the cycle and cannot trigger another
+candidate round.
+
+Every report includes the repository/Prompt identity, fixed redacted client
+configuration, dataset/manifest hashes, slot counts and error categories,
+schema-valid rate, run accuracy, stable-case rate, both regression counts,
+case-level diffs, candidate diff when applicable, stop reason, and delivery
+gate result. No LLM judge, credential, authorization header, or runtime token
+is part of scoring or persisted reporting.

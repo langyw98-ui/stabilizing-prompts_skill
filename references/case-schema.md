@@ -51,3 +51,35 @@ rationale: why-this-result-is-correct
 - 这是一套冻结最终评测集，不宣称对负责生成案例和候选的 Codex 构成统计意义上的盲测；
 - 调优循环不得删除、弱化或重标验证、验收案例；
 - 终验失败即结束本周期。经用户确认后，暴露的问题可进入下一周期开发集，但下一周期必须重新生成、确认和冻结验收集。
+
+## Case validation and split execution interface
+
+During the internal `bootstrap` state of `tune`, validate all three files and
+the production Schema before any model call:
+
+```text
+validate_cases.py --eval-root PATH --schema MODULE:CLASS --output CASE_SUITE_JSON
+```
+
+The input root contains `dev-cases.yaml`, `validation-cases.yaml`, and
+`acceptance-cases.yaml`. `CASE_SUITE_JSON` records the validated cases,
+complete expected-object serialization, split ownership, and the dataset hash.
+An invalid expected object, duplicate ID, cross-split normalized input or
+semantic-family collision, missing split, or schema import failure is an
+asset `setup_error`; it must be repaired and reconfirmed rather than ignored.
+
+After the contract confirmation gate, `run_prompt_eval.py` loads only the
+selected split:
+
+```text
+run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH
+```
+
+Development and validation runs therefore do not require or read the
+acceptance file. Only the single final acceptance activity owned by `tune` may
+select `--dataset acceptance`, and it does so after the candidate hash is
+frozen. An interrupted final activity may resume its existing immutable slots,
+but cannot create a second acceptance activity or feed its result back into
+the current candidate loop. `verify` may select `dev`, `validation`, or a
+separately supplied non-acceptance `external` case set only; it must reject
+`--dataset acceptance` before opening any case file.

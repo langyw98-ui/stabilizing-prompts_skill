@@ -42,3 +42,32 @@ Skill 生成 `prompt-contract.yaml`，至少包含：
 只有用户明确确认后，契约和验收预期才被冻结，Skill 才能进入基线评测。确认前不得调用测试模型。
 
 调优中如发现契约或案例错误，Skill 必须停止当前实验，说明问题，等待用户确认修订；修订后旧运行失效并重新建立基线。
+
+## Operational contract-confirmation state
+
+The contract/cases/adapter package is a pre-model artifact. The confirmation
+record must bind the canonical Prompt path and hash, Schema reference, renderer
+and message-assembly entry points, critical dependency hashes, all three case
+file hashes, adapter identity, the fixed `kds` command/Python version,
+repetition counts, phase thresholds, and stop conditions. A plain approval of
+the Prompt wording is not sufficient.
+
+The `tune` state uses:
+
+```text
+validate_workspace.py --repo PATH --prompt REPO_RELATIVE_MD --mode tune --output WORKSPACE_JSON
+validate_cases.py --eval-root PATH --schema MODULE:CLASS --output CASE_SUITE_JSON
+```
+
+`WORKSPACE_JSON` is a read-only repository snapshot. `CASE_SUITE_JSON` is the
+validated, split-aware case summary and dataset hash. The proposed contract,
+complete expected objects, coverage matrix, and adapter boundary are shown to
+the user together with those outputs. Only an explicit confirmation freezes
+them and permits the fixed local-model probe. If evidence conflicts, a path or
+dependency changes, or a user declines, stop without constructing the client
+or generating a candidate; after any revision, invalidate old manifests and
+rebuild the baseline.
+
+The confirmation gate does not authorize production delivery. Acceptance
+success and failure-asset-only synchronization each require a separate,
+explicit delivery confirmation later in the same cycle.

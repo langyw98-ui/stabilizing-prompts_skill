@@ -1,0 +1,124 @@
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).parents[1]
+SKILL = ROOT / "SKILL.md"
+
+
+@pytest.fixture
+def skill_text() -> str:
+    return SKILL.read_text(encoding="utf-8")
+
+
+def _section(skill_text: str, heading: str, next_heading: str) -> str:
+    return skill_text.split(heading, 1)[1].split(next_heading, 1)[0]
+
+
+def test_verify_forbids_acceptance_dataset(skill_text):
+    verify = skill_text.split("## verify", 1)[1]
+    assert "must not read or run `acceptance-cases.yaml`" in verify
+
+
+def test_tune_contains_both_user_gates_and_stop_conditions(skill_text):
+    assert "contract confirmation gate" in skill_text
+    assert "delivery confirmation gate" in skill_text
+    for reason in (
+        "two consecutive rounds",
+        "five candidate rounds",
+        "contract conflict",
+        "acceptance failure",
+    ):
+        assert reason in skill_text
+
+
+def test_tune_states_are_explicit_and_ordered(skill_text):
+    tune = _section(skill_text, "## tune", "## verify")
+    states = (
+        "preflight",
+        "worktree",
+        "contract/cases/adapter",
+        "user confirmation",
+        "model probe/smoke",
+        "asset commit",
+        "dev/validation baseline",
+        "no-change exit or candidate loop",
+        "candidate freeze",
+        "single acceptance activity",
+        "failure exit or delivery confirmation",
+        "worktree commit",
+        "allowlisted synchronization",
+    )
+    state_line = next(
+        line for line in tune.splitlines() if line.startswith("`preflight")
+    )
+    positions = [state_line.index(state) for state in states]
+    assert positions == sorted(positions)
+
+
+def test_all_supporting_cli_contracts_are_documented(skill_text):
+    contracts = (
+        "validate_workspace.py --repo PATH --prompt REPO_RELATIVE_MD --mode tune|verify --output WORKSPACE_JSON",
+        "validate_cases.py --eval-root PATH --schema MODULE:CLASS --output CASE_SUITE_JSON",
+        "run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH",
+        "score_results.py --manifest PATH --report PATH",
+        "compare_runs.py --baseline PATH --candidate PATH --phase development|validation|acceptance --report PATH",
+        "manage_worktree.py create --repo PATH --prompt-id ID --state PATH",
+        "manage_worktree.py build-patch --state PATH --out PATCH --out-manifest PATCH_JSON --result success|failure",
+        "manage_worktree.py apply-patch --state PATH --patch PATCH --patch-manifest PATCH_JSON",
+    )
+    for contract in contracts:
+        assert contract in skill_text
+
+
+def test_tune_documents_confirmation_before_any_model_call(skill_text):
+    tune = _section(skill_text, "## tune", "## verify")
+    confirmation = tune.index("contract confirmation gate")
+    model_call = tune.index("model probe/smoke")
+    assert confirmation < model_call
+    assert "contract, cases, adapter" in tune
+    assert "delivery confirmation gate" in tune
+
+
+def test_tune_documents_cycle_worktree_continuity_and_acceptance_ownership(skill_text):
+    tune = _section(skill_text, "## tune", "## verify")
+    assert "same cycle" in tune
+    assert "same worktree" in tune
+    assert "bootstrap" in tune
+    assert "acceptance-cases.yaml" in tune
+    assert "once per cycle" in tune
+    assert "only `tune`" in tune
+
+
+def test_tune_documents_isolated_phases_and_no_change_exit(skill_text):
+    tune = _section(skill_text, "## tune", "## verify")
+    assert "development" in tune
+    assert "validation" in tune
+    assert "acceptance" in tune
+    assert "never run acceptance" in tune or "do not run acceptance" in tune
+    assert "no_change_needed" in tune
+    assert "does not generate a candidate" in tune
+
+
+def test_tune_documents_success_and_failure_delivery_gates(skill_text):
+    tune = _section(skill_text, "## tune", "## verify")
+    assert "success" in tune and "failure" in tune
+    assert "acceptance passes" in tune
+    assert "acceptance fails" in tune
+    assert "failure-asset-only" in tune
+    assert "explicitly confirm" in tune
+    assert "does not deliver the candidate" in tune
+
+
+def test_verify_is_read_only_and_rejects_acceptance_before_loading(skill_text):
+    verify = skill_text.split("## verify", 1)[1]
+    guard = verify.split("### verify state machine", 1)[0]
+    reject = guard.index("Reject")
+    load = guard.index("loading")
+    client = guard.index("client")
+    assert reject < load < client
+    assert "read-only" in verify
+    assert "current workspace" in verify
+    assert "does not modify" in verify
+    assert "--dataset acceptance" in verify

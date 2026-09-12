@@ -29,3 +29,31 @@ def prepare_call(prompt_path, case) -> dict:
 通用 runner 负责调用槽位、固定 `ChatOpenAI` 调用、原始 `AIMessage` 保存、错误分类和完整 Pydantic 对象比较。适配器 smoke test 必须证明原 Prompt 能通过该边界完成一次真实渲染、function calling 和生产 Schema 实例化。
 
 如果工程调用链无法注入候选 Prompt 或固定客户端，Skill 可以在评测目录生成最薄的兼容层，但必须继续直接导入生产渲染器和 Schema。无法等价复现时应停止并说明差异，不能给出通过结论。
+
+## Adapter state and CLI boundary
+
+The adapter is created or checked during `contract/cases/adapter` in the same
+cycle/worktree as `bootstrap` and `tune`. It consumes the frozen contract,
+canonical Prompt path, production renderer/call assembly, Schema reference,
+and a selected `EvalCase`; it produces `{messages, schema}` and a redacted
+smoke result. It must not read candidates as production assets, parse a model
+response, or choose a model.
+
+The first real call occurs only after the contract confirmation gate. The
+post-confirmation smoke path uses `build_client()`/`probe_model()` from
+`scripts/local_model_client.py` and the runner's production adapter boundary.
+It uses one development case; it never loads acceptance cases. Missing
+credentials, a fixed-model identity mismatch, renderer failure, or a
+structured-response protocol failure stops the cycle and is not converted into
+a Prompt score.
+
+For ordinary evaluation the adapter is consumed through:
+
+```text
+run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH
+```
+
+The selected `PATH` may be a runtime candidate, but the renderer, message
+assembly, Schema, fixed request configuration, and call-slot identity must be
+identical to the baseline. Candidates remain under `.runtime/` until an
+acceptance-passing candidate receives the separate delivery confirmation.
