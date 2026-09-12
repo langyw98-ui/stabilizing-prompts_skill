@@ -1,0 +1,1067 @@
+"""Create isolated prompt-tuning cycles and safely deliver allowlisted assets.
+
+The module keeps the production workspace separate from a tuning worktree.  A
+delivery is always a patch from the immutable cycle base commit to a committed
+worktree result.  Before applying it, the original workspace is checked for
+target collisions and exact source hashes; after applying it, destination
+hashes are checked and the exact target snapshots are restored on failure.
+
+No function in this module removes a worktree or branch.  Users can inspect a
+failed cycle and clean it up explicitly when they are ready.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import posixpath
+import re
+import stat
+import subprocess
+import uuid
+from typing import Any
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - kds includes PyYAML
+    yaml = None  # type: ignore[assignment]
+
+
+SUCCESS_ALLOWLIST = {
+    # ``prompt`` is a symbolic entry.  It is resolved to the one canonical
+    # production Prompt path recorded by prompt-contract.yaml for this cycle.
+    "prompt",
+    "prompt-contract.yaml",
+    "eval-config.yaml",
+    "dev-cases.yaml",
+    "validation-cases.yaml",
+    "acceptance-cases.yaml",
+    "adapter.py",
+    "optimization-history.yaml",
+    ".gitignore",
+}
+FAILURE_ALLOWLIST = SUCCESS_ALLOWLIST - {"prompt"}
+
+_ASSET_NAMES = frozenset(
+    {
+        "prompt-contract.yaml",
+        "eval-config.yaml",
+        "dev-cases.yaml",
+        "validation-cases.yaml",
+        "acceptance-cases.yaml",
+        "adapter.py",
+        "optimization-history.yaml",
+    }
+)
+_FORBIDDEN_SEGMENTS = frozenset({".runtime", "reports"})
+
+
+class WorktreeError(RuntimeError):
+    """Raised when a cycle cannot be created or loaded safely."""
+
+
+class DeliveryError(ValueError):
+    """Raised when a delivery patch is invalid or cannot be applied safely."""
+
+
+class DeliveryConflict(DeliveryError):
+    """Raised when the original workspace no longer matches patch sources."""
+
+
+class AllowlistError(DeliveryError):
+    """Raised for an invalid delivery allowlist or patch path."""
+
+
+# Descriptive compatibility aliases for callers that use shorter names.
+PatchError = DeliveryError
+WorktreeDeliveryError = DeliveryError
+
+
+def _git(
+    repo: Path,
+    *arguments: str,
+    input_data: bytes | str | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run Git without invoking a shell and return captured bytes."""
+
+    if isinstance(input_data, str):
+        input_data = input_data.encode("utf-8")
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=repo,
+            input=input_data,
+            check=False,
+            capture_output=True,
+        )
+    except OSError as error:
+        raise WorktreeError(f"unable to run git: {error}") from error
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+        command = "git " + " ".join(arguments)
+        raise WorktreeError(f"{command} failed{': ' + detail if detail else ''}")
+    return result
+
+
+def _git_text(repo: Path, *arguments: str) -> str:
+    result = _git(repo, *arguments)
+    return result.stdout.decode("utf-8", "replace").strip()
+
+
+def _repo_root(repo: Path) -> Path:
+    requested = Path(repo).resolve(strict=False)
+    if not requested.is_dir():
+        raise WorktreeError(f"repository does not exist: {repo}")
+    actual_text = _git_text(requested, "rev-parse", "--show-toplevel")
+    actual = Path(actual_text).resolve(strict=False)
+    if actual != requested:
+        raise WorktreeError(
+            f"repository must be the Git root: {requested} (actual {actual})"
+        )
+    return actual
+
+
+def _normalize_relative(value: str, *, label: str = "path") -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise AllowlistError(f"{label} must be a concrete repository-relative path")
+    candidate = value.replace("\\", "/")
+    if candidate.startswith("/") or re.match(r"^[A-Za-z]:/", candidate):
+        raise AllowlistError(f"{label} must be repository-relative: {value}")
+    normalized = posixpath.normpath(candidate)
+    if normalized in {"", ".", ".."} or normalized.startswith("../"):
+        raise AllowlistError(f"{label} escapes the repository: {value}")
+    if any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise AllowlistError(f"{label} is not a concrete path: {value}")
+    if any(character in normalized for character in "*?["):
+        raise AllowlistError(f"{label} must not contain a wildcard: {value}")
+    return PurePosixPath(normalized).as_posix()
+
+
+def _relative_path(repo: Path, value: Path | str, *, label: str = "path") -> str:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        resolved = candidate.resolve(strict=False)
+        try:
+            relative = resolved.relative_to(repo)
+        except ValueError as error:
+            raise AllowlistError(f"{label} is outside repository: {value}") from error
+        return _normalize_relative(relative.as_posix(), label=label)
+    return _normalize_relative(str(value), label=label)
+
+
+def _under_eval_root(path: str, prompt_id: str) -> bool:
+    prefix = f".prompt-evals/{prompt_id}/"
+    return path.startswith(prefix) and path != prefix
+
+
+def _reject_unsafe_delivery_path(path: str, *, label: str = "path") -> str:
+    normalized = _normalize_relative(path, label=label)
+    segments = set(normalized.split("/"))
+    if segments & _FORBIDDEN_SEGMENTS:
+        raise AllowlistError(f"{label} cannot deliver runtime or report files: {path}")
+    if normalized == ".git" or normalized.startswith(".git/"):
+        raise AllowlistError(f"{label} cannot deliver Git metadata: {path}")
+    return normalized
+
+
+def _contract_values(data: Mapping[str, object]) -> list[object]:
+    values: list[object] = []
+    for key in ("prompt_path", "target_prompt", "path"):
+        if key in data:
+            values.append(data[key])
+    nested = data.get("prompt")
+    if isinstance(nested, Mapping):
+        for key in ("path", "prompt_path", "target_prompt"):
+            if key in nested:
+                values.append(nested[key])
+    return values
+
+
+def _parse_contract_prompt_path(root: Path, contract: Path) -> str | None:
+    if yaml is None:
+        raise DeliveryError("cannot resolve prompt allowlist without PyYAML")
+    try:
+        data = yaml.safe_load(contract.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise DeliveryError(f"invalid prompt-contract.yaml: {error}") from error
+    if not isinstance(data, Mapping):
+        raise DeliveryError("prompt-contract.yaml must contain a mapping")
+    paths: list[str] = []
+    for raw in _contract_values(data):
+        if not isinstance(raw, str) or not raw.strip():
+            raise DeliveryError("prompt-contract.yaml contains an invalid prompt path")
+        try:
+            paths.append(_relative_path(root, raw, label="recorded prompt path"))
+        except AllowlistError as error:
+            raise DeliveryError(
+                "prompt-contract.yaml records a prompt path outside repository"
+            ) from error
+    if not paths:
+        return None
+    if len(set(paths)) != 1:
+        raise DeliveryError("prompt-contract.yaml contains conflicting prompt paths")
+    return paths[0]
+
+
+def _discover_prompt_path(cycle: "WorktreeCycle") -> str | None:
+    if cycle.prompt_path is not None:
+        return _relative_path(cycle.original_repo, cycle.prompt_path, label="prompt path")
+    contract = (
+        cycle.original_repo
+        / ".prompt-evals"
+        / (cycle.prompt_id or "")
+        / "prompt-contract.yaml"
+    )
+    if contract.is_file():
+        return _parse_contract_prompt_path(cycle.original_repo, contract)
+    # The normal contract is committed at the cycle base.  Reading it from
+    # the original worktree is not sufficient when it was created by an
+    # earlier stage in the cycle, so inspect the immutable base commit too.
+    if cycle.prompt_id:
+        relative = f".prompt-evals/{cycle.prompt_id}/prompt-contract.yaml"
+        result = _git(
+            cycle.original_repo,
+            "show",
+            f"{cycle.cycle_base_commit}:{relative}",
+            check=False,
+        )
+        if result.returncode == 0:
+            temporary = cycle.original_repo / ".git" / "__stabilizing_prompt_contract.tmp"
+            # Avoid writing into the repository while resolving a symbolic
+            # path.  Parse the Git blob directly instead.
+            if yaml is None:
+                raise DeliveryError("cannot resolve prompt allowlist without PyYAML")
+            try:
+                data = yaml.safe_load(result.stdout.decode("utf-8"))
+            except Exception as error:
+                raise DeliveryError(f"invalid prompt-contract.yaml: {error}") from error
+            if isinstance(data, Mapping):
+                values = _contract_values(data)
+                paths: list[str] = []
+                for raw in values:
+                    if not isinstance(raw, str) or not raw.strip():
+                        raise DeliveryError(
+                            "prompt-contract.yaml contains an invalid prompt path"
+                        )
+                    paths.append(_relative_path(cycle.original_repo, raw, label="recorded prompt path"))
+                if len(set(paths)) > 1:
+                    raise DeliveryError("prompt-contract.yaml contains conflicting prompt paths")
+                return paths[0] if paths else None
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class WorktreeCycle:
+    """Identity of one isolated tuning cycle."""
+
+    original_repo: Path
+    worktree: Path
+    branch: str
+    cycle_base_commit: str
+    prompt_id: str | None = None
+    prompt_path: str | None = None
+    final_worktree_commit: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "original_repo", Path(self.original_repo).resolve(strict=False))
+        object.__setattr__(self, "worktree", Path(self.worktree).resolve(strict=False))
+
+    @property
+    def repo(self) -> Path:
+        """Compatibility alias for the original repository."""
+
+        return self.original_repo
+
+    @property
+    def final_commit(self) -> str | None:
+        return self.final_worktree_commit
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "original_repo": str(self.original_repo),
+            "worktree": str(self.worktree),
+            "branch": self.branch,
+            "cycle_base_commit": self.cycle_base_commit,
+            "prompt_id": self.prompt_id,
+            "prompt_path": self.prompt_path,
+            "final_worktree_commit": self.final_worktree_commit,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "WorktreeCycle":
+        required = ("original_repo", "worktree", "branch", "cycle_base_commit")
+        if any(not isinstance(value.get(key), str) or not value[key] for key in required):
+            raise WorktreeError("cycle state is missing required identity")
+        return cls(
+            original_repo=Path(str(value["original_repo"])),
+            worktree=Path(str(value["worktree"])),
+            branch=str(value["branch"]),
+            cycle_base_commit=str(value["cycle_base_commit"]),
+            prompt_id=value.get("prompt_id") if isinstance(value.get("prompt_id"), str) else None,
+            prompt_path=value.get("prompt_path") if isinstance(value.get("prompt_path"), str) else None,
+            final_worktree_commit=(
+                value.get("final_worktree_commit")
+                if isinstance(value.get("final_worktree_commit"), str)
+                else None
+            ),
+        )
+
+
+def _safe_slug(value: str) -> str:
+    result = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
+    return result or "prompt"
+
+
+def create_cycle(
+    original_repo: Path,
+    prompt_id: str,
+    *,
+    worktree: Path | None = None,
+    branch: str | None = None,
+    prompt_path: Path | str | None = None,
+) -> WorktreeCycle:
+    """Create a dedicated branch/worktree rooted at the original ``HEAD``."""
+
+    if not isinstance(prompt_id, str) or not prompt_id.strip():
+        raise WorktreeError("prompt_id must be a non-empty string")
+    root = _repo_root(Path(original_repo))
+    base = _git_text(root, "rev-parse", "--verify", "HEAD")
+    resolved_prompt: str | None
+    if prompt_path is not None:
+        resolved_prompt = _relative_path(root, prompt_path, label="prompt path")
+    else:
+        provisional = WorktreeCycle(root, root, "", base, prompt_id=prompt_id)
+        resolved_prompt = _discover_prompt_path(provisional)
+
+    identity = uuid.uuid4().hex[:12]
+    slug = _safe_slug(prompt_id)
+    selected_branch = branch or f"stabilizing-prompts/{slug}-{identity}"
+    if not selected_branch.strip() or selected_branch.endswith("/"):
+        raise WorktreeError("branch must be a concrete Git branch name")
+    selected_worktree = (
+        Path(worktree).resolve(strict=False)
+        if worktree is not None
+        else root.parent / f".{root.name}-stabilizing-prompts-{slug}-{identity}"
+    )
+    if selected_worktree == root or selected_worktree.exists():
+        raise WorktreeError(f"worktree path already exists: {selected_worktree}")
+    selected_worktree.parent.mkdir(parents=True, exist_ok=True)
+    _git(root, "worktree", "add", "-b", selected_branch, str(selected_worktree), base)
+    return WorktreeCycle(
+        original_repo=root,
+        worktree=selected_worktree,
+        branch=selected_branch,
+        cycle_base_commit=base,
+        prompt_id=prompt_id,
+        prompt_path=resolved_prompt,
+    )
+
+
+def _changed_paths(cycle: WorktreeCycle, final_commit: str) -> tuple[str, ...]:
+    result = _git(
+        cycle.worktree,
+        "diff",
+        "--name-status",
+        "--no-renames",
+        "-z",
+        cycle.cycle_base_commit,
+        final_commit,
+        "--",
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise DeliveryError(f"unable to enumerate cycle changes: {detail}")
+    fields = result.stdout.split(b"\x00")
+    paths: list[str] = []
+    index = 0
+    while index < len(fields) and fields[index]:
+        status = fields[index].decode("ascii", "replace")
+        index += 1
+        if index >= len(fields):
+            raise DeliveryError("Git returned a malformed changed-path list")
+        raw_path = os.fsdecode(fields[index])
+        index += 1
+        if len(status) != 1:
+            raise DeliveryError(f"unsupported Git change status: {status}")
+        # Runtime/report paths are intentionally enumerated here so the
+        # allowlist can reject them from the generated patch.  Rejecting them
+        # while parsing would prevent a safe filtered patch from being built.
+        paths.append(_normalize_relative(raw_path, label="changed path"))
+    return tuple(dict.fromkeys(paths))
+
+
+def _allowlist_paths(
+    cycle: WorktreeCycle,
+    allowlist: Sequence[str] | set[str] | frozenset[str] | Mapping[str, object],
+    *,
+    result: str,
+    changed_paths: Sequence[str] | None = None,
+) -> frozenset[str]:
+    if isinstance(allowlist, Mapping):
+        entries = list(allowlist.keys())
+    else:
+        entries = list(allowlist)
+    if result not in {"success", "failure"}:
+        raise DeliveryError("delivery result must be success or failure")
+    if result == "failure":
+        entries = [entry for entry in entries if entry != "prompt"]
+    resolved_prompt: str | None = None
+    if "prompt" in entries:
+        resolved_prompt = _discover_prompt_path(cycle)
+        if resolved_prompt is None and changed_paths is not None:
+            candidates = [
+                path
+                for path in changed_paths
+                if path.casefold().endswith(".md")
+                and not path.startswith(".prompt-evals/")
+            ]
+            if len(candidates) == 1:
+                resolved_prompt = candidates[0]
+        if resolved_prompt is None:
+            raise AllowlistError(
+                "symbolic prompt allowlist entry cannot resolve a canonical Prompt path"
+            )
+        resolved_prompt = _reject_unsafe_delivery_path(resolved_prompt, label="prompt path")
+    eval_prefix = f".prompt-evals/{cycle.prompt_id}/" if cycle.prompt_id else None
+    resolved: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise AllowlistError("delivery allowlist entries must be strings")
+        if entry == "prompt":
+            if resolved_prompt is not None:
+                resolved.add(resolved_prompt)
+            continue
+        if entry == ".gitignore":
+            resolved.add(".gitignore")
+            continue
+        if entry in _ASSET_NAMES:
+            if eval_prefix is None:
+                raise AllowlistError("prompt_id is required for evaluation assets")
+            resolved.add(f"{eval_prefix}{entry}")
+            continue
+        canonical = _reject_unsafe_delivery_path(entry, label="allowlist path")
+        if canonical == resolved_prompt:
+            if result == "failure":
+                continue
+            resolved.add(canonical)
+            continue
+        if eval_prefix is not None and canonical.startswith(eval_prefix):
+            resolved.add(canonical)
+            continue
+        # A custom path may name a repository file explicitly, but only an
+        # exact canonical path is accepted; no glob or directory allowlists.
+        if canonical.endswith("/"):
+            raise AllowlistError("delivery allowlist cannot name a directory")
+        resolved.add(canonical)
+    if result == "failure" and resolved_prompt is not None:
+        resolved.discard(resolved_prompt)
+    return frozenset(resolved)
+
+
+def _commit_blob(cycle: WorktreeCycle, commit: str, path: str) -> bytes | None:
+    type_result = _git(cycle.worktree, "cat-file", "-t", f"{commit}:{path}", check=False)
+    if type_result.returncode != 0:
+        return None
+    object_type = type_result.stdout.decode("ascii", "replace").strip()
+    if object_type != "blob":
+        raise DeliveryError(f"delivery path is not a regular file: {path}")
+    result = _git(cycle.worktree, "show", f"{commit}:{path}", check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _hash_bytes(data: bytes | None) -> str | None:
+    return hashlib.sha256(data).hexdigest() if data is not None else None
+
+
+def _working_tree_matches_commit(cycle: WorktreeCycle, path: str) -> bool:
+    """Compare a target with the cycle base through Git's clean filters."""
+
+    for arguments in (
+        ("diff", "--quiet", cycle.cycle_base_commit, "--", path),
+        ("diff", "--cached", "--quiet", cycle.cycle_base_commit, "--", path),
+    ):
+        result = _git(cycle.original_repo, *arguments, check=False)
+        if result.returncode == 1:
+            return False
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            raise DeliveryError(f"unable to compare cycle source {path}: {detail}")
+    return True
+
+
+def _build_source_hash(cycle: WorktreeCycle, path: str) -> str | None:
+    """Hash the exact original-workspace bytes after proving base identity."""
+
+    base_blob = _commit_blob(cycle, cycle.cycle_base_commit, path)
+    current = _current_file_bytes(cycle.original_repo, path)
+    if base_blob is None:
+        if current is not None:
+            raise DeliveryConflict(
+                f"source hash conflict for {path}: expected None, got {_hash_bytes(current)}"
+            )
+        return None
+    if not _working_tree_matches_commit(cycle, path):
+        raise DeliveryConflict(f"source hash conflict for {path}: original target is dirty")
+    if current is None:
+        raise DeliveryConflict(f"source hash conflict for {path}: original target is missing")
+    return _hash_bytes(current)
+
+
+def _build_destination_hash(cycle: WorktreeCycle, final: str, path: str) -> str | None:
+    """Hash the checked-out final worktree representation used by Git apply."""
+
+    # A final result must be committed and clean.  The file bytes are read from
+    # the worktree rather than the Git blob so Windows clean/smudge line-ending
+    # conversion is represented exactly as it will be after application.
+    result = _git(cycle.worktree, "diff", "--quiet", final, "--", path, check=False)
+    if result.returncode == 1:
+        raise DeliveryError(f"final worktree target is dirty: {path}")
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise DeliveryError(f"unable to inspect final worktree target: {detail}")
+    return _hash_bytes(_current_file_bytes(cycle.worktree, path))
+
+
+def _final_commit(cycle: WorktreeCycle, value: str | None) -> str:
+    selected = value or cycle.final_worktree_commit
+    if selected is None:
+        selected = _git_text(cycle.worktree, "rev-parse", "--verify", "HEAD")
+    result = _git(cycle.worktree, "rev-parse", "--verify", f"{selected}^{{commit}}", check=False)
+    if result.returncode != 0:
+        raise DeliveryError("final worktree commit is not a valid Git commit")
+    return result.stdout.decode("utf-8", "replace").strip()
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryPatch:
+    """A filtered, hash-bound patch ready for preflight/application."""
+
+    text: str
+    paths: tuple[str, ...]
+    source_hashes: Mapping[str, str | None]
+    destination_hashes: Mapping[str, str | None]
+    cycle_base_commit: str
+    final_worktree_commit: str
+    result: str = "success"
+    prompt_path: str | None = None
+    allowlist_paths: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "paths", tuple(self.paths))
+        object.__setattr__(self, "source_hashes", dict(self.source_hashes))
+        object.__setattr__(self, "destination_hashes", dict(self.destination_hashes))
+
+    @property
+    def patch(self) -> str:
+        return self.text
+
+    @property
+    def diff(self) -> str:
+        return self.text
+
+    @property
+    def content(self) -> str:
+        return self.text
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "paths": list(self.paths),
+            "source_hashes": dict(self.source_hashes),
+            "destination_hashes": dict(self.destination_hashes),
+            "cycle_base_commit": self.cycle_base_commit,
+            "final_worktree_commit": self.final_worktree_commit,
+            "result": self.result,
+            "prompt_path": self.prompt_path,
+            "allowlist_paths": list(self.allowlist_paths),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object], *, text: str) -> "DeliveryPatch":
+        raw_paths = value.get("paths", ())
+        if not isinstance(raw_paths, Sequence) or isinstance(raw_paths, (str, bytes)):
+            raise DeliveryError("patch manifest paths must be a list")
+        source = value.get("source_hashes", {})
+        destination = value.get("destination_hashes", {})
+        if not isinstance(source, Mapping) or not isinstance(destination, Mapping):
+            raise DeliveryError("patch manifest hashes must be mappings")
+        allowlist_paths = value.get("allowlist_paths", ())
+        if not isinstance(allowlist_paths, Sequence) or isinstance(allowlist_paths, (str, bytes)):
+            raise DeliveryError("patch manifest allowlist_paths must be a list")
+        return cls(
+            text=text,
+            paths=tuple(str(path) for path in raw_paths),
+            source_hashes={str(key): value for key, value in source.items()},
+            destination_hashes={str(key): value for key, value in destination.items()},
+            cycle_base_commit=str(value.get("cycle_base_commit", "")),
+            final_worktree_commit=str(value.get("final_worktree_commit", "")),
+            result=str(value.get("result", "success")),
+            prompt_path=value.get("prompt_path") if isinstance(value.get("prompt_path"), str) else None,
+            allowlist_paths=tuple(str(path) for path in allowlist_paths),
+        )
+
+
+Patch = DeliveryPatch
+
+
+def build_delivery_patch(
+    cycle: WorktreeCycle,
+    allowlist: Sequence[str] | set[str] | frozenset[str] | Mapping[str, object] | None = None,
+    *,
+    final_commit: str | None = None,
+    result: str = "success",
+) -> DeliveryPatch:
+    """Build a patch containing only paths rejected into the allowlist boundary."""
+
+    if not isinstance(cycle, WorktreeCycle):
+        raise TypeError("build_delivery_patch expects a WorktreeCycle")
+    final = _final_commit(cycle, final_commit)
+    changed = _changed_paths(cycle, final)
+    selected_allowlist = (
+        SUCCESS_ALLOWLIST if result == "success" and allowlist is None else
+        FAILURE_ALLOWLIST if result == "failure" and allowlist is None else allowlist
+    )
+    if selected_allowlist is None:
+        raise DeliveryError("delivery allowlist is required")
+    allowed = _allowlist_paths(
+        cycle,
+        selected_allowlist,
+        result=result,
+        changed_paths=changed,
+    )
+    selected = tuple(path for path in changed if path in allowed)
+    source_hashes = {path: _build_source_hash(cycle, path) for path in selected}
+    destination_hashes = {
+        path: _build_destination_hash(cycle, final, path)
+        for path in selected
+    }
+    patch_text = ""
+    if selected:
+        result_patch = _git(
+            cycle.worktree,
+            "diff",
+            "--binary",
+            "--full-index",
+            cycle.cycle_base_commit,
+            final,
+            "--",
+            *selected,
+        )
+        if result_patch.returncode != 0:
+            detail = result_patch.stderr.decode("utf-8", "replace").strip()
+            raise DeliveryError(f"unable to build delivery patch: {detail}")
+        patch_text = result_patch.stdout.decode("utf-8", "surrogateescape")
+    return DeliveryPatch(
+        text=patch_text,
+        paths=selected,
+        source_hashes=source_hashes,
+        destination_hashes=destination_hashes,
+        cycle_base_commit=cycle.cycle_base_commit,
+        final_worktree_commit=final,
+        result=result,
+        prompt_path=_discover_prompt_path(cycle),
+        allowlist_paths=tuple(sorted(allowed)),
+    )
+
+
+def _patch_header_paths(text: str) -> tuple[str, ...]:
+    """Extract paths from Git's ordinary ``diff --git a/ b/`` headers."""
+
+    paths: list[str] = []
+    for line in text.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        fields = line[len("diff --git ") :].split(" ")
+        if len(fields) != 2 or not fields[0].startswith("a/") or not fields[1].startswith("b/"):
+            raise DeliveryError("delivery patch contains an unsupported Git path header")
+        left = _reject_unsafe_delivery_path(fields[0][2:], label="patch path")
+        right = _reject_unsafe_delivery_path(fields[1][2:], label="patch path")
+        paths.extend((left, right))
+    return tuple(dict.fromkeys(paths))
+
+
+def _current_file_bytes(root: Path, relative: str) -> bytes | None:
+    current = root / Path(relative)
+    cursor = root
+    for part in Path(relative).parts:
+        if cursor.is_symlink():
+            raise DeliveryConflict(f"delivery target traverses a symbolic link: {relative}")
+        cursor = cursor / part
+    if current.is_symlink():
+        raise DeliveryConflict(f"delivery target is a symbolic link: {relative}")
+    if not current.exists():
+        return None
+    if not current.is_file():
+        raise DeliveryConflict(f"delivery target is not a regular file: {relative}")
+    try:
+        return current.read_bytes()
+    except OSError as error:
+        raise DeliveryConflict(f"unable to read delivery target: {relative}") from error
+
+
+def _current_hash(root: Path, relative: str) -> str | None:
+    return _hash_bytes(_current_file_bytes(root, relative))
+
+
+def _index_changed(root: Path, relative: str) -> bool:
+    result = _git(root, "diff", "--cached", "--quiet", "--", relative, check=False)
+    if result.returncode == 1:
+        return True
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise DeliveryError(f"unable to inspect staged delivery target: {detail}")
+    return False
+
+
+def _validate_patch(cycle: WorktreeCycle, patch: DeliveryPatch) -> None:
+    if patch.cycle_base_commit != cycle.cycle_base_commit:
+        raise DeliveryConflict("patch cycle_base_commit does not match cycle")
+    if not patch.final_worktree_commit:
+        raise DeliveryError("patch final worktree commit is missing")
+    paths = tuple(_reject_unsafe_delivery_path(path, label="patch path") for path in patch.paths)
+    if paths != patch.paths:
+        raise DeliveryError("patch paths are not canonical")
+    if set(patch.source_hashes) != set(paths) or set(patch.destination_hashes) != set(paths):
+        raise DeliveryError("patch hash manifest does not cover exactly its paths")
+    if patch.allowlist_paths:
+        allowlist_paths = {
+            _reject_unsafe_delivery_path(path, label="allowlist path")
+            for path in patch.allowlist_paths
+        }
+    else:
+        defaults = FAILURE_ALLOWLIST if patch.result == "failure" else SUCCESS_ALLOWLIST
+        allowlist_paths = set(
+            _allowlist_paths(cycle, defaults, result=patch.result, changed_paths=paths)
+        )
+    if not set(paths).issubset(allowlist_paths):
+        outside = sorted(set(paths) - allowlist_paths)
+        raise AllowlistError(
+            "patch contains paths outside the delivery allowlist: "
+            + ", ".join(outside)
+        )
+    header_paths = _patch_header_paths(patch.text)
+    if set(header_paths) != set(paths):
+        if patch.text or paths:
+            raise DeliveryError("patch manifest paths do not match patch content")
+
+
+def _check_sources(cycle: WorktreeCycle, patch: DeliveryPatch, expected: Mapping[str, object] | None) -> None:
+    expected_hashes: dict[str, object] = dict(expected or patch.source_hashes)
+    normalized_expected: dict[str, object] = {}
+    for raw_path, digest in expected_hashes.items():
+        path = _relative_path(cycle.original_repo, raw_path, label="source hash path")
+        if path == "prompt":
+            prompt = _discover_prompt_path(cycle)
+            if prompt is None:
+                raise DeliveryConflict("source hash prompt path cannot be resolved")
+            path = prompt
+        normalized_expected[path] = digest
+    for path in patch.paths:
+        if path not in normalized_expected:
+            raise DeliveryConflict(f"source hash is missing for {path}")
+        expected_digest = normalized_expected[path]
+        if expected_digest is not None and not isinstance(expected_digest, str):
+            raise DeliveryConflict(f"source hash is invalid for {path}")
+        actual = _current_hash(cycle.original_repo, path)
+        if actual != expected_digest:
+            raise DeliveryConflict(
+                f"source hash conflict for {path}: expected {expected_digest}, got {actual}"
+            )
+        if _index_changed(cycle.original_repo, path):
+            raise DeliveryConflict(f"target has staged changes: {path}")
+
+
+def preflight_patch(
+    cycle: WorktreeCycle,
+    patch: DeliveryPatch | Path | str | None = None,
+    *,
+    expected_source_hashes: Mapping[str, object] | None = None,
+) -> DeliveryPatch:
+    """Validate allowlisted paths, source hashes, and ``git apply --check``."""
+
+    if patch is None:
+        patch = build_delivery_patch(cycle)
+    if isinstance(patch, (str, Path)):
+        raise DeliveryError("a patch file requires its patch manifest metadata")
+    if not isinstance(patch, DeliveryPatch):
+        raise TypeError("preflight_patch expects a DeliveryPatch")
+    _validate_patch(cycle, patch)
+    # Source checks intentionally happen immediately before Git's check.  The
+    # application path repeats them after this function and before apply.
+    _check_sources(cycle, patch, expected_source_hashes)
+    if patch.text:
+        result = _git(
+            cycle.original_repo,
+            "apply",
+            "--check",
+            "--whitespace=nowarn",
+            "--no-3way",
+            "-",
+            input_data=patch.text,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            raise DeliveryConflict(f"delivery patch conflict: {detail or 'git apply --check failed'}")
+    return patch
+
+
+@dataclass(frozen=True, slots=True)
+class _Snapshot:
+    path: str
+    existed: bool
+    data: bytes | None
+    mode: int | None
+    parent_dirs: tuple[Path, ...] = field(default=())
+
+
+def _snapshot_targets(root: Path, paths: Sequence[str]) -> tuple[_Snapshot, ...]:
+    snapshots: list[_Snapshot] = []
+    for relative in paths:
+        target = root / Path(relative)
+        parent_dirs: list[Path] = []
+        parent = target.parent
+        while parent != root and not parent.exists():
+            parent_dirs.append(parent)
+            parent = parent.parent
+        data = _current_file_bytes(root, relative)
+        mode = None
+        if data is not None:
+            try:
+                mode = stat.S_IMODE(target.stat().st_mode)
+            except OSError as error:
+                raise DeliveryError(f"unable to snapshot delivery target: {relative}") from error
+        snapshots.append(
+            _Snapshot(
+                path=relative,
+                existed=data is not None,
+                data=data,
+                mode=mode,
+                parent_dirs=tuple(parent_dirs),
+            )
+        )
+    return tuple(snapshots)
+
+
+def _restore_snapshots(root: Path, snapshots: Sequence[_Snapshot]) -> None:
+    errors: list[str] = []
+    for snapshot in snapshots:
+        target = root / Path(snapshot.path)
+        try:
+            if snapshot.existed:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists() or target.is_symlink():
+                    if target.is_dir() and not target.is_symlink():
+                        raise OSError("target became a directory")
+                    target.unlink()
+                target.write_bytes(snapshot.data or b"")
+                if snapshot.mode is not None:
+                    os.chmod(target, snapshot.mode)
+            else:
+                if target.exists() or target.is_symlink():
+                    if target.is_dir() and not target.is_symlink():
+                        raise OSError("target became a directory")
+                    target.unlink()
+        except OSError as error:
+            errors.append(f"{snapshot.path}: {error}")
+    # Remove only empty parent directories that did not exist at snapshot time.
+    # This is narrowly scoped scaffolding cleanup, never worktree/branch cleanup.
+    seen: set[Path] = set()
+    for snapshot in snapshots:
+        for parent in snapshot.parent_dirs:
+            if parent in seen:
+                continue
+            seen.add(parent)
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
+    if errors:
+        raise DeliveryError("unable to restore delivery targets: " + "; ".join(errors))
+
+
+def apply_delivery_patch(
+    cycle: WorktreeCycle,
+    patch: DeliveryPatch | None = None,
+    *,
+    expected_source_hashes: Mapping[str, object] | None = None,
+) -> DeliveryPatch:
+    """Preflight, apply without staging, verify, and rollback on any error."""
+
+    prepared = preflight_patch(
+        cycle,
+        patch,
+        expected_source_hashes=expected_source_hashes,
+    )
+    if not prepared.text:
+        return prepared
+
+    # Repeat source checks after preflight and immediately before snapshot/apply
+    # so a concurrent user edit cannot slip between the checks.
+    _check_sources(cycle, prepared, expected_source_hashes)
+    snapshots = _snapshot_targets(cycle.original_repo, prepared.paths)
+    applied = False
+    try:
+        result = _git(
+            cycle.original_repo,
+            "apply",
+            "--whitespace=nowarn",
+            "--no-3way",
+            "-",
+            input_data=prepared.text,
+            check=False,
+        )
+        applied = True
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            raise DeliveryConflict(f"delivery patch application failed: {detail or 'git apply failed'}")
+        for path, expected in prepared.destination_hashes.items():
+            actual = _current_hash(cycle.original_repo, path)
+            if actual != expected:
+                raise DeliveryError(
+                    f"destination hash mismatch for {path}: expected {expected}, got {actual}"
+                )
+        return prepared
+    except BaseException as error:
+        # Restore even if Git partially applied a patch or verification raised.
+        # Chaining preserves the original failure while making rollback failure
+        # visible to the caller.
+        try:
+            _restore_snapshots(cycle.original_repo, snapshots)
+        except BaseException as restore_error:
+            raise DeliveryError(f"delivery failed and rollback failed: {restore_error}") from error
+        raise
+
+
+def save_cycle(cycle: WorktreeCycle, path: Path) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(cycle.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_cycle(path: Path) -> WorktreeCycle:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as error:
+        raise WorktreeError(f"cycle state is unreadable: {error}") from None
+    if not isinstance(value, Mapping):
+        raise WorktreeError("cycle state must contain an object")
+    return WorktreeCycle.from_dict(value)
+
+
+def save_patch(patch: DeliveryPatch, patch_path: Path, manifest_path: Path) -> None:
+    patch_path = Path(patch_path)
+    manifest_path = Path(manifest_path)
+    patch_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    patch_path.write_text(patch.text, encoding="utf-8", errors="surrogateescape")
+    manifest_path.write_text(
+        json.dumps(patch.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_patch(patch_path: Path, manifest_path: Path) -> DeliveryPatch:
+    try:
+        text = Path(patch_path).read_text(encoding="utf-8", errors="surrogateescape")
+        value = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except Exception as error:
+        raise DeliveryError(f"delivery patch artifacts are unreadable: {error}") from None
+    if not isinstance(value, Mapping):
+        raise DeliveryError("patch manifest must contain an object")
+    return DeliveryPatch.from_dict(value, text=text)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    create = commands.add_parser("create")
+    create.add_argument("--repo", type=Path, required=True)
+    create.add_argument("--prompt-id", required=True)
+    create.add_argument("--state", type=Path, required=True)
+    create.add_argument("--worktree", type=Path)
+    create.add_argument("--branch")
+
+    build = commands.add_parser("build-patch")
+    build.add_argument("--state", type=Path, required=True)
+    build.add_argument("--out", type=Path, required=True)
+    build.add_argument("--out-manifest", type=Path, required=True)
+    build.add_argument("--result", choices=("success", "failure"), required=True)
+    build.add_argument("--final-commit")
+
+    apply = commands.add_parser("apply-patch")
+    apply.add_argument("--state", type=Path, required=True)
+    apply.add_argument("--patch", type=Path, required=True)
+    apply.add_argument("--patch-manifest", type=Path, required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        if args.command == "create":
+            cycle = create_cycle(
+                args.repo,
+                args.prompt_id,
+                worktree=args.worktree,
+                branch=args.branch,
+            )
+            save_cycle(cycle, args.state)
+            print(json.dumps(cycle.to_dict(), ensure_ascii=False, sort_keys=True))
+            return 0
+        cycle = load_cycle(args.state)
+        if args.command == "build-patch":
+            patch = build_delivery_patch(
+                cycle,
+                FAILURE_ALLOWLIST if args.result == "failure" else SUCCESS_ALLOWLIST,
+                final_commit=args.final_commit,
+                result=args.result,
+            )
+            save_patch(patch, args.out, args.out_manifest)
+            print(json.dumps(patch.to_dict(), ensure_ascii=False, sort_keys=True))
+            return 0
+        patch = load_patch(args.patch, args.patch_manifest)
+        apply_delivery_patch(cycle, patch)
+        print(json.dumps({"status": "applied", "paths": list(patch.paths)}, ensure_ascii=False))
+        return 0
+    except Exception as error:
+        print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False))
+        return 2
+
+
+__all__ = [
+    "AllowlistError",
+    "DeliveryConflict",
+    "DeliveryError",
+    "DeliveryPatch",
+    "FAILURE_ALLOWLIST",
+    "Patch",
+    "PatchError",
+    "SUCCESS_ALLOWLIST",
+    "WorktreeCycle",
+    "WorktreeDeliveryError",
+    "WorktreeError",
+    "apply_delivery_patch",
+    "build_delivery_patch",
+    "create_cycle",
+    "load_cycle",
+    "load_patch",
+    "main",
+    "preflight_patch",
+    "save_cycle",
+    "save_patch",
+]
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
