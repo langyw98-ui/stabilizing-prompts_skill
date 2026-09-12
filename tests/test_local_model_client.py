@@ -152,6 +152,60 @@ def test_probe_retrieve_and_list_fail_with_sanitized_error() -> None:
     assert sentinel not in str(exc_info.value)
 
 
+def test_probe_rejects_retrieve_identity_without_list_fallback() -> None:
+    sentinel = "unexpected-retrieve-identity"
+    calls: list[str] = []
+
+    def retrieve(_model: str) -> SimpleNamespace:
+        calls.append("retrieve")
+        return SimpleNamespace(id=sentinel)
+
+    def list_models() -> list[SimpleNamespace]:
+        calls.append("list")
+        return [SimpleNamespace(id=module.MODEL_NAME)]
+
+    client = SimpleNamespace(
+        root_client=SimpleNamespace(
+            models=SimpleNamespace(retrieve=retrieve, list=list_models)
+        )
+    )
+
+    with pytest.raises(module.ModelProbeError) as exc_info:
+        module.probe_model(client)
+
+    assert type(exc_info.value) is module.ModelProbeError
+    assert calls == ["retrieve"]
+    assert str(exc_info.value) == "model probe returned an unexpected model identity"
+    assert sentinel not in str(exc_info.value)
+
+
+def test_probe_rejects_unexpected_list_identity_after_retrieve_failure() -> None:
+    sentinel = "unexpected-list-identity"
+    calls: list[str] = []
+
+    def retrieve(_model: str) -> object:
+        calls.append("retrieve")
+        raise RuntimeError("retrieve unavailable")
+
+    def list_models() -> list[SimpleNamespace]:
+        calls.append("list")
+        return [SimpleNamespace(id=sentinel)]
+
+    client = SimpleNamespace(
+        root_client=SimpleNamespace(
+            models=SimpleNamespace(retrieve=retrieve, list=list_models)
+        )
+    )
+
+    with pytest.raises(module.ModelProbeError) as exc_info:
+        module.probe_model(client)
+
+    assert type(exc_info.value) is module.ModelProbeError
+    assert calls == ["retrieve", "list"]
+    assert str(exc_info.value) == "model probe returned an unexpected model identity"
+    assert sentinel not in str(exc_info.value)
+
+
 def test_redact_secret_handles_nested_values_and_headers() -> None:
     value = {
         "authorization_token": "unit-test-secret",
