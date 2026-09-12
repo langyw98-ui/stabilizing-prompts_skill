@@ -1,7 +1,7 @@
 # Stabilizing Prompts Skill Validation
 
-Validation date: 2026-09-12  
-Task: 10 (personal installation and local-model validation)  
+Validation date: 2026-09-12
+Task: 10 (personal installation and local-model validation)
 Source checkout: `feature/stabilizing-prompts-skill` at the verified implementation
 commit `834a887c3a284984b0cd13e71eec600e93a41421`
 
