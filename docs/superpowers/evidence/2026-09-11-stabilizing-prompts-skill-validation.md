@@ -50,9 +50,11 @@ The installed directory passed:
 rtk conda run -n kds python C:/Users/kgcda/.codex/skills/.system/skill-creator/scripts/quick_validate.py C:/Users/kgcda/.codex/skills/stabilizing-prompts
 ```
 
-Exit code was 0 (`Skill is valid!`). The installed credential-file check was
-false, every excluded-directory check was false, and the installed scan found
-only the same static redaction identifiers as the source scan.
+Exit code was 0 (`Skill is valid!`). At installation time the credential-file
+check was false; the controller later supplied the credential and the current
+strict-load result is recorded below. Every excluded-directory check was
+false, and the installed scan found only the same static redaction identifiers
+as the source scan.
 
 SHA-256 parity checks between source and installed metadata:
 
@@ -65,21 +67,61 @@ agents/openai.yaml
 
 ## Credential gate and real smoke
 
-The only supported credential path was checked without printing or copying its
-contents:
+The controller supplied the local credential at the supported installed-Skill
+path. Only file existence and the strict loader result were inspected; its
+contents were never printed, copied, or persisted in this repository:
 
 ```text
-C:\Users\kgcda\.codex\skills\stabilizing-prompts\.local\model-credentials.json: absent
-strict loader result: absent
+C:\Users\kgcda\.codex\skills\stabilizing-prompts\.local\model-credentials.json: present
+strict loader result: valid
 ```
 
-The source checkout credential path was also absent. This is a setup gate, so
-no client was constructed and no LAN request was attempted. The real fixed
-model smoke is therefore **not completed**; model identity, structured-call
-response, timeout behavior, and live redaction remain an external gate blocked
-by missing local credentials. No Authorization material was emitted.
+The source checkout credential path remained absent, as required. A fixed
+client construction check exited 0 and reported `client-settings-status:
+verified`; its safe configuration hash was:
 
-The safe fixed-client configuration reserved for the smoke is:
+```text
+1cb27d35b75624521c182572a2dca939c99cc9746ca2d0246d062ecdfd2a6436
+```
+
+The disposable committed Python Git fixture was:
+
+```text
+D:\Workspace\AgentPlugin\stabilizing-prompts-smoke-fixture-20260912
+fixture final HEAD: b51ca78e8c67f1fd2172623ce74a7c23eeba6269
+```
+
+Its production renderer/Schema preflight exited 0 with
+`renderer-schema-status: verified`, schema reference
+`target_app.production:Decision`, and renderer-message SHA-256
+`627b82ecbfc9c8ba3ce774106ba4864cd83302bb1146abbba93c36c561241b54`.
+Full case validation exited 0 with counts `dev=1`, `validation=2`,
+`acceptance=2`, and dataset SHA-256
+`5d277e28b9b8e7a8c27b110d47c06d5034fa7161d2450a5a3a57ef93d4f53d09`.
+
+The fixed model identity probe returned a failure (command exit 1) before an
+identity could be accepted. The real runner then entered the production
+structured-output path and exited 2 because the LAN service returned
+`transport_error:http_status_502`. Its sanitized manifest reported:
+
+```text
+manifest status: incomplete
+slots: 5
+pending: 4
+classifications: transport_error=1
+manifest SHA-256: 135193696952bfc333cb581092b9174c2179bc11757d8c8b8fd4bb9827945cd1
+```
+
+The renderer and production Pydantic Schema therefore passed the pre-call
+boundary, and the fixed `with_structured_output` call path was attempted, but
+the service failed before returning a response envelope. No parsed response,
+protocol classification, live timeout observation, or live redaction result
+was available. The constructor-level fixed settings and 30-second timeout
+were verified; offline redaction coverage remains the only redaction evidence.
+This smoke is **not completed** and is blocked by the external model-service
+gate (`HTTP 502`); no alternate model, endpoint, or credential was tried.
+
+The safe fixed-client configuration used for the attempt is:
 
 ```yaml
 base_url: http://192.168.168.230:8000/v1
@@ -117,6 +159,7 @@ for those scenarios.
 ## Final state
 
 The installation is outside the repository and is not a repository commit.
-Generated Python caches are disposable and are removed by the final exact
-cleanup. The source evidence/validation commit and final worktree status are
-reported by the controller after commit and cleanup.
+The committed temporary fixture was removed after its sanitized hashes and
+statuses were captured. Generated Python caches are disposable and are removed
+by the final exact cleanup. The source evidence/validation commit and final
+worktree status are reported in the controller handoff.
