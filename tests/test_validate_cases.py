@@ -565,6 +565,28 @@ def test_case_coverage_metadata_is_required_and_parsed(
     )
 
 
+def test_case_coverage_is_deeply_immutable_and_serializable() -> None:
+    payload = {
+        "primary_obligation": "classify-input",
+        "secondary_obligations": ["related-obligation"],
+        "variant": "normal",
+        "condition_id": "stable-condition",
+        "distinction": "an evidenced distinction",
+    }
+
+    coverage = CaseCoverage.model_validate(payload)
+
+    with pytest.raises(ValidationError):
+        coverage.variant = "boundary"
+    with pytest.raises(TypeError):
+        coverage.secondary_obligations.append("another-obligation")
+    with pytest.raises(TypeError):
+        coverage.secondary_obligations[0] = "changed-obligation"
+
+    assert coverage.model_dump(mode="json") == payload
+    assert json.loads(coverage.model_dump_json()) == payload
+
+
 def test_case_requires_coverage_metadata(
     case_files, output_schema, coverage_obligations
 ) -> None:

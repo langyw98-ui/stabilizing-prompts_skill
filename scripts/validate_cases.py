@@ -353,7 +353,7 @@ class CoverageObligations(BaseModel):
 class CaseCoverage(BaseModel):
     """Coverage identity and reporting references for one evaluation case."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     primary_obligation: str
     secondary_obligations: list[str] = Field(default_factory=list)
@@ -410,6 +410,15 @@ class CaseCoverage(BaseModel):
             raise ValueError(
                 "primary_obligation must not be repeated in secondary_obligations"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _freeze_nested_values(self) -> "CaseCoverage":
+        object.__setattr__(
+            self,
+            "secondary_obligations",
+            _FrozenList(self.secondary_obligations),
+        )
         return self
 
 
