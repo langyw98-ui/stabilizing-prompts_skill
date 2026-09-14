@@ -15,6 +15,8 @@ from scripts.validate_cases import (
     CaseCoverage,
     CaseSetupError,
     CaseSuite,
+    CoverageAudit,
+    CoverageObligations,
     EvalCase,
     coverage_obligations_hash,
     dataset_hash,
@@ -104,9 +106,9 @@ def complete_obligations_payload() -> dict[str, object]:
                 "risk": "normal",
                 "rule": "return the evidenced routing decision",
                 "required_splits": {
-                    "dev": ["normal"],
-                    "validation": ["boundary"],
-                    "acceptance": ["natural_variation"],
+                    "dev": ["normal", "boundary", "natural_variation"],
+                    "validation": ["normal", "boundary", "natural_variation"],
+                    "acceptance": ["normal", "boundary", "natural_variation"],
                 },
                 "variant_exclusions": {},
             }
@@ -172,6 +174,111 @@ def duplicate_scenario_with_new_input(
         "variables": {"text": "different wording only"}, "context": {}
     }
     write_cases(case_files[target_split], target_cases)
+
+
+def make_case(
+    split: str,
+    index: int,
+    *,
+    obligation: str = "classify-input",
+    variant: str | None = None,
+    output: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build one deterministic, substantively distinct fixture case."""
+
+    default_variant = {
+        "dev": "normal",
+        "validation": "boundary",
+        "acceptance": "natural_variation",
+    }[split]
+    value = _case(
+        f"{split}-{index}",
+        f"routing-{split}-{index}",
+        output=output,
+        input={
+            "variables": {"split": split, "message": f"{split} message {index}"},
+            "context": {"index": index},
+        },
+        coverage={
+            "primary_obligation": obligation,
+            "secondary_obligations": [],
+            "variant": variant or default_variant,
+            "condition_id": f"{split}-{index}-condition",
+            "distinction": None,
+        },
+    )
+    return value
+
+
+def _complete_split_cases(
+    split: str, provided: list[dict[str, object]] | None
+) -> list[dict[str, object]]:
+    """Keep legacy fixture callers valid while meeting the hard case floor."""
+
+    cases = list(provided or [])
+    present_variants = {
+        case["coverage"]["variant"]
+        for case in cases
+        if isinstance(case.get("coverage"), dict)
+    }
+    required_variants = ("normal", "boundary", "natural_variation")
+    template_output = None
+    if cases and isinstance(cases[0].get("expect"), dict):
+        raw_output = cases[0]["expect"].get("output")
+        if isinstance(raw_output, dict):
+            template_output = raw_output
+    next_index = 1
+    for required_variant in required_variants:
+        if required_variant not in present_variants:
+            while f"{split}-{next_index}" in {case["id"] for case in cases}:
+                next_index += 1
+            cases.append(
+                make_case(
+                    split,
+                    next_index,
+                    variant=required_variant,
+                    output=template_output,
+                )
+            )
+            next_index += 1
+    while len(cases) < 30:
+        while f"{split}-{next_index}" in {case["id"] for case in cases}:
+            next_index += 1
+        cases.append(make_case(split, next_index, output=template_output))
+        next_index += 1
+    return cases
+
+
+def remove_last_case(path: Path) -> None:
+    cases = read_cases(path)
+    write_cases(path, cases[:-1])
+
+
+def require_variant(
+    obligations: CoverageObligations, obligation_id: str, *, split: str, variant: str
+) -> CoverageObligations:
+    payload = obligations.model_dump(mode="json")
+    matches = [value for value in payload["obligations"] if value["id"] == obligation_id]
+    if matches:
+        matches[0]["required_splits"].setdefault(split, []).append(variant)
+    else:
+        payload["obligations"].append({
+            "id": obligation_id,
+            "source": ["evidence.py"],
+            "category": "normal_path",
+            "risk": "normal",
+            "rule": "exercise a quota that secondary references cannot satisfy",
+            "required_splits": {split: [variant]},
+            "variant_exclusions": {},
+        })
+    return CoverageObligations.model_validate(payload)
+
+
+def add_secondary_reference_to_every_case(path: Path, obligation_id: str) -> None:
+    cases = read_cases(path)
+    for case in cases:
+        case["coverage"]["secondary_obligations"].append(obligation_id)
+    write_cases(path, cases)
 
 
 def test_coverage_obligations_require_every_fixed_category(tmp_path: Path) -> None:
@@ -513,37 +620,46 @@ def write_case_sets(
     return (
         _write(
             root / "dev-cases.yaml",
-            [
-                _case(
-                    "dev-1",
-                    "routing-dev",
-                    output=dev_expect,
-                    input=dev_input
-                    or {"variables": {"split": "dev"}, "context": {}},
-                )
-            ],
+            _complete_split_cases(
+                "dev",
+                [
+                    _case(
+                        "dev-1",
+                        "routing-dev",
+                        output=dev_expect,
+                        input=dev_input
+                        or {"variables": {"split": "dev"}, "context": {}},
+                    )
+                ],
+            ),
         ),
         _write(
             root / "validation-cases.yaml",
-            validation
-            or [
-                _case(
-                    "validation-1",
-                    "routing-validation",
-                    input={"variables": {"split": "validation"}, "context": {}},
-                )
-            ],
+            _complete_split_cases(
+                "validation",
+                validation
+                or [
+                    _case(
+                        "validation-1",
+                        "routing-validation",
+                        input={"variables": {"split": "validation"}, "context": {}},
+                    )
+                ],
+            ),
         ),
         _write(
             root / "acceptance-cases.yaml",
-            acceptance
-            or [
-                _case(
-                    "acceptance-1",
-                    "routing-acceptance",
-                    input={"variables": {"split": "acceptance"}, "context": {}},
-                )
-            ],
+            _complete_split_cases(
+                "acceptance",
+                acceptance
+                or [
+                    _case(
+                        "acceptance-1",
+                        "routing-acceptance",
+                        input={"variables": {"split": "acceptance"}, "context": {}},
+                    )
+                ],
+            ),
         ),
     )
 
@@ -563,6 +679,83 @@ def test_case_coverage_metadata_is_required_and_parsed(
         "normal",
         "dev1condition",
     )
+
+
+def test_exactly_thirty_valid_cases_produce_audit_counts(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    suite = load_case_suite(
+        case_files.values(), output_schema, obligations=coverage_obligations
+    )
+
+    assert isinstance(suite.coverage_audit, CoverageAudit)
+    assert suite.coverage_audit.counts == {
+        "dev": {"total": 30, "valid": 30, "non_counting": 0},
+        "validation": {"total": 30, "valid": 30, "non_counting": 0},
+        "acceptance": {"total": 30, "valid": 30, "non_counting": 0},
+    }
+
+
+def test_thirty_one_independent_cases_are_all_counted(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    cases = read_cases(case_files["dev"])
+    cases.append(make_case("dev", 31))
+    write_cases(case_files["dev"], cases)
+
+    suite = load_case_suite(
+        case_files.values(), output_schema, obligations=coverage_obligations
+    )
+
+    assert suite.coverage_audit.counts == {
+        "dev": {"total": 31, "valid": 31, "non_counting": 0},
+        "validation": {"total": 30, "valid": 30, "non_counting": 0},
+        "acceptance": {"total": 30, "valid": 30, "non_counting": 0},
+    }
+
+
+def test_each_split_requires_thirty_valid_cases(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    remove_last_case(case_files["validation"])
+
+    with pytest.raises(CaseSetupError, match="validation.*29.*30"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=coverage_obligations
+        )
+
+
+def test_missing_required_split_variant_quota_is_reported(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    obligations = require_variant(
+        coverage_obligations,
+        "classify-input",
+        split="validation",
+        variant="adversarial",
+    )
+
+    with pytest.raises(
+        CaseSetupError, match="missing.*classify-input.*validation.*adversarial"
+    ):
+        load_case_suite(case_files.values(), output_schema, obligations=obligations)
+
+
+def test_secondary_obligations_do_not_satisfy_quota(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    obligations = require_variant(
+        coverage_obligations,
+        "reject-unrelated",
+        split="acceptance",
+        variant="adversarial",
+    )
+    add_secondary_reference_to_every_case(
+        case_files["acceptance"], "reject-unrelated"
+    )
+
+    with pytest.raises(CaseSetupError, match="missing.*acceptance.*adversarial"):
+        load_case_suite(case_files.values(), output_schema, obligations=obligations)
 
 
 def test_case_coverage_is_deeply_immutable_and_serializable() -> None:
@@ -626,7 +819,7 @@ def test_global_scenario_key_allows_substantive_variant_and_condition_changes(
         case_files.values(), output_schema, obligations=coverage_obligations
     )
 
-    assert len({_scenario_key(item.case) for item in suite.all_cases}) == 3
+    assert len({_scenario_key(item.case) for item in suite.all_cases}) == 90
 
 
 def test_secondary_obligations_never_change_scenario_identity() -> None:
@@ -719,7 +912,7 @@ def test_rejects_exact_duplicate_inputs_within_one_split(
     paths = write_case_sets(tmp_path)
     cases = read_cases(paths[0])
     duplicate = dict(cases[0])
-    duplicate["id"] = "dev-2"
+    duplicate["id"] = "dev-31"
     duplicate["semantic_family"] = "independent-dev-family"
     duplicate["coverage"] = {
         **cases[0]["coverage"],
@@ -813,9 +1006,12 @@ def test_loads_all_splits_with_validated_production_models(
     suite = load_case_suite(paths, Decision, obligations=coverage_obligations)
 
     assert isinstance(suite, CaseSuite)
-    assert [item.case.id for item in suite.dev] == ["dev-1"]
-    assert [item.case.id for item in suite.validation] == ["validation-1"]
-    assert [item.case.id for item in suite.acceptance] == ["acceptance-1"]
+    assert len(suite.dev) == 30
+    assert len(suite.validation) == 30
+    assert len(suite.acceptance) == 30
+    assert suite.dev[0].case.id == "dev-1"
+    assert suite.validation[0].case.id == "validation-1"
+    assert suite.acceptance[0].case.id == "acceptance-1"
     assert isinstance(suite.dev[0].expected, Decision)
     assert suite.dev[0].expected.action == "accept"
     assert suite.dev[0].expected.reason == "matched"
@@ -926,7 +1122,8 @@ def test_case_validation_cli_writes_machine_readable_suite(
     assert payload["dataset_hash"] == dataset_hash(
         load_case_suite(paths, Decision, obligations=coverage_obligations)
     )
-    assert [item["id"] for item in payload["splits"]["dev"]] == ["dev-1"]
+    assert len(payload["splits"]["dev"]) == 30
+    assert payload["splits"]["dev"][0]["id"] == "dev-1"
     assert payload["splits"]["dev"][0]["expect"]["output"] == {
         "action": "accept",
         "reason": "matched",

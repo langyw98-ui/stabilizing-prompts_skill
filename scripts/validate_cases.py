@@ -460,6 +460,55 @@ class ValidatedCase:
     expected: BaseModel
 
 
+def _freeze_audit_value(value: object) -> object:
+    """Recursively freeze mappings and sequences stored in a coverage audit."""
+
+    if isinstance(value, Mapping):
+        return _FrozenDict(
+            {key: _freeze_audit_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, tuple):
+        return tuple(_freeze_audit_value(item) for item in value)
+    if isinstance(value, list):
+        return _FrozenList([_freeze_audit_value(item) for item in value])
+    if isinstance(value, set):
+        return frozenset(_freeze_audit_value(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True)
+class CoverageAudit:
+    """Deterministic, mechanical coverage evidence for a complete case suite.
+
+    This audit intentionally contains only checks the validator can establish
+    from the frozen obligations and case data.  Human evidence scanning and
+    saturation confirmation happen later in the workflow and are not part of
+    this object.
+    """
+
+    counts: Mapping[str, Mapping[str, int]]
+    distributions: Mapping[str, object]
+    missing_quotas: tuple[tuple[str, str, str], ...]
+    hard_duplicates: tuple[Mapping[str, object], ...]
+    near_duplicates: tuple[Mapping[str, object], ...]
+    mechanical_gates: Mapping[str, bool]
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "counts",
+            "distributions",
+            "missing_quotas",
+            "hard_duplicates",
+            "near_duplicates",
+            "mechanical_gates",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _freeze_audit_value(getattr(self, field_name)),
+            )
+
+
 @dataclass(frozen=True)
 class CaseSuite:
     """The three evaluation splits in their runner-facing form."""
@@ -467,6 +516,7 @@ class CaseSuite:
     dev: tuple[ValidatedCase, ...]
     validation: tuple[ValidatedCase, ...]
     acceptance: tuple[ValidatedCase, ...]
+    coverage_audit: CoverageAudit
 
     @property
     def development(self) -> tuple[ValidatedCase, ...]:
@@ -749,11 +799,39 @@ def _validate_coverage_references(
             f"{coverage.primary_obligation!r}"
         )
 
+    category_by_name = {
+        category.category: category for category in obligations.categories
+    }
+    category = category_by_name.get(primary.category)
+    if category is None or category.applicability != "required":
+        applicability = category.applicability if category is not None else "unknown"
+        raise CaseSetupError(
+            f"{split} case {case.id!r} references primary obligation "
+            f"{primary.id!r} with invalid category {primary.category!r} "
+            f"({applicability})"
+        )
+
     for secondary in coverage.secondary_obligations:
-        if secondary not in by_id:
+        secondary_obligation = by_id.get(secondary)
+        if secondary_obligation is None:
             raise CaseSetupError(
                 f"{split} case {case.id!r} references unknown secondary obligation "
                 f"{secondary!r}"
+            )
+        secondary_category = category_by_name.get(secondary_obligation.category)
+        if (
+            secondary_category is None
+            or secondary_category.applicability != "required"
+        ):
+            applicability = (
+                secondary_category.applicability
+                if secondary_category is not None
+                else "unknown"
+            )
+            raise CaseSetupError(
+                f"{split} case {case.id!r} references secondary obligation "
+                f"{secondary_obligation.id!r} with invalid category "
+                f"{secondary_obligation.category!r} ({applicability})"
             )
 
     declared_variants = primary.required_splits.get(split, ())
@@ -764,6 +842,222 @@ def _validate_coverage_references(
             f"is not declared for primary obligation {primary.id!r} in {split} "
             f"(declared: {declared})"
         )
+
+
+def _coverage_audit(
+    split_cases: Mapping[str, tuple[ValidatedCase, ...]],
+    obligations: CoverageObligations,
+) -> CoverageAudit:
+    """Build the mechanical coverage audit after suite validation succeeds."""
+
+    counts = {
+        split: {
+            "total": len(split_cases[split]),
+            "valid": len(split_cases[split]),
+            "non_counting": 0,
+        }
+        for split in _SPLITS
+    }
+
+    ordered_obligations = tuple(
+        sorted(obligations.obligations, key=lambda obligation: obligation.id)
+    )
+    by_id = {obligation.id: obligation for obligation in ordered_obligations}
+    category_distribution: dict[str, int] = {}
+    obligation_distribution: dict[str, int] = {}
+    risk_distribution: dict[str, int] = {}
+    split_distribution: dict[str, int] = {}
+    variant_distribution: dict[str, int] = {}
+    observed: set[tuple[str, str, str]] = set()
+
+    for split in _SPLITS:
+        split_distribution[split] = len(split_cases[split])
+        for validated in split_cases[split]:
+            coverage = validated.case.coverage
+            obligation = by_id[coverage.primary_obligation]
+            observed.add((obligation.id, split, coverage.variant))
+            category_distribution[obligation.category] = (
+                category_distribution.get(obligation.category, 0) + 1
+            )
+            obligation_distribution[obligation.id] = (
+                obligation_distribution.get(obligation.id, 0) + 1
+            )
+            risk_distribution[obligation.risk] = (
+                risk_distribution.get(obligation.risk, 0) + 1
+            )
+            variant_distribution[coverage.variant] = (
+                variant_distribution.get(coverage.variant, 0) + 1
+            )
+
+    required = {
+        (obligation.id, split, variant)
+        for obligation in ordered_obligations
+        for split, variants in obligation.required_splits.items()
+        for variant in variants
+    }
+    missing_quotas = tuple(sorted(required - observed))
+
+    category_by_name = {category.category: category for category in obligations.categories}
+    category_declarations = (
+        set(category_by_name) == FIXED_CATEGORIES
+        and len(category_by_name) == len(obligations.categories)
+        and all(
+            category.applicability == "required"
+            or (
+                bool(category.evidence_checked)
+                and bool(category.rationale and category.rationale.strip())
+            )
+            for category in obligations.categories
+        )
+    )
+
+    critical_coverage = True
+    critical_variants = {"boundary", "conflict", "adversarial"}
+    for obligation in ordered_obligations:
+        if obligation.risk != "critical":
+            continue
+        actual_variants = {
+            validated.case.coverage.variant
+            for split in _SPLITS
+            for validated in split_cases[split]
+            if validated.case.coverage.primary_obligation == obligation.id
+        }
+        declared_variants = {
+            variant
+            for variants in obligation.required_splits.values()
+            for variant in variants
+        }
+        missing_exclusions = (
+            critical_variants
+            - declared_variants
+            - set(obligation.variant_exclusions)
+        )
+        if "normal" not in declared_variants or "normal" not in actual_variants:
+            critical_coverage = False
+        if not declared_variants & critical_variants or not actual_variants & critical_variants:
+            critical_coverage = False
+        if missing_exclusions:
+            critical_coverage = False
+
+    mechanical_gates = {
+        "minimum_counts": all(
+            counts[split]["valid"] >= MIN_CASES_PER_SPLIT for split in _SPLITS
+        ),
+        "required_quotas": not missing_quotas,
+        "category_declarations": category_declarations,
+        "critical_coverage": critical_coverage,
+        # Hard duplicates are rejected before this audit is constructed.  The
+        # empty tuple is therefore positive evidence that this gate passed.
+        "hard_duplicates": True,
+        # Near-duplicate detection is added by the later audit extension.  A
+        # complete Task 3 suite has no such pairs to explain.
+        "near_duplicate_explanations": True,
+        "coverage_matrix": (
+            category_declarations
+            and not missing_quotas
+            and critical_coverage
+        ),
+    }
+
+    distributions = {
+        "category": dict(sorted(category_distribution.items())),
+        "obligation": dict(sorted(obligation_distribution.items())),
+        "risk": dict(sorted(risk_distribution.items())),
+        "split": dict(sorted(split_distribution.items())),
+        "variant": dict(sorted(variant_distribution.items())),
+    }
+    return CoverageAudit(
+        counts=counts,
+        distributions=distributions,
+        missing_quotas=missing_quotas,
+        hard_duplicates=(),
+        near_duplicates=(),
+        mechanical_gates=mechanical_gates,
+    )
+
+
+def _coverage_gate_error(
+    audit: CoverageAudit,
+    obligations: CoverageObligations,
+    split_cases: Mapping[str, tuple[ValidatedCase, ...]],
+) -> CaseSetupError | None:
+    """Return one deterministic error covering all failed mechanical gates."""
+
+    failures: list[str] = []
+    for split in _SPLITS:
+        valid = audit.counts[split]["valid"]
+        if valid < MIN_CASES_PER_SPLIT:
+            failures.append(
+                f"{split} has {valid} valid cases (minimum {MIN_CASES_PER_SPLIT})"
+            )
+
+    if audit.missing_quotas:
+        details = ", ".join(
+            f"{obligation_id} in {split} for variant {variant}"
+            for obligation_id, split, variant in audit.missing_quotas
+        )
+        failures.append(f"missing coverage quota(s): {details}")
+
+    if not audit.mechanical_gates["category_declarations"]:
+        declared = {category.category for category in obligations.categories}
+        missing = sorted(FIXED_CATEGORIES - declared)
+        suffix = f": missing {', '.join(missing)}" if missing else ""
+        failures.append(f"category declarations are incomplete{suffix}")
+
+    if not audit.mechanical_gates["critical_coverage"]:
+        critical_variants = {"boundary", "conflict", "adversarial"}
+        for obligation in sorted(
+            obligations.obligations, key=lambda obligation: obligation.id
+        ):
+            if obligation.risk != "critical":
+                continue
+            actual = {
+                validated.case.coverage.variant
+                for split in _SPLITS
+                for validated in split_cases[split]
+                if validated.case.coverage.primary_obligation == obligation.id
+            }
+            # The model-level obligation validator normally catches malformed
+            # critical declarations before this point.  Keep this fallback
+            # message precise for callers that constructed such a model with
+            # ``model_construct``.
+            declared = {
+                variant
+                for variants in obligation.required_splits.values()
+                for variant in variants
+            }
+            missing_exclusions = (
+                critical_variants
+                - declared
+                - set(obligation.variant_exclusions)
+            )
+            missing = []
+            if "normal" not in declared:
+                missing.append("normal")
+            if not declared & critical_variants:
+                missing.append("boundary|conflict|adversarial")
+            if missing:
+                failures.append(
+                    f"critical obligation {obligation.id!r} is missing "
+                    + ", ".join(missing)
+                )
+            elif not actual:
+                failures.append(
+                    f"critical obligation {obligation.id!r} has no primary cases"
+                )
+            if missing_exclusions:
+                failures.append(
+                    f"critical obligation {obligation.id!r} is missing "
+                    "variant_exclusions for "
+                    + ", ".join(sorted(missing_exclusions))
+                )
+
+    if not audit.mechanical_gates["coverage_matrix"]:
+        failures.append("coverage matrix is incomplete")
+
+    if failures:
+        return CaseSetupError("coverage gates failed: " + "; ".join(failures))
+    return None
 
 
 def load_case_split(
@@ -915,10 +1209,18 @@ def load_case_suite(
                 )
             seen_scenarios[scenario_key] = (split, case.id)
 
+    coverage_audit = _coverage_audit(split_cases, obligations)
+    coverage_error = _coverage_gate_error(
+        coverage_audit, obligations, split_cases
+    )
+    if coverage_error is not None:
+        raise coverage_error
+
     return CaseSuite(
         dev=split_cases["dev"],
         validation=split_cases["validation"],
         acceptance=split_cases["acceptance"],
+        coverage_audit=coverage_audit,
     )
 
 
@@ -1146,6 +1448,7 @@ __all__ = [
     "CaseSetupError",
     "CaseSuite",
     "CaseCoverage",
+    "CoverageAudit",
     "CoverageCategory",
     "CoverageObligation",
     "CoverageObligations",
