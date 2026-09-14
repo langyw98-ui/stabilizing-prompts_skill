@@ -67,6 +67,46 @@ RequiredSplits = dict[
 ]
 
 
+class _FrozenList(list[Any]):
+    """A list-compatible container that rejects every in-place mutation."""
+
+    __slots__ = ()
+
+    def _reject_mutation(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("coverage obligation values are immutable")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __iadd__ = _reject_mutation
+    __imul__ = _reject_mutation
+    append = _reject_mutation
+    clear = _reject_mutation
+    extend = _reject_mutation
+    insert = _reject_mutation
+    pop = _reject_mutation
+    remove = _reject_mutation
+    reverse = _reject_mutation
+    sort = _reject_mutation
+
+
+class _FrozenDict(dict[Any, Any]):
+    """A dict-compatible container that rejects every in-place mutation."""
+
+    __slots__ = ()
+
+    def _reject_mutation(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("coverage obligation values are immutable")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __ior__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+
+
 class CoverageCategory(BaseModel):
     """A fixed coverage category and its evidence-backed applicability."""
 
@@ -109,6 +149,11 @@ class CoverageCategory(BaseModel):
                 raise ValueError(
                     "not_applicable category requires non-empty rationale"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _freeze_nested_values(self) -> "CoverageCategory":
+        object.__setattr__(self, "evidence_checked", _FrozenList(self.evidence_checked))
         return self
 
 
@@ -228,6 +273,26 @@ class CoverageObligation(BaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _freeze_nested_values(self) -> "CoverageObligation":
+        object.__setattr__(self, "source", _FrozenList(self.source))
+        object.__setattr__(
+            self,
+            "required_splits",
+            _FrozenDict(
+                {
+                    split: _FrozenList(variants)
+                    for split, variants in self.required_splits.items()
+                }
+            ),
+        )
+        object.__setattr__(
+            self,
+            "variant_exclusions",
+            _FrozenDict(self.variant_exclusions),
+        )
+        return self
+
 
 class CoverageObligations(BaseModel):
     """The complete frozen coverage-obligation asset."""
@@ -235,8 +300,8 @@ class CoverageObligations(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     version: Literal[1]
-    categories: list[CoverageCategory] = Field(default_factory=list)
-    obligations: list[CoverageObligation] = Field(default_factory=list)
+    categories: list[CoverageCategory]
+    obligations: list[CoverageObligation]
 
     @model_validator(mode="after")
     def _validate_complete_asset(self) -> "CoverageObligations":
@@ -275,6 +340,12 @@ class CoverageObligations(BaseModel):
         if duplicate_ids:
             values = ", ".join(sorted(duplicate_ids))
             raise ValueError(f"duplicate obligation id(s): {values}")
+        return self
+
+    @model_validator(mode="after")
+    def _freeze_nested_values(self) -> "CoverageObligations":
+        object.__setattr__(self, "categories", _FrozenList(self.categories))
+        object.__setattr__(self, "obligations", _FrozenList(self.obligations))
         return self
 
 
@@ -462,7 +533,7 @@ def load_coverage_obligations(path: Path, repo_root: Path) -> CoverageObligation
 
     try:
         root = Path(repo_root).resolve(strict=False)
-    except (OSError, TypeError, ValueError) as error:
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise CaseSetupError(f"repository root is invalid: {error}") from error
 
     for obligation in value.obligations:
@@ -471,7 +542,7 @@ def load_coverage_obligations(path: Path, repo_root: Path) -> CoverageObligation
                 candidate = (root / source).resolve(strict=False)
                 contained = candidate.is_relative_to(root)
                 exists = candidate.is_file()
-            except (OSError, TypeError, ValueError):
+            except (OSError, RuntimeError, TypeError, ValueError):
                 contained = False
                 exists = False
             if not contained or not exists:

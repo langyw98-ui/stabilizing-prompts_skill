@@ -8,7 +8,7 @@ from typing import Literal
 
 import pytest
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from scripts.validate_cases import (
     CaseSetupError,
@@ -123,6 +123,199 @@ def test_not_applicable_requires_evidence_and_rationale(tmp_path: Path) -> None:
     path = write_obligations(tmp_path, payload)
 
     with pytest.raises(CaseSetupError, match="evidence_checked|rationale"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_require_top_level_fields(tmp_path: Path) -> None:
+    for field in ("categories", "obligations"):
+        payload = complete_obligations_payload()
+        payload.pop(field)
+        path = write_obligations(tmp_path / field, payload)
+
+        with pytest.raises(CaseSetupError, match=field):
+            load_coverage_obligations(path, tmp_path / field)
+
+
+def test_coverage_obligations_allow_explicit_empty_obligations(
+    tmp_path: Path,
+) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"] = []
+    path = write_obligations(tmp_path, payload)
+
+    loaded = load_coverage_obligations(path, tmp_path)
+
+    assert loaded.obligations == []
+
+
+def test_coverage_obligations_are_deeply_immutable(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["variant_exclusions"] = {
+        "conflict": "the evidence has no conflict branch",
+    }
+    path = write_obligations(tmp_path, payload)
+    loaded = load_coverage_obligations(path, tmp_path)
+
+    with pytest.raises(TypeError):
+        loaded.categories.append(loaded.categories[0])
+    with pytest.raises(TypeError):
+        loaded.categories[0].evidence_checked.append("new-evidence")
+    with pytest.raises(TypeError):
+        loaded.obligations.append(loaded.obligations[0])
+    with pytest.raises(TypeError):
+        loaded.obligations[0].source.append("another.py")
+    with pytest.raises(TypeError):
+        loaded.obligations[0].required_splits["dev"].append("boundary")
+    with pytest.raises(TypeError):
+        loaded.obligations[0].required_splits["dev"] = ["boundary"]
+    with pytest.raises(TypeError):
+        loaded.obligations[0].variant_exclusions["adversarial"] = "reason"
+    with pytest.raises(ValidationError):
+        loaded.obligations[0].id = "changed"
+
+
+def test_coverage_obligations_reject_duplicate_categories(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["categories"].append(dict(payload["categories"][0]))
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="categor"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_duplicate_variants(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["required_splits"]["dev"] = ["normal", "normal"]
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="variant"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_unknown_split_key(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["required_splits"]["other"] = ["normal"]
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="required_splits"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_declared_variant_exclusion(
+    tmp_path: Path,
+) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["variant_exclusions"] = {
+        "normal": "normal is declared in dev",
+    }
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="variant_exclusions"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_blank_exclusion_reason(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["variant_exclusions"] = {"boundary": "  "}
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="variant_exclusions"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_unknown_exclusion_variant(
+    tmp_path: Path,
+) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["variant_exclusions"] = {
+        "project-specific": "the evidence has no such variant",
+    }
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="variant_exclusions|variant"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_critical_obligation_accepts_exclusions_for_unused_risky_variants(
+    tmp_path: Path,
+) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["risk"] = "critical"
+    payload["obligations"][0]["required_splits"] = {
+        "dev": ["normal", "boundary"],
+    }
+    payload["obligations"][0]["variant_exclusions"] = {
+        "conflict": "the evidence has no conflict branch",
+        "adversarial": "the evidence has no adversarial branch",
+    }
+    path = write_obligations(tmp_path, payload)
+
+    loaded = load_coverage_obligations(path, tmp_path)
+
+    assert loaded.obligations[0].risk == "critical"
+
+
+def test_coverage_obligations_accept_alias_and_parent_segments(
+    tmp_path: Path,
+) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["source"] = ["./nested/../evidence.py"]
+    path = write_obligations(tmp_path, payload)
+
+    loaded = load_coverage_obligations(path, tmp_path)
+
+    assert loaded.obligations[0].source == ["./nested/../evidence.py"]
+
+
+def test_coverage_obligations_reject_source_escape(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["source"] = ["../outside-evidence.py"]
+    (tmp_path.parent / "outside-evidence.py").write_text(
+        "OUTSIDE = True\n", encoding="utf-8"
+    )
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="source"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_symlink_source_when_supported(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path.parent / "outside-evidence.py"
+    outside.write_text("OUTSIDE = True\n", encoding="utf-8")
+    link = tmp_path / "linked-evidence.py"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable")
+
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["source"] = ["linked-evidence.py"]
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="source"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_source_resolve_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["source"] = ["loop.py"]
+    path = write_obligations(tmp_path, payload)
+    original_resolve = Path.resolve
+
+    def raise_for_loop(
+        candidate: Path, *, strict: bool = False
+    ) -> Path:
+        if candidate.name == "loop.py":
+            raise RuntimeError("symlink loop")
+        return original_resolve(candidate, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", raise_for_loop)
+
+    with pytest.raises(CaseSetupError, match="source"):
         load_coverage_obligations(path, tmp_path)
 
 
