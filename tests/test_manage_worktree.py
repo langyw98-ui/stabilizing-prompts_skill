@@ -120,6 +120,45 @@ def test_cycle_base_is_original_head(repo: tuple[Path, str]) -> None:
     assert cycle.branch
 
 
+def test_create_cycle_rejects_linked_worktree_before_writes(
+    repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    original, prompt_id = repo
+    linked = tmp_path / "linked"
+    git(original, "worktree", "add", "-b", "linked-test", str(linked), "HEAD")
+
+    with pytest.raises(WorktreeError, match="primary workspace|linked worktree"):
+        create_cycle(linked, prompt_id)
+
+    assert not (linked / ".worktrees").exists()
+
+
+def test_create_cycle_rejects_detached_head(repo: tuple[Path, str]) -> None:
+    original, prompt_id = repo
+    git(original, "checkout", "--detach", "HEAD")
+
+    with pytest.raises(WorktreeError, match="detached HEAD"):
+        create_cycle(original, prompt_id)
+
+
+def test_create_cycle_accepts_primary_submodule_checkout(tmp_path: Path) -> None:
+    source, prompt_id = make_repo(tmp_path / "source")
+    superproject, _ = make_repo(tmp_path / "superproject")
+    git(
+        superproject,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(source),
+        "prompt-submodule",
+    )
+    git(superproject, "commit", "-am", "add prompt submodule")
+
+    cycle = create_cycle(superproject / "prompt-submodule", prompt_id)
+    assert cycle.original_repo == (superproject / "prompt-submodule").resolve()
+
+
 def test_success_allowlist_resolves_prompt_symbol_to_canonical_target(
     completed_cycle: WorktreeCycle,
 ) -> None:

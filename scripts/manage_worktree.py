@@ -126,6 +126,28 @@ def _repo_root(repo: Path) -> Path:
     return actual
 
 
+def _resolved_git_directory(root: Path, argument: str) -> Path:
+    value = Path(_git_text(root, "rev-parse", argument))
+    if not value.is_absolute():
+        value = root / value
+    return value.resolve(strict=False)
+
+
+def _primary_workspace_head(root: Path) -> str:
+    git_dir = _resolved_git_directory(root, "--git-dir")
+    common_dir = _resolved_git_directory(root, "--git-common-dir")
+    superproject = _git_text(root, "rev-parse", "--show-superproject-working-tree")
+    if git_dir != common_dir and not superproject:
+        raise WorktreeError("tune must start from the primary workspace, not a linked worktree")
+    branch = _git_text(root, "branch", "--show-current")
+    if not branch:
+        raise WorktreeError("tune cannot start from detached HEAD")
+    head = _git_text(root, "rev-parse", "--verify", "HEAD")
+    if not head:
+        raise WorktreeError("repository HEAD cannot be verified")
+    return head
+
+
 def _path_key(path: Path) -> str:
     """Return a case-aware boundary key for an absolute filesystem path."""
 
@@ -404,7 +426,7 @@ def create_cycle(
     if not isinstance(prompt_id, str) or not prompt_id.strip():
         raise WorktreeError("prompt_id must be a non-empty string")
     root = _repo_root(Path(original_repo))
-    base = _git_text(root, "rev-parse", "--verify", "HEAD")
+    base = _primary_workspace_head(root)
     resolved_prompt: str | None
     if prompt_path is not None:
         resolved_prompt = _relative_path(root, prompt_path, label="prompt path")
