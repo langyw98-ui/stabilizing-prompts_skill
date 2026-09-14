@@ -400,16 +400,24 @@ def workspace_snapshot(repo: Path) -> tuple[dict[str, bytes], str]:
 
     Runtime bytecode/cache directories are intentionally excluded because they
     are ignored implementation artifacts, not assets that a tune cycle may
-    deliver.  The status component still catches staged, unstaged, and
-    untracked changes to all tracked/visible assets.
+    deliver.  Retained linked checkouts under the managed project-local
+    ``.worktrees/`` subtree are excluded for the same reason.  The status
+    component still catches staged, unstaged, and untracked changes to all
+    other tracked/visible assets.
     """
 
     root = Path(repo).resolve()
     files: dict[str, bytes] = {}
     for path in root.rglob("*"):
-        if not path.is_file() or ".git" in path.parts or "__pycache__" in path.parts:
+        relative_path = path.relative_to(root)
+        if (
+            not path.is_file()
+            or ".git" in relative_path.parts
+            or "__pycache__" in relative_path.parts
+            or relative_path.parts[:1] == (".worktrees",)
+        ):
             continue
-        relative = path.relative_to(root).as_posix()
+        relative = relative_path.as_posix()
         files[relative] = path.read_bytes()
     status = _git(
         root,

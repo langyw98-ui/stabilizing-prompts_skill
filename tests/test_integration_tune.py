@@ -36,6 +36,29 @@ def test_tune_initializes_and_delivers_only_after_acceptance_and_confirmation(
     assert (target_repo / "prompts" / "classify.md").read_text(encoding="utf-8") == result.candidate_prompt
 
 
+def test_workspace_snapshot_ignores_managed_worktree_but_captures_other_nested_worktree(
+    target_repo: Path,
+) -> None:
+    managed_asset = (
+        target_repo
+        / ".worktrees"
+        / "stabilizing-prompts"
+        / "retained-cycle"
+        / "prompt.txt"
+    )
+    managed_asset.parent.mkdir(parents=True)
+    managed_asset.write_text("retained checkout\n", encoding="utf-8")
+
+    nested_asset = target_repo / "fixtures" / ".worktrees" / "meaningful.txt"
+    nested_asset.parent.mkdir(parents=True)
+    nested_asset.write_bytes(b"meaningful workspace asset\n")
+
+    files, _ = workspace_snapshot(target_repo)
+
+    assert ".worktrees/stabilizing-prompts/retained-cycle/prompt.txt" not in files
+    assert files["fixtures/.worktrees/meaningful.txt"] == b"meaningful workspace asset\n"
+
+
 def test_tune_does_not_run_model_before_contract_confirmation(target_repo: Path) -> None:
     result = run_tune_with_fake_transport(
         target_repo,
