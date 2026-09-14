@@ -81,6 +81,15 @@ def test_tune_documents_confirmation_before_any_model_call(skill_text):
     assert "delivery confirmation gate" in tune
 
 
+def test_tune_documents_project_local_worktree_gate(skill_text):
+    tune = skill_text.split("## verify", 1)[0]
+    assert ".worktrees/stabilizing-prompts" in tune
+    assert "primary workspace" in tune
+    assert "git check-ignore" in tune
+    assert "never" in tune and "fall back" in tune
+    assert "--worktree" not in tune
+
+
 def test_tune_documents_cycle_worktree_continuity_and_acceptance_ownership(skill_text):
     tune = _section(skill_text, "## tune", "## verify")
     assert "same cycle" in tune

@@ -65,16 +65,26 @@ repository or worktree and is never taken from model output.
 ### 2. worktree
 
 - Inputs: the preflight snapshot and its stable `prompt_id`.
-- Command: `manage_worktree.py create --repo PATH --prompt-id ID --state PATH`.
-- Output: a persisted `WorktreeCycle` state with the dedicated worktree,
-  internal branch, original workspace identity, and immutable
-  `cycle_base_commit`.
+- Preflight: resolve the primary workspace identity, then reject a linked
+  worktree or detached `HEAD`. Derive the fixed target
+  `.worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/` inside the target
+  repository; never accept a caller-selected worktree path.
+- Ignore gate: run `git check-ignore --no-index --quiet` for the final target
+  directory before creating its parent, branch, or worktree. The target
+  repository's `.gitignore` is never modified automatically.
+- Command: `manage_worktree.py create --repo PATH --prompt-id ID --state PATH [--branch BRANCH]`.
+- Output: a persisted `WorktreeCycle` state with the dedicated project-local
+  worktree, internal or explicitly validated branch, original workspace
+  identity, and immutable `cycle_base_commit`.
 - Next: `contract/cases/adapter`, in this same worktree and cycle. Never make a
   second worktree for bootstrap or for candidate rounds. The worktree and
   branch are not automatically deleted.
-- Stop: reject a repository-root mismatch, a stale/invalid cycle, or a
-  critical dependency change; preserve the original workspace and report the
-  precise reason.
+- Stop: reject a repository-root mismatch, linked worktree, detached `HEAD`,
+  missing ignore coverage, stale/invalid cycle, or critical dependency change
+  before any model call. Fail closed: never fall back to tuning in the
+  original checkout. Preserve the original workspace and report the precise
+  reason; retained worktrees and branches require manual inspection or
+  cleanup.
 
 ### 3. contract/cases/adapter
 
@@ -309,7 +319,7 @@ validate_cases.py --eval-root PATH --schema MODULE:CLASS --output CASE_SUITE_JSO
 run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|acceptance|external --repeats N --manifest PATH [--mode tune|verify]
 score_results.py --manifest PATH --report PATH
 compare_runs.py --baseline PATH --candidate PATH --phase development|validation|acceptance --report PATH
-manage_worktree.py create --repo PATH --prompt-id ID --state PATH
+manage_worktree.py create --repo PATH --prompt-id ID --state PATH [--branch BRANCH]
 manage_worktree.py build-patch --state PATH --out PATCH --out-manifest PATCH_JSON --result success|failure
 manage_worktree.py apply-patch --state PATH --patch PATCH --patch-manifest PATCH_JSON
 ```

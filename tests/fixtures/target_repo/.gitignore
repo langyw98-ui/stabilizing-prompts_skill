@@ -1,3 +1,4 @@
+.worktrees/
 .prompt-evals/**/reports/
 .prompt-evals/**/.runtime/
 __pycache__/

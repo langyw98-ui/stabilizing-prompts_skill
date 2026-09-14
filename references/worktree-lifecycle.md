@@ -8,9 +8,29 @@ This reference preserves sections 12–15 of the approved design.
 
 用于在一个专用 worktree 和调优周期中连续建立或复用评测资产、建立基线并自动产生候选 Prompt。缺少有效评测资产时，`tune` 先执行内部初始化阶段；该阶段不是可独立调用或退出后再由另一次 `tune` 恢复的用户模式。
 
+每个 `tune` 周期都必须在目标仓库的 primary workspace 中通过以下
+fail-closed setup gate；不能从 linked worktree 或 detached `HEAD` 开始：
+
+```text
+resolve primary checkout identity
+-> reject linked worktree or detached HEAD
+-> derive .worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/
+-> verify that directory is ignored with git check-ignore
+-> create branch and worktree
+-> persist WorktreeCycle
+```
+
+最终 worktree 路径只能位于目标仓库的
+`.worktrees/stabilizing-prompts/` 下；调用方不能提供替代路径。必须在
+创建目录或分支前验证最终目录已被 Git 忽略，`.gitignore` never modified
+automatically。任何 primary-workspace、detached-HEAD、路径或 ignore gate
+失败都停止本周期，在任何 model call 前返回 setup error；never fall back
+to tuning in the original checkout。保留的 worktree 和 branch 需要用户
+手动检查或清理。
+
 完整流程：
 
-1. 验证 Python Git 工程中的单个 `.md` Prompt、相关文件 Git 状态并创建专用 worktree；
+1. 验证 Python Git 工程中的单个 `.md` Prompt、相关文件 Git 状态并完成上述 worktree gate；
 2. 追踪渲染、生产 Pydantic Schema、`ChatOpenAI` 结构化调用、下游业务和关键依赖；
 3. 若缺少有效评测资产，生成业务契约、开发集、验证集、验收集和覆盖矩阵；
 4. 验证固定 Conda `kds` 环境并生成或验证项目适配器；
@@ -140,7 +160,7 @@ the same `WorktreeCycle` and immutable `cycle_base_commit`. The cycle is
 created with:
 
 ```text
-manage_worktree.py create --repo PATH --prompt-id ID --state PATH
+manage_worktree.py create --repo PATH --prompt-id ID --state PATH [--branch BRANCH]
 ```
 
 After the user confirms the contract/cases/adapter and the fixed local-model

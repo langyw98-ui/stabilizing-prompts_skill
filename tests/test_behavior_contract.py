@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.local_model_client import safe_client_config
+from scripts.manage_worktree import WorktreeError
 from scripts.run_prompt_eval import _redacted, _safe_serialize
 from tests.integration_support import (
+    CountingTransport,
     build_target_repo,
     run_cli_chain,
     run_tune_with_fake_transport,
@@ -35,6 +39,43 @@ def test_delivery_rollback_restores_exact_targets_after_post_apply_failure(tmp_p
     assert result.stop_reason == "delivery_rollback"
     assert (target_repo / "prompts" / "classify.md").read_text(encoding="utf-8") == result.original_prompt
     assert not result.partially_delivered_paths
+
+
+def test_tune_rejects_unignored_project_local_worktree_before_model_call(
+    tmp_path: Path,
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo")
+    (target_repo / ".gitignore").write_text(
+        ".prompt-evals/**/reports/\n"
+        ".prompt-evals/**/.runtime/\n"
+        "__pycache__/\n"
+        "*.pyc\n",
+        encoding="utf-8",
+    )
+    transport = CountingTransport()
+
+    with pytest.raises(WorktreeError, match="not ignored"):
+        run_tune_with_fake_transport(target_repo, transport=transport)
+
+    assert transport.call_count == 0
+
+
+def test_tune_creates_project_local_worktree_before_model_call(tmp_path: Path) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo")
+    transport = CountingTransport(scenario="no-change")
+
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        transport=transport,
+    )
+
+    assert result.stop_reason == "no_change_needed"
+    assert transport.call_count > 0
+    worktree_root = target_repo / ".worktrees" / "stabilizing-prompts"
+    worktrees = tuple(worktree_root.iterdir())
+    assert len(worktrees) == 1
+    assert worktrees[0].is_dir()
 
 
 def test_token_redaction_survives_fixture_transport_and_reports(tmp_path: Path) -> None:
@@ -70,7 +111,12 @@ def test_failure_assets_never_include_candidate_text_or_token(tmp_path: Path) ->
     delivered_text = "\n".join(
         path.read_text(encoding="utf-8")
         for path in target_repo.rglob("*")
-        if path.is_file() and ".git" not in path.parts and ".runtime" not in path.parts
+        if (
+            path.is_file()
+            and ".git" not in path.parts
+            and ".runtime" not in path.parts
+            and ".worktrees" not in path.parts
+        )
     )
     assert result.candidate_prompt not in delivered_text
     assert "integration-sentinel-token" not in delivered_text
