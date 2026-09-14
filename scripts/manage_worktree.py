@@ -1389,7 +1389,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.prompt_id,
                 branch=args.branch,
             )
-            save_cycle(cycle, args.state)
+            try:
+                save_cycle(cycle, args.state)
+            except Exception as error:
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "error": str(error),
+                            "worktree": str(cycle.worktree),
+                            "branch": cycle.branch,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return 2
             print(json.dumps(cycle.to_dict(), ensure_ascii=False, sort_keys=True))
             return 0
         cycle = load_cycle(args.state)

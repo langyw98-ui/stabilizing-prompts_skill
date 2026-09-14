@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -723,3 +724,34 @@ def test_create_cli_rejects_worktree_option(
         )
 
     assert error.value.code == 2
+
+
+def test_create_cli_reports_created_identity_when_state_save_fails(
+    repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    original, prompt_id = repo
+
+    def fail_save(cycle: WorktreeCycle, path: Path) -> None:
+        raise OSError("state disk unavailable")
+
+    monkeypatch.setattr(manage_worktree, "save_cycle", fail_save)
+    result = main(
+        [
+            "create",
+            "--repo",
+            str(original),
+            "--prompt-id",
+            prompt_id,
+            "--state",
+            str(tmp_path / "state.json"),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 2
+    assert payload["status"] == "error"
+    assert Path(payload["worktree"]).is_dir()
+    assert payload["branch"].startswith("stabilizing-prompts/")
