@@ -116,15 +116,19 @@ Detached HEAD、无法解析的仓库身份或无法验证的 `HEAD` 同样是
 `manage_worktree.py create --worktree PATH`，Python API 删除
 `create_cycle(..., worktree=...)`。
 
-创建目录前，通过 Git 对一个不存在的哨兵路径执行 ignore 查询，例如：
+生成 `prompt-slug` 和 `cycle-id` 后、创建任何目录或分支前，通过 Git 对最终
+目标形状下一个不存在的哨兵路径执行 ignore 查询：
 
 ```text
-git check-ignore --no-index --quiet .worktrees/.stabilizing-prompts-probe
+git check-ignore --no-index --quiet -- \
+  .worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/.stabilizing-prompts-probe
 ```
 
-该命令只查询规则，不创建哨兵文件。查询不通过时返回 `setup_error`，并提示
-用户自行把 `.worktrees/` 加入 `.gitignore`、提交后重新运行。Skill 不修改或
-提交 `.gitignore`。
+该命令只查询规则，不创建哨兵文件。仓库 `.gitignore`、`.git/info/exclude` 或
+全局 excludes 中当前生效的任一规则都可以满足本地隔离门禁。实现可以额外使用
+`-v` 报告匹配规则来源，但不要求规则必须来自已提交的 `.gitignore`。查询不
+通过时返回 `setup_error`，并推荐用户自行把 `.worktrees/` 加入项目
+`.gitignore`、提交后重新运行。Skill 不修改或提交 `.gitignore`。
 
 如果 `.worktrees` 已存在但不是目录，或者解析后的目标目录逃逸
 `<repo>/.worktrees/`，返回 `setup_error`。ignore 门禁通过后，Skill 可以创建
@@ -132,21 +136,22 @@ git check-ignore --no-index --quiet .worktrees/.stabilizing-prompts-probe
 
 ### 5.3 分支和目录命名
 
-内部调优分支继续使用：
+未指定自定义分支时，内部调优分支继续使用：
 
 ```text
 stabilizing-prompts/<prompt-slug>-<cycle-id>
 ```
 
-对应 worktree 固定为：
+CLI 的 `--branch` 和 Python API 的 `branch=` 保持可用，但自定义值必须通过
+现有 Git 分支名和安全校验。无论是否指定自定义分支，对应 worktree 都固定为：
 
 ```text
 <repo>/.worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>
 ```
 
-`cycle-id` 保留当前随机唯一标识。它用于避免保留的旧目录或分支与下一周期
-重名，不代表支持并行调优。目标目录或分支已存在时返回 `setup_error`，不得
-猜测其所有权或自动复用。
+`cycle-id` 保留当前随机唯一标识。它用于避免保留的旧目录或默认分支与下一
+周期重名，不代表支持并行调优。自定义分支名不得参与 worktree 路径派生。目标
+目录或分支已存在时返回 `setup_error`，不得猜测其所有权或自动复用。
 
 ### 5.4 创建、状态和失败处理
 
@@ -238,11 +243,13 @@ obligations:
     required_splits:
       dev:
         - normal
-        - near_boundary
+        - boundary
       validation:
         - adversarial
       acceptance:
         - natural_variation
+    variant_exclusions:
+      conflict: 生产规则不存在可同时成立的冲突条件
 ```
 
 规则如下：
@@ -254,8 +261,28 @@ obligations:
 - `rule` 是可由完整预期对象判定的业务陈述；
 - `required_splits` 至少包含一个 split，每个 split 的 variant 列表非空且无
   重复；
-- critical 义务必须覆盖其业务适用的正常行为以及至少一种边界、冲突或对抗
-  变体；若某种变体不适用，必须通过类别级或义务级理由说明。
+- `variant_exclusions` 是可选映射，只能为未出现在 `required_splits` 中的固定
+  variant 提供非空义务级理由；
+- critical 义务必须在 `required_splits` 中包含 `normal`，并至少包含
+  `boundary`、`conflict` 或 `adversarial` 之一；这三种 critical variant 中其余
+  未声明者必须出现在 `variant_exclusions` 中。
+
+固定 variant 枚举为：
+
+```text
+normal
+boundary
+conflict
+ambiguity
+irrelevant
+fallback
+regression
+adversarial
+natural_variation
+```
+
+`variant` 只表达校验器需要理解的覆盖类型。更具体的业务前提和案例差异由
+`condition_id` 表达，不允许新增项目自定义 variant。
 
 ## 7. 案例结构、数量和唯一性
 
@@ -268,8 +295,12 @@ MIN_CASES_PER_SPLIT = 30
 ```
 
 `dev`、`validation` 和 `acceptance` 分别独立计算有效案例数。三个 split 不要求
-数量相同，也不设置上限。无效、硬重复或未解决的疑似近重复案例不计入最低
-数量。
+数量相同，也不设置上限。无效、硬重复或疑似近重复但缺少 `distinction` 的案例
+不计入最低数量。
+
+如果生产证据不足以支持任一 split 至少 30 条实质独立案例，本周期必须以
+`setup_error` 停止，并报告未达到门槛的 split 和数量。不得降低门槛、制造无
+依据义务或用同义改写补足数量。
 
 ### 7.2 案例覆盖元数据
 
@@ -279,7 +310,7 @@ MIN_CASES_PER_SPLIT = 30
 coverage:
   primary_obligation: reject-unrelated-question
   secondary_obligations: []
-  variant: near_boundary
+  variant: boundary
   condition_id: mentions-domain-keyword-but-intent-is-unrelated
   distinction: 与其他无关输入不同，本例包含领域关键词但真实意图仍在任务外
 ```
@@ -289,8 +320,8 @@ coverage:
 - 每条案例必须引用一个真实的 `primary_obligation`；
 - `secondary_obligations` 只能引用真实义务，用于报告而不贡献最低数量或义务
   配额；
-- `variant` 必须满足对应义务在该 split 声明的一个 variant，额外的有证据变体
-  可以记录，但不能替代必需 variant；
+- `variant` 必须属于固定枚举，并满足对应义务在该 split 声明的一个 variant；
+  具体的有证据变体使用不同 `condition_id` 记录，不能新增自定义 variant；
 - `condition_id` 描述产生独立业务判断的条件组合，采用稳定 slug；
 - `distinction` 在近重复审计命中或同一义务存在多个相近案例时说明实质差异。
 
@@ -322,10 +353,16 @@ coverage:
 3. 当非字符串叶子相同且字符串字符三元组 Jaccard 相似度达到或超过 `0.85`
    时，标记为疑似近重复。
 
-疑似近重复不是自动判定业务等价，但必须提供非空 `distinction`，说明不同的
-业务前提、决策边界或预期行为。只说明“换了一种说法”“使用不同措辞”不构成
-实质差异。未解决的疑似近重复不计数、不能贡献覆盖配额，并阻止资产冻结。
-`CASE_SUITE_JSON` 必须列出案例对、相似度和差异说明，供用户最终审阅。
+疑似近重复不是自动判定业务等价。命中案例必须提供非空 `distinction`，说明
+不同的业务前提、决策边界或预期行为；缺少说明时返回 `setup_error`，案例不
+计数且不能贡献覆盖配额。只说明“换了一种说法”或“使用不同措辞”不构成实质
+差异，但该语义判断由用户而不是确定性校验器完成。
+
+存在非空 `distinction` 时，校验保持 `status: valid`，同时输出
+`requires_user_review: true`。这些案例暂时计入预计有效数量和覆盖矩阵；
+`CASE_SUITE_JSON` 必须列出案例对、相似度和差异说明，供用户在确认门禁逐项
+审阅。用户接受全部差异说明后，案例才正式计数并冻结；用户不接受任一说明时，
+必须修改或删除相关案例，再重新运行校验和确认。无需新增逐 pair 裁决文件。
 
 ## 8. 覆盖义务生成和覆盖饱和
 
@@ -364,7 +401,7 @@ Codex 必须先完成覆盖义务，再生成案例：
 2. 每项义务的所有必需 split/variant 配额都已满足；
 3. 所有 fixed categories 均已标记 required 或有证据理由的 not_applicable；
 4. 所有 critical 义务完成其正常和适用的边界、冲突或对抗覆盖；
-5. 没有硬重复或未解决的疑似近重复；
+5. 没有硬重复，且所有疑似近重复均提供了待用户审阅的非空 `distinction`；
 6. 对 Schema、生产分支、业务契约、历史故障和输入边界完成一轮系统扫描后，
    没有尚未登记的、有证据支持的边界条件；
 7. coverage matrix 不存在缺口。
@@ -375,7 +412,8 @@ Codex 必须先完成覆盖义务，再生成案例：
 
 第 6 项由 Codex 在 coverage summary 中列出已扫描证据和未发现新增边界的结论，
 再由用户确认。校验器只对已声明义务和案例做机械校验，不能替代用户判断义务
-提取是否完整。
+提取是否完整。coverage summary 不新增独立项目资产；其扫描范围和结论记录在
+现有 confirmation record 中。
 
 ## 9. 校验输出和用户确认门禁
 
@@ -389,6 +427,8 @@ Codex 必须先完成覆盖义务，再生成案例：
 
 扩展后的 `CASE_SUITE_JSON` 至少包含：
 
+- 顶层 `status: valid|error`，不得增加第三种状态；
+- 是否存在待用户审阅近重复的 `requires_user_review` 布尔值；
 - 各 split 总数、有效数和不计数案例；
 - 各类别、义务、风险和 variant 的覆盖分布；
 - 缺失的 split/variant 配额；
@@ -403,14 +443,27 @@ Codex 必须先完成覆盖义务，再生成案例：
 - 任一 split 有效案例少于 30；
 - 未知义务、未知 variant 或非法类别；
 - 义务配额、critical 覆盖或类别声明不完整；
-- 硬重复或未解决的疑似近重复；
+- 硬重复，或疑似近重复缺少非空 `distinction`；
 - 无理由的 not_applicable；
 - expected object 无法由生产 Schema 验证；
 - 现有 ID、semantic/input leakage 或 Schema import 检查失败。
 
 用户确认门禁必须展示完整义务、全部案例、数量、覆盖矩阵、未适用理由、重复
-审计、固定重复次数和由实际案例数推导出的预计模型调用量。用户明确确认后才
-冻结资产并进入 probe/smoke。
+审计、固定重复次数和由实际案例数推导出的预计模型调用量。若
+`requires_user_review` 为 true，用户必须接受全部疑似近重复的差异说明；拒绝
+任一说明时返回案例生成步骤修订资产。用户明确确认后才冻结资产并进入
+probe/smoke。
+
+现有 confirmation record 还必须记录：
+
+- 本次扫描的仓库路径、测试集合和 Git 历史范围 `evidence_checked`；
+- 未发现其他有证据边界的 `saturation_statement`；
+- `coverage_obligations_hash` 和 `case_suite_hash`；
+- 用户已审阅近重复报告的确认标识。
+
+confirmation record 属于周期运行状态，不是新的项目资产、CLI 输入或交付项。
+覆盖义务或案例哈希变化时，旧 confirmation record 立即失效，必须重新生成并
+确认。
 
 若三个 split 的实际案例数分别为 `D`、`V`、`A`，确认材料至少展示：
 
@@ -443,7 +496,7 @@ paired acceptance slots = 10A + 10A
 
 - `scripts/manage_worktree.py`
   - 主工作区检测；
-  - `.worktrees/` ignore 门禁；
+  - 对实际目标形状执行 `.worktrees/` ignore 门禁；
   - 固定项目内目录；
   - 删除自定义 worktree 参数；
   - 将新资产加入交付白名单。
@@ -475,10 +528,13 @@ paired acceptance slots = 10A + 10A
 
 - 默认路径严格位于 `<repo>/.worktrees/stabilizing-prompts/...`；
 - `.worktrees/` 不存在但 ignore 规则覆盖时成功创建；
-- 未 ignore 时在创建分支和 worktree 前失败；
+- 实际目标形状未 ignore 时在创建分支和 worktree 前失败，包括根级哨兵被 ignore
+  但目标被否定规则重新包含的情况；
 - `.worktrees` 是文件或目标路径逃逸时失败；
 - linked worktree 启动被拒绝，submodule 不被误判；
 - CLI 和 Python API 不再接受任意 worktree 路径；
+- 默认和自定义分支均使用固定派生的 worktree 路径，自定义分支继续通过安全
+  校验；
 - 目录或分支冲突 fail closed；
 - 创建后原工作区不因 worktree 内容变脏；
 - `WorktreeCycle` 继续记录正确路径、分支和基准提交；
@@ -493,12 +549,19 @@ paired acceptance slots = 10A + 10A
 - secondary obligations 不贡献配额；
 - 未知义务、variant、category 或 source 失败；
 - 缺少必需 split/variant 配额失败；
-- critical 义务缺少适用边界、冲突或对抗覆盖失败；
+- 未知或自定义 variant 失败；
+- critical 义务缺少 `normal`、缺少至少一种边界/冲突/对抗覆盖，或缺少其他
+  critical variant 的排除理由时失败；
 - 类别缺失或 not_applicable 没有证据理由失败；
-- 疑似近重复阈值、Unicode 规范化、distinction 和审计输出具有确定性；
+- 疑似近重复阈值、Unicode 规范化、distinction 和审计输出具有确定性；缺少
+  distinction 时失败，存在说明时保持 `status: valid` 并设置
+  `requires_user_review`；
 - 同一义务跨 split 的不同实例可以通过；
 - 义务文件、三个 split 和 Schema 一起验证并生成稳定哈希；
 - `CASE_SUITE_JSON` 正确输出计数、覆盖缺口、重复审计和饱和状态；
+- confirmation record 绑定证据扫描摘要、义务哈希、案例哈希和近重复审阅确认，
+  但不成为新的交付资产；
+- 生产证据不足 30 条独立案例时以 `setup_error` 停止且不允许降低门槛；
 - 新资产进入冻结记录、asset commit、manifest 和交付白名单；
 - fake transport 集成测试反映实际案例数和固定 repeats，不发起真实模型请求；
 - 第一次模型调用前的任一资产失败都停止周期。
@@ -517,7 +580,8 @@ paired acceptance slots = 10A + 10A
 3. Skill 不修改或提交目标项目的 `.gitignore`；
 4. `dev`、`validation`、`acceptance` 各至少有 30 条有效案例；
 5. 达到 30 条后仍必须满足所有覆盖义务和覆盖饱和条件；
-6. 硬重复和未解决的疑似近重复不能用于满足数量或配额；
+6. 硬重复和缺少 `distinction` 的疑似近重复不能用于满足数量或配额；带说明的
+   疑似近重复必须经用户接受后才能冻结；
 7. 同一业务义务可以跨 split 验证，但案例实例必须不同；
 8. 覆盖义务、完整案例、未适用理由、重复审计和预计调用量在模型调用前由用户
    明确确认；
