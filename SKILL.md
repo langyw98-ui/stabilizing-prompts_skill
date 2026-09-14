@@ -82,7 +82,9 @@ repository or worktree and is never taken from model output.
   repository; never accept a caller-selected worktree path.
 - Ignore gate: run `git check-ignore --no-index --quiet` for the final target
   directory before creating its parent, branch, or worktree. The target
-  repository's `.gitignore` is never modified automatically.
+  Do not edit, stage, or commit the target repository's `.gitignore`. Before invoking `tune`, the user must establish an ignore rule that
+  covers `.worktrees/` (in the project rules, `.git/info/exclude`, or a global
+  excludes file); if the rule is missing, stop with `setup_error`.
 - Command: `manage_worktree.py create --repo PATH --prompt-id ID --state PATH [--branch BRANCH]`.
 - Output: a persisted `WorktreeCycle` state with the dedicated project-local
   worktree, internal or explicitly validated branch, original workspace
@@ -157,9 +159,8 @@ repository or worktree and is never taken from model output.
 
 - Inputs: frozen, validated assets and successful smoke evidence.
 - Action: commit the contract, configuration, three case files, adapter, and
-  any required evaluation ignore rules in the dedicated worktree. Keep
-  reports, raw responses, caches, and candidate files under ignored
-  `reports/`/`.runtime/`.
+  the confirmed evaluation assets in the dedicated worktree. Do not edit, stage, or commit the target repository's `.gitignore`; evaluation outputs
+  must remain under already-ignored `reports/`/`.runtime/` paths.
 - Output: an asset commit recorded in the cycle state and the immutable
   committed input hashes used by manifests.
 - Next: `dev/validation baseline`.
@@ -307,8 +308,10 @@ production prompt and performs no synchronization.
   candidate. The original worktree and branch remain for inspection.
 - Delivery-time stale-state guard: after model phases and immediately before
   synchronization, re-check the original `HEAD == cycle_base_commit`, final
-  worktree `HEAD`, and committed contract identity. A stale/invalid cycle,
-  `HEAD` drift, or worktree commit mismatch stops delivery. These guards run at
+  worktree `HEAD`, committed contract identity, and the fixed managed-root
+  path (`.worktrees/stabilizing-prompts/<cycle-dir>`). A stale/invalid,
+  legacy, or externally located cycle is rejected; it is not migrated. `HEAD`
+  drift or worktree commit mismatch also stops delivery. These guards run at
   delivery time and are not setup checks that promise to precede the first
   model call.
 - Safety/stop behavior: regenerate from trusted cycle state at delivery time;

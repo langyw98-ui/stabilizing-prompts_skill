@@ -42,7 +42,6 @@ SUCCESS_ALLOWLIST = {
     "acceptance-cases.yaml",
     "adapter.py",
     "optimization-history.yaml",
-    ".gitignore",
 }
 FAILURE_ALLOWLIST = SUCCESS_ALLOWLIST - {"prompt"}
 
@@ -99,7 +98,7 @@ def _git(
             check=False,
             capture_output=True,
         )
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise WorktreeError(f"unable to run git: {error}") from error
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
@@ -191,6 +190,57 @@ def _reject_worktree_path_links(root: Path, target: Path) -> None:
                 f"derived worktree path contains a symlink or junction: {current}"
             )
         current = current.parent
+
+
+def _validate_managed_worktree_path(
+    original_repo: Path,
+    worktree: Path,
+    *,
+    require_exists: bool = True,
+) -> Path:
+    """Validate a cycle path against the fixed project-local worktree root.
+
+    State files are untrusted transport data.  Check the lexical path before
+    resolving it so a symlink alias cannot become an apparently safe managed
+    path, then require the resolved path to remain a direct child of the
+    managed directory.
+    """
+
+    root = Path(original_repo).resolve(strict=False)
+    target = Path(worktree).absolute()
+    managed_parent = root / ".worktrees" / "stabilizing-prompts"
+    try:
+        relative = target.relative_to(managed_parent)
+    except ValueError as error:
+        raise WorktreeError(
+            "cycle worktree must be under the managed "
+            f".worktrees/stabilizing-prompts directory: {target}"
+        ) from error
+    if len(relative.parts) != 1 or relative.parts[0] in {"", ".", ".."}:
+        raise WorktreeError(
+            "cycle worktree must be a direct child of the managed "
+            f".worktrees/stabilizing-prompts directory: {target}"
+        )
+
+    _reject_worktree_path_links(root, target)
+    if managed_parent.exists() and not managed_parent.is_dir():
+        raise WorktreeError(f"managed worktree root is not a directory: {managed_parent}")
+    canonical_parent = managed_parent.resolve(strict=False)
+    canonical_target = target.resolve(strict=False)
+    if (
+        not _path_is_within(canonical_parent, root)
+        or not _path_is_within(canonical_target, canonical_parent)
+        or canonical_target.parent != canonical_parent
+    ):
+        raise WorktreeError(
+            "cycle worktree escapes the managed .worktrees/stabilizing-prompts directory"
+        )
+    if require_exists:
+        if not target.exists():
+            raise WorktreeError(f"managed cycle worktree does not exist: {target}")
+        if not target.is_dir():
+            raise WorktreeError(f"managed cycle worktree is not a directory: {target}")
+    return target
 
 
 def _normalize_relative(value: str, *, label: str = "path") -> str:
@@ -392,7 +442,9 @@ class WorktreeCycle:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "original_repo", Path(self.original_repo).resolve(strict=False))
-        object.__setattr__(self, "worktree", Path(self.worktree).resolve(strict=False))
+        # Keep the lexical worktree spelling so delivery can reject a symlink
+        # or reparse-point alias before resolving it to a safe-looking target.
+        object.__setattr__(self, "worktree", Path(self.worktree).absolute())
 
     @property
     def repo(self) -> Path:
@@ -420,6 +472,10 @@ class WorktreeCycle:
         required = ("original_repo", "worktree", "branch", "cycle_base_commit")
         if any(not isinstance(value.get(key), str) or not value[key] for key in required):
             raise WorktreeError("cycle state is missing required identity")
+        _validate_managed_worktree_path(
+            Path(str(value["original_repo"])),
+            Path(str(value["worktree"])),
+        )
         return cls(
             original_repo=Path(str(value["original_repo"])),
             worktree=Path(str(value["worktree"])),
@@ -435,14 +491,36 @@ class WorktreeCycle:
         )
 
 
+def _validate_managed_cycle(cycle: WorktreeCycle) -> None:
+    """Reject legacy or externally located cycle state before delivery."""
+
+    root = _repo_root(cycle.original_repo)
+    if root != cycle.original_repo:
+        raise WorktreeError("cycle original repository is not canonical")
+    _validate_managed_worktree_path(root, cycle.worktree)
+
+
 def _safe_slug(value: str) -> str:
     result = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
     return result or "prompt"
 
 
+def _validate_branch_name(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or "\x00" in value
+        or value.startswith("refs/")
+    ):
+        raise WorktreeError(f"invalid branch: {value!r}")
+    return value
+
+
 def _cycle_worktree_path(root: Path, prompt_id: str, identity: str) -> Path:
     root = Path(root).resolve(strict=False)
     expected_parent = root / ".worktrees" / "stabilizing-prompts"
+    if expected_parent.exists() and not expected_parent.is_dir():
+        raise WorktreeError(f".worktrees/stabilizing-prompts is not a directory: {expected_parent}")
     target = expected_parent / f"{_safe_slug(prompt_id)}-{identity}"
     _reject_worktree_path_links(root, target)
     target = target.resolve(strict=False)
@@ -488,6 +566,8 @@ def create_cycle(
 
     if not isinstance(prompt_id, str) or not prompt_id.strip():
         raise WorktreeError("prompt_id must be a non-empty string")
+    if branch is not None:
+        _validate_branch_name(branch)
     root = _repo_root(Path(original_repo))
     base = _primary_workspace_head(root)
     resolved_prompt: str | None
@@ -500,15 +580,10 @@ def create_cycle(
     identity = uuid.uuid4().hex[:12]
     slug = _safe_slug(prompt_id)
     selected_branch = branch if branch is not None else f"stabilizing-prompts/{slug}-{identity}"
+    _validate_branch_name(selected_branch)
     worktrees_root = root / ".worktrees"
     if worktrees_root.exists() and not worktrees_root.is_dir():
         raise WorktreeError(".worktrees is not a directory")
-    if (
-        not isinstance(selected_branch, str)
-        or not selected_branch.strip()
-        or selected_branch.startswith("refs/")
-    ):
-        raise WorktreeError(f"invalid branch: {selected_branch!r}")
     branch_result = _git(root, "check-ref-format", "--branch", selected_branch, check=False)
     if branch_result.returncode != 0:
         raise WorktreeError(f"invalid branch: {selected_branch}")
@@ -527,6 +602,28 @@ def create_cycle(
             "utf-8", "replace"
         ).strip()
         raise WorktreeError(f"unable to verify branch availability: {detail}")
+    namespace_result = _git(
+        root,
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads",
+        check=False,
+    )
+    if namespace_result.returncode != 0:
+        detail = (namespace_result.stderr or namespace_result.stdout).decode(
+            "utf-8", "replace"
+        ).strip()
+        raise WorktreeError(f"unable to verify branch namespace availability: {detail}")
+    existing_names = namespace_result.stdout.decode("utf-8", "replace").splitlines()
+    for existing_name in existing_names:
+        if (
+            existing_name.startswith(selected_branch + "/")
+            or selected_branch.startswith(existing_name + "/")
+        ):
+            raise WorktreeError(
+                "branch namespace collision: "
+                f"{selected_branch} conflicts with existing branch {existing_name}"
+            )
 
     selected_worktree = _cycle_worktree_path(root, prompt_id, identity)
     if selected_worktree.exists():
@@ -620,9 +717,6 @@ def _allowlist_paths(
         if entry == "prompt":
             if result == "success" and resolved_prompt is not None:
                 resolved.add(resolved_prompt)
-            continue
-        if entry == ".gitignore":
-            resolved.add(".gitignore")
             continue
         if entry in _ASSET_NAMES:
             if eval_prefix is None:
@@ -922,6 +1016,7 @@ def build_delivery_patch(
         raise TypeError("build_delivery_patch expects a WorktreeCycle")
     if result not in {"success", "failure"}:
         raise DeliveryError("delivery result must be success or failure")
+    _validate_managed_cycle(cycle)
     final = _final_commit(cycle, final_commit)
     _assert_prompt_contract_identity(cycle, final)
     changed = _changed_paths(cycle, final)
@@ -1140,6 +1235,9 @@ def preflight_patch(
 ) -> DeliveryPatch:
     """Validate allowlisted paths, source hashes, and ``git apply --check``."""
 
+    if not isinstance(cycle, WorktreeCycle):
+        raise TypeError("preflight_patch expects a WorktreeCycle")
+    _validate_managed_cycle(cycle)
     if patch is None:
         canonical = _canonical_delivery_patch(cycle, result="success")
     else:
@@ -1255,6 +1353,9 @@ def apply_delivery_patch(
 ) -> DeliveryPatch:
     """Preflight, apply without staging, verify, and rollback on any error."""
 
+    if not isinstance(cycle, WorktreeCycle):
+        raise TypeError("apply_delivery_patch expects a WorktreeCycle")
+    _validate_managed_cycle(cycle)
     prepared = preflight_patch(
         cycle,
         patch,

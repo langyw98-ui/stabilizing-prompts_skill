@@ -53,10 +53,15 @@ def test_workspace_snapshot_ignores_managed_worktree_but_captures_other_nested_w
     nested_asset.parent.mkdir(parents=True)
     nested_asset.write_bytes(b"meaningful workspace asset\n")
 
+    sibling_asset = target_repo / ".worktrees" / "other" / "meaningful.txt"
+    sibling_asset.parent.mkdir(parents=True)
+    sibling_asset.write_bytes(b"sibling workspace asset\n")
+
     files, _ = workspace_snapshot(target_repo)
 
     assert ".worktrees/stabilizing-prompts/retained-cycle/prompt.txt" not in files
     assert files["fixtures/.worktrees/meaningful.txt"] == b"meaningful workspace asset\n"
+    assert files[".worktrees/other/meaningful.txt"] == b"sibling workspace asset\n"
 
 
 def test_tune_does_not_run_model_before_contract_confirmation(target_repo: Path) -> None:

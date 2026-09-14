@@ -76,6 +76,17 @@ def _git_commit(repo: Path, message: str) -> None:
     _git(repo, "commit", "-m", message)
 
 
+def _establish_managed_worktree_ignore(repo: Path) -> None:
+    """Model the user's pre-run ignore setup without changing project files."""
+
+    exclude = repo / ".git" / "info" / "exclude"
+    existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+    if ".worktrees/" in existing.splitlines():
+        return
+    separator = "" if not existing or existing.endswith("\n") else "\n"
+    exclude.write_text(existing + separator + ".worktrees/\n", encoding="utf-8")
+
+
 def _purge_fixture_modules() -> None:
     """Prevent a prior temporary target package from leaking into a new test."""
 
@@ -221,6 +232,7 @@ def build_target_repo(path: Path, *, complete_assets: bool = False) -> Path:
     prompt_id = prompt_id_for_path(PROMPT_RELATIVE)
     _initial_contract(target, prompt_id)
     _git(target, "init")
+    _establish_managed_worktree_ignore(target)
     _git(target, "config", "user.email", "integration-tests@example.invalid")
     _git(target, "config", "user.name", "Offline Integration Tests")
     _git_commit(target, "fixture: create production prompt target")
@@ -401,7 +413,7 @@ def workspace_snapshot(repo: Path) -> tuple[dict[str, bytes], str]:
     Runtime bytecode/cache directories are intentionally excluded because they
     are ignored implementation artifacts, not assets that a tune cycle may
     deliver.  Retained linked checkouts under the managed project-local
-    ``.worktrees/`` subtree are excluded for the same reason.  The status
+    ``.worktrees/stabilizing-prompts/`` subtree are excluded for the same reason.  The status
     component still catches staged, unstaged, and untracked changes to all
     other tracked/visible assets.
     """
@@ -414,7 +426,7 @@ def workspace_snapshot(repo: Path) -> tuple[dict[str, bytes], str]:
             not path.is_file()
             or ".git" in relative_path.parts
             or "__pycache__" in relative_path.parts
-            or relative_path.parts[:1] == (".worktrees",)
+            or relative_path.parts[:2] == (".worktrees", "stabilizing-prompts")
         ):
             continue
         relative = relative_path.as_posix()

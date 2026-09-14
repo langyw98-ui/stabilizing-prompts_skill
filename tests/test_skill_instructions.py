@@ -101,6 +101,20 @@ def test_tune_documents_project_local_worktree_gate(skill_text):
     assert positions == sorted(positions)
 
 
+def test_tune_requires_user_ignore_setup_and_never_delivers_gitignore(skill_text):
+    tune = skill_text.split("## verify", 1)[0]
+    worktree = _section(tune, "### 2. worktree", "### 3. contract/cases/adapter")
+    asset_commit = _section(tune, "### 6. asset commit", "### 7. dev/validation baseline")
+
+    assert "user" in worktree
+    assert "before invoking `tune`" in worktree.casefold()
+    assert "`.worktrees/`" in worktree
+    assert "Do not edit, stage, or commit the target repository's `.gitignore`" in worktree
+    assert "any required evaluation ignore rules" not in asset_commit
+    assert "`.gitignore`" in asset_commit
+    assert "edit, stage, or commit" in asset_commit
+
+
 def test_tune_separates_delivery_stale_state_guard_from_setup_gate(skill_text):
     tune = skill_text.split("## verify", 1)[0]
     worktree = _section(tune, "### 2. worktree", "### 3. contract/cases/adapter")

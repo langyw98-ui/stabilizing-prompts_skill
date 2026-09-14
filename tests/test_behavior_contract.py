@@ -45,6 +45,7 @@ def test_tune_rejects_unignored_project_local_worktree_before_model_call(
     tmp_path: Path,
 ) -> None:
     target_repo = build_target_repo(tmp_path / "target-repo")
+    (target_repo / ".git" / "info" / "exclude").write_text("", encoding="utf-8")
     (target_repo / ".gitignore").write_text(
         ".prompt-evals/**/reports/\n"
         ".prompt-evals/**/.runtime/\n"
@@ -126,7 +127,8 @@ def test_failure_assets_never_include_candidate_text_or_token(tmp_path: Path) ->
             path.is_file()
             and ".git" not in path.parts
             and ".runtime" not in path.parts
-            and ".worktrees" not in path.parts
+            and path.relative_to(target_repo).parts[:2]
+            != (".worktrees", "stabilizing-prompts")
         )
     )
     assert result.candidate_prompt not in delivered_text

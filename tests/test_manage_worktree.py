@@ -12,6 +12,7 @@ import pytest
 
 from scripts import manage_worktree
 from scripts.manage_worktree import (
+    AllowlistError,
     FAILURE_ALLOWLIST,
     SUCCESS_ALLOWLIST,
     DeliveryConflict,
@@ -21,6 +22,7 @@ from scripts.manage_worktree import (
     apply_delivery_patch,
     build_delivery_patch,
     create_cycle,
+    load_cycle,
     main,
     preflight_patch,
 )
@@ -42,7 +44,12 @@ def snapshot_workspace(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in root.rglob("*")
-        if path.is_file() and ".git" not in path.parts and ".worktrees" not in path.parts
+        if (
+            path.is_file()
+            and ".git" not in path.parts
+            and path.relative_to(root).parts[:2]
+            != (".worktrees", "stabilizing-prompts")
+        )
     }
 
 
@@ -66,6 +73,9 @@ def snapshot_filesystem(root: Path) -> dict[str, tuple[str, object]]:
 def make_repo(path: Path) -> tuple[Path, str]:
     path.mkdir()
     git(path, "init")
+    (path / ".git" / "info" / "exclude").write_text(
+        ".worktrees/\n", encoding="utf-8"
+    )
     git(path, "config", "user.email", "tests@example.invalid")
     git(path, "config", "user.name", "Worktree Tests")
     prompt = path / "prompts" / "classify.md"
@@ -78,7 +88,7 @@ def make_repo(path: Path) -> tuple[Path, str]:
         "prompt_path: prompts/classify.md\n",
         encoding="utf-8",
     )
-    (path / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
+    (path / ".gitignore").write_text("", encoding="utf-8")
     git(path, "add", ".gitignore", "prompts/classify.md", ".prompt-evals")
     git(path, "commit", "-m", "initial prompt assets")
     return path, prompt_id
@@ -181,12 +191,101 @@ def test_cycle_uses_fixed_project_local_path(
     assert git(original, "status", "--short") == ""
 
 
+def test_gitignore_is_not_a_delivery_allowlist_entry(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    assert ".gitignore" not in SUCCESS_ALLOWLIST
+    assert ".gitignore" not in FAILURE_ALLOWLIST
+
+    with pytest.raises(AllowlistError, match="unsupported|allowlist|gitignore"):
+        build_delivery_patch(completed_cycle, {".gitignore"})
+
+
+def test_gitignore_change_is_never_built_or_delivered(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    original = completed_cycle.original_repo / ".gitignore"
+    before = original.read_bytes()
+    worktree_ignore = completed_cycle.worktree / ".gitignore"
+    worktree_ignore.write_text(
+        worktree_ignore.read_text(encoding="utf-8") + "should-not-be-delivered\n",
+        encoding="utf-8",
+    )
+    git(completed_cycle.worktree, "add", ".gitignore")
+    git(completed_cycle.worktree, "commit", "-m", "change target ignore rules")
+
+    patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST)
+
+    assert ".gitignore" not in patch.paths
+    apply_delivery_patch(completed_cycle, patch)
+    assert original.read_bytes() == before
+
+
+def test_loaded_cycle_rejects_external_worktree_before_delivery(
+    repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    original, prompt_id = repo
+    external = tmp_path / "legacy-worktree"
+    git(original, "worktree", "add", "-b", "legacy-cycle", str(external), "HEAD")
+    state = {
+        "original_repo": str(original),
+        "worktree": str(external),
+        "branch": "legacy-cycle",
+        "cycle_base_commit": git(original, "rev-parse", "HEAD"),
+        "prompt_id": prompt_id,
+        "prompt_path": "prompts/classify.md",
+    }
+    state_path = tmp_path / "legacy-state.json"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(WorktreeError, match=r"managed|\.worktrees/stabilizing-prompts"):
+        load_cycle(state_path)
+
+
+def test_delivery_rejects_external_worktree_cycle(
+    repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    original, prompt_id = repo
+    external = tmp_path / "external-worktree"
+    git(original, "worktree", "add", "-b", "external-cycle", str(external), "HEAD")
+    cycle = WorktreeCycle(
+        original_repo=original,
+        worktree=external,
+        branch="external-cycle",
+        cycle_base_commit=git(original, "rev-parse", "HEAD"),
+        prompt_id=prompt_id,
+        prompt_path="prompts/classify.md",
+    )
+
+    with pytest.raises(WorktreeError, match=r"managed|\.worktrees/stabilizing-prompts"):
+        build_delivery_patch(cycle)
+    with pytest.raises(WorktreeError, match=r"managed|\.worktrees/stabilizing-prompts"):
+        apply_delivery_patch(cycle)
+
+
+def test_loaded_cycle_rejects_symlink_alias_inside_managed_root(
+    repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    original, prompt_id = repo
+    cycle = create_cycle(original, prompt_id)
+    alias = cycle.worktree.parent / "alias"
+    _make_directory_symlink(alias, cycle.worktree)
+    state = cycle.to_dict()
+    state["worktree"] = str(alias)
+    state_path = tmp_path / "symlink-state.json"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(WorktreeError, match="symlink|junction|managed"):
+        load_cycle(state_path)
+
+
 def test_create_cycle_rejects_special_child_only_ignore(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original, prompt_id = make_repo(tmp_path / "repo")
     _freeze_cycle_uuid(monkeypatch)
     (original / ".gitignore").write_text(
         "**/.stabilizing-prompts-probe\n", encoding="utf-8"
     )
+    (original / ".git" / "info" / "exclude").write_text("", encoding="utf-8")
     git(original, "add", ".gitignore")
     git(original, "commit", "-m", "ignore only probe")
     before_branches = git(original, "branch", "--format=%(refname:short)")
@@ -230,11 +329,73 @@ def test_create_cycle_rejects_worktrees_file_before_git_add(
     assert snapshot_filesystem(original) == before_files
 
 
+def test_create_cycle_rejects_stabilizing_prompts_file_before_writes(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    _freeze_cycle_uuid(monkeypatch)
+    (original / ".worktrees").mkdir()
+    (original / ".worktrees" / "stabilizing-prompts").write_text(
+        "not a directory\n", encoding="utf-8"
+    )
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_filesystem(original)
+
+    with pytest.raises(WorktreeError, match=r"stabilizing-prompts.*directory"):
+        create_cycle(original, prompt_id)
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_filesystem(original) == before_files
+
+
+def test_create_cycle_rejects_nul_custom_branch_before_git_argument(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    calls: list[tuple[str, ...]] = []
+    real_git = manage_worktree._git
+
+    def recording_git(repo_path: Path, *arguments: str, **kwargs: object):
+        calls.append(arguments)
+        return real_git(repo_path, *arguments, **kwargs)
+
+    monkeypatch.setattr(manage_worktree, "_git", recording_git)
+
+    with pytest.raises(WorktreeError, match="invalid branch"):
+        create_cycle(original, prompt_id, branch="custom\x00branch")
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("existing", "requested"),
+    [
+        ("stabilizing-prompts", "stabilizing-prompts/new"),
+        ("stabilizing-prompts/new", "stabilizing-prompts"),
+    ],
+)
+def test_create_cycle_rejects_branch_namespace_collision_before_parent_creation(
+    repo: tuple[Path, str], existing: str, requested: str
+) -> None:
+    original, prompt_id = repo
+    git(original, "branch", existing)
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_filesystem(original)
+
+    with pytest.raises(WorktreeError, match="branch.*already exists|namespace"):
+        create_cycle(original, prompt_id, branch=requested)
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_filesystem(original) == before_files
+    assert not (original / ".worktrees").exists()
+
+
 def test_create_cycle_rejects_target_reincluded_by_negation_rule(
     repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     original, prompt_id = repo
     _freeze_cycle_uuid(monkeypatch)
+    (original / ".git" / "info" / "exclude").write_text("", encoding="utf-8")
     target_name = "classify--abc123-0123456789ab"
     (original / ".gitignore").write_text(
         ".worktrees/*\n"
@@ -408,6 +569,15 @@ def test_create_cycle_accepts_primary_submodule_checkout(tmp_path: Path) -> None
         "prompt-submodule",
     )
     git(superproject, "commit", "-am", "add prompt submodule")
+    module_exclude = (
+        superproject
+        / ".git"
+        / "modules"
+        / "prompt-submodule"
+        / "info"
+        / "exclude"
+    )
+    module_exclude.write_text(".worktrees/\n", encoding="utf-8")
 
     cycle = create_cycle(superproject / "prompt-submodule", prompt_id)
     assert cycle.original_repo == (superproject / "prompt-submodule").resolve()
