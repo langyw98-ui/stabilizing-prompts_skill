@@ -166,6 +166,33 @@ def _path_is_within(path: Path, parent: Path) -> bool:
         return False
 
 
+def _is_link_or_junction(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if is_junction is not None and is_junction():
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise WorktreeError(f"unable to inspect worktree path: {path}: {error}") from error
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _reject_worktree_path_links(root: Path, target: Path) -> None:
+    current = target
+    while current != root:
+        if not _path_is_within(current, root):
+            raise WorktreeError("derived worktree path escapes the original repository")
+        if _is_link_or_junction(current):
+            raise WorktreeError(
+                f"derived worktree path contains a symlink or junction: {current}"
+            )
+        current = current.parent
+
+
 def _normalize_relative(value: str, *, label: str = "path") -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise AllowlistError(f"{label} must be a concrete repository-relative path")
@@ -414,17 +441,26 @@ def _safe_slug(value: str) -> str:
 
 
 def _cycle_worktree_path(root: Path, prompt_id: str, identity: str) -> Path:
-    target = (
-        root / ".worktrees" / "stabilizing-prompts" / f"{_safe_slug(prompt_id)}-{identity}"
-    ).resolve(strict=False)
-    expected_parent = (root / ".worktrees" / "stabilizing-prompts").resolve(strict=False)
-    if target.parent != expected_parent:
+    root = Path(root).resolve(strict=False)
+    expected_parent = root / ".worktrees" / "stabilizing-prompts"
+    target = expected_parent / f"{_safe_slug(prompt_id)}-{identity}"
+    _reject_worktree_path_links(root, target)
+    target = target.resolve(strict=False)
+    expected_parent = expected_parent.resolve(strict=False)
+    if (
+        not _path_is_within(expected_parent, root)
+        or not _path_is_within(target, root)
+        or target.parent != expected_parent
+    ):
         raise WorktreeError("derived worktree path escapes .worktrees/stabilizing-prompts")
     return target
 
 
 def _require_ignored_worktree(root: Path, target: Path) -> None:
-    relative = target.relative_to(root).as_posix() + "/"
+    try:
+        relative = target.relative_to(root).as_posix() + "/"
+    except ValueError as error:
+        raise WorktreeError("derived worktree path escapes the original repository") from error
     result = _git(
         root,
         "check-ignore",

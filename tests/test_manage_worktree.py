@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 import uuid
@@ -42,6 +43,23 @@ def snapshot_workspace(root: Path) -> dict[str, bytes]:
         for path in root.rglob("*")
         if path.is_file() and ".git" not in path.parts and ".worktrees" not in path.parts
     }
+
+
+def snapshot_filesystem(root: Path) -> dict[str, tuple[str, object]]:
+    snapshot: dict[str, tuple[str, object]] = {}
+    for path in root.rglob("*"):
+        if ".git" in path.parts:
+            continue
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            snapshot[relative] = ("symlink", os.readlink(path))
+        elif path.is_dir():
+            snapshot[relative] = ("directory", "")
+        elif path.is_file():
+            snapshot[relative] = ("file", path.read_bytes())
+        else:
+            snapshot[relative] = ("other", "")
+    return snapshot
 
 
 def make_repo(path: Path) -> tuple[Path, str]:
@@ -131,6 +149,24 @@ def _freeze_cycle_uuid(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _make_directory_symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as symlink_error:
+        if os.name != "nt":
+            pytest.skip(f"directory symlinks are unavailable: {symlink_error}")
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        pytest.skip(f"directory junctions are unavailable: {detail}")
+
+
 def test_cycle_uses_fixed_project_local_path(
     repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -153,13 +189,13 @@ def test_create_cycle_rejects_special_child_only_ignore(tmp_path: Path, monkeypa
     git(original, "add", ".gitignore")
     git(original, "commit", "-m", "ignore only probe")
     before_branches = git(original, "branch", "--format=%(refname:short)")
-    before_files = snapshot_workspace(original)
+    before_files = snapshot_filesystem(original)
 
     with pytest.raises(WorktreeError, match="ignored"):
         create_cycle(original, prompt_id)
 
     assert git(original, "branch", "--format=%(refname:short)") == before_branches
-    assert snapshot_workspace(original) == before_files
+    assert snapshot_filesystem(original) == before_files
     assert not (original / ".worktrees").exists()
 
 
@@ -168,13 +204,13 @@ def test_create_cycle_api_rejects_removed_worktree_keyword(
 ) -> None:
     original, prompt_id = repo
     before_branches = git(original, "branch", "--format=%(refname:short)")
-    before_files = snapshot_workspace(original)
+    before_files = snapshot_filesystem(original)
 
     with pytest.raises(TypeError, match="worktree"):
         create_cycle(original, prompt_id, worktree=tmp_path / "custom")
 
     assert git(original, "branch", "--format=%(refname:short)") == before_branches
-    assert snapshot_workspace(original) == before_files
+    assert snapshot_filesystem(original) == before_files
 
 
 def test_create_cycle_rejects_worktrees_file_before_git_add(
@@ -184,13 +220,13 @@ def test_create_cycle_rejects_worktrees_file_before_git_add(
     _freeze_cycle_uuid(monkeypatch)
     (original / ".worktrees").write_text("not a directory\n", encoding="utf-8")
     before_branches = git(original, "branch", "--format=%(refname:short)")
-    before_files = snapshot_workspace(original)
+    before_files = snapshot_filesystem(original)
 
     with pytest.raises(WorktreeError, match=r"\.worktrees is not a directory"):
         create_cycle(original, prompt_id)
 
     assert git(original, "branch", "--format=%(refname:short)") == before_branches
-    assert snapshot_workspace(original) == before_files
+    assert snapshot_filesystem(original) == before_files
 
 
 def test_create_cycle_rejects_target_reincluded_by_negation_rule(
@@ -208,13 +244,13 @@ def test_create_cycle_rejects_target_reincluded_by_negation_rule(
     git(original, "add", ".gitignore")
     git(original, "commit", "-m", "re-include fixed target")
     before_branches = git(original, "branch", "--format=%(refname:short)")
-    before_files = snapshot_workspace(original)
+    before_files = snapshot_filesystem(original)
 
     with pytest.raises(WorktreeError, match="not ignored"):
         create_cycle(original, prompt_id)
 
     assert git(original, "branch", "--format=%(refname:short)") == before_branches
-    assert snapshot_workspace(original) == before_files
+    assert snapshot_filesystem(original) == before_files
 
 
 def test_create_cycle_rejects_existing_derived_target(
@@ -225,13 +261,13 @@ def test_create_cycle_rejects_existing_derived_target(
     target = original / ".worktrees" / "stabilizing-prompts" / "classify--abc123-0123456789ab"
     target.mkdir(parents=True)
     before_branches = git(original, "branch", "--format=%(refname:short)")
-    before_files = snapshot_workspace(original)
+    before_files = snapshot_filesystem(original)
 
     with pytest.raises(WorktreeError, match="already exists"):
         create_cycle(original, prompt_id)
 
     assert git(original, "branch", "--format=%(refname:short)") == before_branches
-    assert snapshot_workspace(original) == before_files
+    assert snapshot_filesystem(original) == before_files
 
 
 def test_create_cycle_rejects_existing_custom_branch(
@@ -241,13 +277,13 @@ def test_create_cycle_rejects_existing_custom_branch(
     _freeze_cycle_uuid(monkeypatch)
     git(original, "branch", "existing-cycle")
     before_branches = git(original, "branch", "--format=%(refname:short)")
-    before_files = snapshot_workspace(original)
+    before_files = snapshot_filesystem(original)
 
     with pytest.raises(WorktreeError, match="already exists"):
         create_cycle(original, prompt_id, branch="existing-cycle")
 
     assert git(original, "branch", "--format=%(refname:short)") == before_branches
-    assert snapshot_workspace(original) == before_files
+    assert snapshot_filesystem(original) == before_files
     assert not (
         original / ".worktrees" / "stabilizing-prompts" / "classify--abc123-0123456789ab"
     ).exists()
@@ -274,16 +310,67 @@ def test_create_cycle_rejects_invalid_custom_branch(
     original, prompt_id = repo
     _freeze_cycle_uuid(monkeypatch)
     before_branches = git(original, "branch", "--format=%(refname:short)")
-    before_files = snapshot_workspace(original)
+    before_files = snapshot_filesystem(original)
 
     with pytest.raises(WorktreeError, match="invalid branch"):
         create_cycle(original, prompt_id, branch=branch)
 
     assert git(original, "branch", "--format=%(refname:short)") == before_branches
-    assert snapshot_workspace(original) == before_files
+    assert snapshot_filesystem(original) == before_files
     assert not (
         original / ".worktrees" / "stabilizing-prompts" / "classify--abc123-0123456789ab"
     ).exists()
+
+
+@pytest.mark.parametrize("component", [".worktrees", "stabilizing-prompts"])
+def test_create_cycle_rejects_redirected_worktree_component_before_writes(
+    repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    original, prompt_id = repo
+    _freeze_cycle_uuid(monkeypatch)
+    external = tmp_path / "redirected"
+    external.mkdir()
+    if component == ".worktrees":
+        link = original / ".worktrees"
+    else:
+        (original / ".worktrees").mkdir()
+        link = original / ".worktrees" / "stabilizing-prompts"
+    _make_directory_symlink(link, external)
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_filesystem(original)
+    before_external = snapshot_filesystem(external)
+
+    with pytest.raises(WorktreeError, match="symlink|junction|escape"):
+        create_cycle(original, prompt_id)
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_filesystem(original) == before_files
+    assert snapshot_filesystem(external) == before_external
+
+
+def test_create_cycle_rejects_dangling_derived_target_before_writes(
+    repo: tuple[Path, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    _freeze_cycle_uuid(monkeypatch)
+    target_parent = original / ".worktrees" / "stabilizing-prompts"
+    target_parent.mkdir(parents=True)
+    target = target_parent / "classify--abc123-0123456789ab"
+    missing_target = target_parent / "missing-target"
+    missing_target.mkdir()
+    _make_directory_symlink(target, missing_target)
+    missing_target.rmdir()
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_filesystem(original)
+
+    with pytest.raises(WorktreeError, match="symlink|junction|exists"):
+        create_cycle(original, prompt_id)
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_filesystem(original) == before_files
 
 
 def test_create_cycle_rejects_linked_worktree_before_writes(
