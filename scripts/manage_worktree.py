@@ -40,6 +40,7 @@ SUCCESS_ALLOWLIST = {
     "dev-cases.yaml",
     "validation-cases.yaml",
     "acceptance-cases.yaml",
+    "coverage-obligations.yaml",
     "adapter.py",
     "optimization-history.yaml",
 }
@@ -52,6 +53,7 @@ _ASSET_NAMES = frozenset(
         "dev-cases.yaml",
         "validation-cases.yaml",
         "acceptance-cases.yaml",
+        "coverage-obligations.yaml",
         "adapter.py",
         "optimization-history.yaml",
     }

@@ -121,3 +121,35 @@ schema-valid rate, run accuracy, stable-case rate, both regression counts,
 case-level diffs, candidate diff when applicable, stop reason, and delivery
 gate result. No LLM judge, credential, authorization header, or runtime token
 is part of scoring or persisted reporting.
+
+## Coverage gate and planned call slots
+
+The coverage gate is completed before the first model call. First,
+`validate_cases.py` performs the mechanical audit of schemas, counts, hard
+duplicates, explained near duplicates, quotas, category declarations, critical
+coverage, and matrix completeness. Next, Codex scans production evidence and
+records a saturation statement; Codex and the user review scanned evidence,
+unregistered evidenced boundaries, near-duplicate distinctions, total call
+slots, and that statement. Only explicit user confirmation permits the model
+probe/smoke.
+
+The confirmation record binds the exact-byte
+`coverage_obligations_hash` and `case_suite_hash` and remains cycle state. It
+is not a project asset, a confirmation file, a coverage-summary asset, or a
+CLI input. If any frozen asset changes, the confirmation and all old runs are
+invalid and the gate must be repeated. The run manifest format remains
+unchanged; coverage obligation hashes are not manifest fields.
+
+For actual split sizes `D`, `V`, and `A`, the confirmation material shows at
+least the fixed planned slots:
+
+```text
+baseline slots = 5D + 5V
+one full promoted candidate round = 5D + 5V + affected-dev pre-run slots
+paired acceptance slots = 10A + 10A
+```
+
+These are planned call slots, not extra cases. Transport retries reuse the
+same slot, and an exhausted slot remains incomplete rather than being
+replaced by a successful call. The material also shows the smoke call,
+candidate-round limit, and early-stop conditions before user confirmation.

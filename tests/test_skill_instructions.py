@@ -81,6 +81,18 @@ def test_tune_documents_confirmation_before_any_model_call(skill_text):
     assert "delivery confirmation gate" in tune
 
 
+def test_tune_separates_mechanical_coverage_from_human_saturation(skill_text):
+    tune = skill_text.split("## `verify`", 1)[0]
+    mechanical = tune.index("mechanical coverage")
+    saturation = tune.index("saturation statement")
+    confirmation = tune.index("user confirmation")
+    probe = tune.index("model probe")
+    assert mechanical < saturation < confirmation < probe
+    assert "invalidate" in tune
+    assert "coverage_obligations_hash" in tune
+    assert "run manifest binds" not in tune
+
+
 def test_tune_documents_project_local_worktree_gate(skill_text):
     tune = skill_text.split("## verify", 1)[0]
     assert ".worktrees/stabilizing-prompts" in tune

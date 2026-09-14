@@ -111,6 +111,9 @@ def completed_cycle(repo: tuple[Path, str]) -> WorktreeCycle:
     (eval_dir / "optimization-history.yaml").write_text(
         "cycles:\n  - id: cycle-1\n", encoding="utf-8"
     )
+    (eval_dir / "coverage-obligations.yaml").write_text(
+        "version: 1\ncategories: []\nobligations: []\n", encoding="utf-8"
+    )
     (eval_dir / "reports").mkdir()
     (eval_dir / "reports" / "run.json").write_text("raw report\n", encoding="utf-8")
     (eval_dir / ".runtime").mkdir()
@@ -591,6 +594,24 @@ def test_success_allowlist_resolves_prompt_symbol_to_canonical_target(
     assert "prompts/classify.md" in patch.paths
     assert "prompt" not in patch.paths
     assert all(Path(path).is_absolute() is False for path in patch.paths)
+
+
+def test_success_and_failure_allowlists_include_coverage_obligations(
+    completed_cycle: WorktreeCycle,
+) -> None:
+    relative = (
+        f".prompt-evals/{completed_cycle.prompt_id}/coverage-obligations.yaml"
+    )
+
+    success = build_delivery_patch(
+        completed_cycle, SUCCESS_ALLOWLIST, result="success"
+    )
+    failure = build_delivery_patch(
+        completed_cycle, FAILURE_ALLOWLIST, result="failure"
+    )
+
+    assert relative in success.paths
+    assert relative in failure.paths
 
 
 def test_delivery_supports_prompt_path_with_spaces(

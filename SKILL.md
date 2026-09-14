@@ -39,6 +39,36 @@ confirmation gate is required for both success delivery and failure-asset-only
 delivery. A user cancellation at either gate stops with no model call or no
 synchronization, respectively.
 
+Coverage has two deliberately separate layers, and they run in this order:
+
+```text
+mechanical coverage audit
+  -> Codex evidence scan and saturation statement
+  -> user confirmation
+  -> model probe/smoke
+```
+
+The ownership boundary is:
+
+```text
+validate_cases.py:
+  validates schemas, counts, hard duplicates, explained near duplicates,
+  quotas, category declarations, critical coverage, and matrix completeness
+
+Codex + user:
+  review scanned evidence, unregistered evidenced boundaries, near-duplicate
+  distinctions, total call slots, and the saturation statement
+```
+
+The mechanical audit is evidence about the declared obligations and cases; it
+does not decide whether the evidence scan is saturated. Codex records the
+scan scope and its saturation statement, and the user confirms both before
+the model probe. The confirmation remains cycle state and binds
+`coverage_obligations_hash` and `case_suite_hash` alongside the other frozen
+asset identities. It is not a project asset or a CLI input. Any change to a
+frozen asset invalidates the confirmation and all old runs, so the assets must
+be audited and confirmed again before another model call.
+
 The state machine is:
 
 `preflight → worktree → contract/cases/adapter → user confirmation → model probe/smoke → asset commit → dev/validation baseline → no-change exit or candidate loop → candidate freeze → single acceptance activity → failure exit or delivery confirmation → worktree commit → allowlisted synchronization`
@@ -103,33 +133,49 @@ repository or worktree and is never taken from model output.
 
 - Inputs: production Pydantic Schema and renderer/call-chain evidence,
   dependency files, existing `prompt-contract.yaml`/`eval-config.yaml` when
-  valid, and any history that is already confirmed.
+  valid, any history that is already confirmed, and the frozen
+  `.prompt-evals/<prompt-id>/coverage-obligations.yaml` when present.
 - Command: `validate_cases.py --eval-root PATH --schema MODULE:CLASS --output CASE_SUITE_JSON`.
-  Validate all three split files together during asset construction; use the
-  selected-split behavior of the runner for later isolated runs.
+  Derive or update `coverage-obligations.yaml` from production evidence first,
+  then validate all three split files together during asset construction; use
+  the selected-split behavior of the runner for later isolated runs. This is
+  the mechanical coverage gate: it validates schemas, counts, hard duplicates,
+  explained near duplicates, quotas, category declarations, critical coverage,
+  and matrix completeness.
 - Output: a proposed `prompt-contract.yaml`, `eval-config.yaml`,
   `dev-cases.yaml`, `validation-cases.yaml`, `acceptance-cases.yaml`,
-  `adapter.py`, and a coverage matrix, plus `CASE_SUITE_JSON`. Every case has
-  a complete expected object validated by the production Schema; IDs and
-  semantic/input fingerprints are globally isolated across splits. The
-  adapter must expose production messages and Schema through `prepare_call`.
+  `coverage-obligations.yaml`, `adapter.py`, and a coverage matrix, plus
+  `CASE_SUITE_JSON`. Every case has a complete expected object validated by the
+  production Schema; IDs and semantic/input fingerprints are globally
+  isolated across splits. The adapter must expose production messages and
+  Schema through `prepare_call`. After the mechanical gate passes, Codex
+  scans the Schema, production branches, business contract, historical
+  failures, and input boundaries; Codex and the user review scanned evidence,
+  unregistered evidenced boundaries, near-duplicate distinctions, total call
+  slots, and the saturation statement.
 - Next: `user confirmation`. No acceptance case is run in this state.
 - Stop: pause for user adjudication on business evidence conflict or an
   uncertain truth. Invalid cases, Schema import, adapter fidelity, path
-  identity, or critical dependencies are `setup_error`; do not weaken cases,
+  identity, critical dependencies, an incomplete mechanical audit, or an
+  incomplete saturation statement are `setup_error`; do not weaken cases,
   duplicate the Schema, or continue to a model call.
 
 ### 4. user confirmation (contract confirmation gate)
 
-- Inputs: the proposed contract, complete case inputs/expected objects and
-  sources, split coverage matrix, adapter boundary, fixed `kds` command and
-  Python version, default repetitions (5 for development/validation, 10 for
-  acceptance), thresholds, and every stop condition.
+- Inputs: the proposed contract, frozen
+  `.prompt-evals/<prompt-id>/coverage-obligations.yaml`, complete case
+  inputs/expected objects and sources, split coverage matrix and mechanical
+  audit, the Codex evidence scan and saturation statement, adapter boundary,
+  fixed `kds` command and Python version, default repetitions (5 for
+  development/validation, 10 for acceptance), thresholds, and every stop
+  condition.
 - Action: show this material to the user and obtain an explicit confirmation.
-  Freeze the contract, all three datasets, adapter, and evaluation settings
-  only after confirmation.
+  The user reviews the mechanical audit separately from Codex's evidence and
+  saturation statement, then freezes the contract, coverage obligations, all
+  three datasets, adapter, and evaluation settings only after confirmation.
 - Output: a confirmation record tied to the cycle and hashes of the frozen
-  assets.
+  assets, including `coverage_obligations_hash` and `case_suite_hash`. The
+  record remains cycle state, not a project asset or a CLI input.
 - Next: `model probe/smoke` only on an affirmative answer.
 - Stop: a declined, ambiguous, or cancelled confirmation leaves assets
   uncalled and the original prompt untouched. Contract/cases/adapter user
@@ -137,7 +183,8 @@ repository or worktree and is never taken from model output.
 
 ### 5. model probe/smoke
 
-- Inputs: the frozen confirmation, Skill-local
+- Inputs: the frozen confirmation, including the coverage-obligation and case
+  suite hashes, Skill-local
   `.local/model-credentials.json`, the fixed client configuration, the
   production adapter, original prompt, and one development case.
 - API/command: use `build_client()` and `probe_model()` from
@@ -158,15 +205,17 @@ repository or worktree and is never taken from model output.
 ### 6. asset commit
 
 - Inputs: frozen, validated assets and successful smoke evidence.
-- Action: commit the contract, configuration, three case files, adapter, and
-  the confirmed evaluation assets in the dedicated worktree. Do not edit, stage, or commit the target repository's `.gitignore`; evaluation outputs
-  must remain under already-ignored `reports/`/`.runtime/` paths.
+- Action: commit the contract, configuration, three case files,
+  `.prompt-evals/<prompt-id>/coverage-obligations.yaml`, adapter, and the
+  confirmed evaluation assets in the dedicated worktree. Do not edit, stage, or commit the target repository's `.gitignore`; evaluation outputs must
+  remain under already-ignored `reports/`/`.runtime/` paths.
 - Output: an asset commit recorded in the cycle state and the immutable
   committed input hashes used by manifests.
 - Next: `dev/validation baseline`.
-- Stop: if an asset changed after confirmation, the commit cannot be made, or
-  its prompt identity is inconsistent, invalidate the old confirmation and
-  stop; do not silently rebuild a baseline.
+- Stop: if any frozen asset, including `coverage-obligations.yaml`, changed
+  after confirmation, the commit cannot be made, or its prompt identity is
+  inconsistent, invalidate the old confirmation and all old runs and stop;
+  do not silently rebuild a baseline.
 
 ### 7. dev/validation baseline
 
@@ -282,8 +331,9 @@ production prompt and performs no synchronization.
   candidate, update only the current Prompt hash/non-path fields in
   `prompt-contract.yaml`, and append compact failure/optimization history.
   On failure delivery, exclude the production Prompt and candidate. Commit the
-  selected deliverables in the same cycle worktree; never commit runtime
-  candidates, reports, raw responses, credentials, or tokens.
+  selected deliverables, including the confirmed
+  `coverage-obligations.yaml` when present, in the same cycle worktree; never
+  commit runtime candidates, reports, raw responses, credentials, or tokens.
 - Output: final committed worktree `HEAD` and a cycle state tied to the
   candidate/asset hashes.
 - Next: `allowlisted synchronization`.
@@ -304,8 +354,10 @@ production prompt and performs no synchronization.
 
 - Output: a freshly generated, result-specific allowlisted patch applied
   unstaged to the original workspace. Success may include the production
-  prompt and confirmed assets; failure excludes the production prompt and
-  candidate. The original worktree and branch remain for inspection.
+  prompt and confirmed assets, including
+  `.prompt-evals/<prompt-id>/coverage-obligations.yaml`; failure excludes the
+  production prompt and candidate but may deliver that confirmed asset. The
+  original worktree and branch remain for inspection.
 - Delivery-time stale-state guard: after model phases and immediately before
   synchronization, re-check the original `HEAD == cycle_base_commit`, final
   worktree `HEAD`, committed contract identity, and the fixed managed-root
@@ -348,6 +400,9 @@ The runner defaults to `--mode tune`; callers running the read-only workflow
 must pass `--mode verify`. A verify invocation rejects `--dataset acceptance`
 before opening any manifest or case file, importing the adapter, or
 constructing the model client.
+
+`validate_cases.py` consumes the frozen `coverage-obligations.yaml` during
+asset construction. Coverage obligations add no CLI option or command.
 
 ## verify
 

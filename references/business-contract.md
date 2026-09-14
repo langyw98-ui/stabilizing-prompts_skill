@@ -71,3 +71,39 @@ rebuild the baseline.
 The confirmation gate does not authorize production delivery. Acceptance
 success and failure-asset-only synchronization each require a separate,
 explicit delivery confirmation later in the same cycle.
+
+## Coverage obligation evidence and confirmation
+
+Before cases are generated, Codex derives the frozen
+`.prompt-evals/<prompt-id>/coverage-obligations.yaml` asset from production
+evidence. The target model cannot create obligations or expected business
+truth. The asset is reviewed with the contract, three case splits, adapter,
+and evaluation configuration, then committed and delivered by the existing
+success and failure-asset-only allowlists.
+
+The two coverage layers have separate owners:
+
+```text
+validate_cases.py:
+  validates schemas, counts, hard duplicates, explained near duplicates,
+  quotas, category declarations, critical coverage, and matrix completeness
+
+Codex + user:
+  review scanned evidence, unregistered evidenced boundaries, near-duplicate
+  distinctions, total call slots, and the saturation statement
+```
+
+`validate_cases.py` is the mechanical gate for declared coverage. After it
+passes, Codex scans the Schema, production branches, business contract,
+historical failures, and input boundaries, and records a saturation statement
+that no evidence-backed boundary remains unregistered. The user reviews that
+statement and the mechanical audit separately before confirming the frozen
+assets and permitting the model probe.
+
+The confirmation record remains cycle state. It binds
+`coverage_obligations_hash` and `case_suite_hash` in addition to the existing
+contract, adapter, configuration, and environment identities; it is not a
+project asset, confirmation file, coverage-summary asset, or CLI input. Any
+change to a frozen asset invalidates the confirmation and all old runs, which
+requires a fresh audit and user confirmation. The run manifest schema remains
+unchanged and does not contain the obligation hash.
