@@ -9,13 +9,14 @@ keep validation and acceptance data from leaking into development data.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import importlib
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 from typing import Any, Literal, TypeVar
 import unicodedata
@@ -349,6 +350,69 @@ class CoverageObligations(BaseModel):
         return self
 
 
+class CaseCoverage(BaseModel):
+    """Coverage identity and reporting references for one evaluation case."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    primary_obligation: str
+    secondary_obligations: list[str] = Field(default_factory=list)
+    variant: str
+    condition_id: str
+    distinction: str | None = None
+
+    @field_validator("primary_obligation", "variant", "condition_id")
+    @classmethod
+    def _require_non_blank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("secondary_obligations")
+    @classmethod
+    def _require_non_blank_secondary_obligations(
+        cls, value: list[str]
+    ) -> list[str]:
+        if any(not item.strip() for item in value):
+            raise ValueError("secondary_obligations entries must not be blank")
+        return value
+
+    @field_validator("variant")
+    @classmethod
+    def _require_fixed_variant(cls, value: str) -> str:
+        if value not in FIXED_VARIANTS:
+            raise ValueError(f"variant is unknown: {value!r}")
+        return value
+
+    @field_validator("condition_id")
+    @classmethod
+    def _require_slug_condition_id(cls, value: str) -> str:
+        if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value) is None:
+            raise ValueError(
+                "condition_id must be a lowercase stable slug containing only "
+                "letters, digits, and single hyphen separators"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_obligation_references(self) -> "CaseCoverage":
+        primary = _normalized_family(self.primary_obligation)
+        secondary = [_normalized_family(item) for item in self.secondary_obligations]
+        if not primary:
+            raise ValueError("primary_obligation must contain a letter or digit")
+        if any(not item for item in secondary):
+            raise ValueError(
+                "secondary_obligations entries must contain a letter or digit"
+            )
+        if len(secondary) != len(set(secondary)):
+            raise ValueError("secondary_obligations must not contain duplicates")
+        if primary in secondary:
+            raise ValueError(
+                "primary_obligation must not be repeated in secondary_obligations"
+            )
+        return self
+
+
 class EvalCase(BaseModel):
     """One complete, human-authored evaluation case."""
 
@@ -362,6 +426,7 @@ class EvalCase(BaseModel):
     priority: Literal["normal", "critical"] = "normal"
     dimensions: list[str]
     rationale: str
+    coverage: CaseCoverage
 
     @field_validator("id", "semantic_family", "rationale")
     @classmethod
@@ -450,12 +515,15 @@ def _split_paths(paths: object) -> dict[str, Path]:
             if name in result:
                 raise CaseSetupError(f"case split supplied more than once: {name}")
             result[name] = Path(raw_path)
-    elif isinstance(paths, Sequence) and not isinstance(paths, (str, bytes, bytearray)):
-        if len(paths) != 3:
+    elif isinstance(paths, Iterable) and not isinstance(
+        paths, (str, bytes, bytearray)
+    ):
+        values = tuple(paths)
+        if len(values) != 3:
             raise CaseSetupError(
                 "load_case_suite requires exactly three paths: dev, validation, acceptance"
             )
-        result = dict(zip(_SPLITS, (Path(path) for path in paths), strict=True))
+        result = dict(zip(_SPLITS, (Path(path) for path in values), strict=True))
     else:
         raise CaseSetupError(
             "load_case_suite paths must be a three-item sequence or split mapping"
@@ -559,6 +627,17 @@ def _normalized_family(value: str) -> str:
     return "".join(character for character in normalized if character.isalnum())
 
 
+def _scenario_key(case: EvalCase) -> tuple[str, str, str]:
+    """Return the normalized global identity for an evaluation scenario."""
+
+    coverage = case.coverage
+    return (
+        _normalized_family(coverage.primary_obligation),
+        _normalized_family(coverage.variant),
+        _normalized_family(coverage.condition_id),
+    )
+
+
 def _normalize_input_strings(value: object) -> object:
     """Recursively normalize only string content for input leak detection."""
 
@@ -644,6 +723,40 @@ def _parse_split(
     return tuple(parsed)
 
 
+def _validate_coverage_references(
+    case: EvalCase,
+    *,
+    split: str,
+    obligations: CoverageObligations,
+) -> None:
+    """Validate case obligation references against an explicit asset."""
+
+    by_id = {obligation.id: obligation for obligation in obligations.obligations}
+    coverage = case.coverage
+    primary = by_id.get(coverage.primary_obligation)
+    if primary is None:
+        raise CaseSetupError(
+            f"{split} case {case.id!r} references unknown primary obligation "
+            f"{coverage.primary_obligation!r}"
+        )
+
+    for secondary in coverage.secondary_obligations:
+        if secondary not in by_id:
+            raise CaseSetupError(
+                f"{split} case {case.id!r} references unknown secondary obligation "
+                f"{secondary!r}"
+            )
+
+    declared_variants = primary.required_splits.get(split, ())
+    if coverage.variant not in declared_variants:
+        declared = ", ".join(declared_variants) or "none"
+        raise CaseSetupError(
+            f"{split} case {case.id!r} coverage variant {coverage.variant!r} "
+            f"is not declared for primary obligation {primary.id!r} in {split} "
+            f"(declared: {declared})"
+        )
+
+
 def load_case_split(
     path: Path, schema: type[_SchemaT], split: str
 ) -> tuple[ValidatedCase, ...]:
@@ -691,7 +804,10 @@ def load_case_split(
 
 
 def load_case_suite(
-    paths: object, schema: type[_SchemaT]
+    paths: object,
+    schema: type[_SchemaT],
+    *,
+    obligations: CoverageObligations,
 ) -> CaseSuite:
     """Load three YAML case files and validate every expected production object.
 
@@ -699,6 +815,11 @@ def load_case_suite(
     keyed by those split names.  The returned expected values are live
     instances of ``schema`` for direct use by runner/scorer code.
     """
+
+    if not isinstance(obligations, CoverageObligations):
+        raise CaseSetupError(
+            "obligations must be an explicit CoverageObligations instance"
+        )
 
     try:
         is_schema = isinstance(schema, type) and issubclass(schema, BaseModel)
@@ -716,9 +837,13 @@ def load_case_suite(
     seen_families: dict[str, tuple[str, str]] = {}
     seen_inputs: dict[str, tuple[str, str]] = {}
     seen_normalized_inputs: dict[str, tuple[str, str]] = {}
+    seen_scenarios: dict[tuple[str, str, str], tuple[str, str]] = {}
     for split in _SPLITS:
         for validated in split_cases[split]:
             case = validated.case
+            _validate_coverage_references(
+                case, split=split, obligations=obligations
+            )
             previous_split = seen_ids.get(case.id)
             if previous_split is not None:
                 raise CaseSetupError(
@@ -748,9 +873,9 @@ def load_case_suite(
                 label=f"{split} case {case.id!r} input",
             )
             previous_input = seen_inputs.get(input_fingerprint)
-            if previous_input is not None and previous_input[0] != split:
+            if previous_input is not None:
                 raise CaseSetupError(
-                    "input fingerprint leakage across splits: "
+                    "duplicate input fingerprint: "
                     f"{case.id!r} in {split} conflicts with "
                     f"{previous_input[1]!r} in {previous_input[0]}"
                 )
@@ -770,6 +895,16 @@ def load_case_suite(
             seen_normalized_inputs.setdefault(
                 normalized_input_fingerprint, (split, case.id)
             )
+
+            scenario_key = _scenario_key(case)
+            previous_scenario = seen_scenarios.get(scenario_key)
+            if previous_scenario is not None:
+                raise CaseSetupError(
+                    "duplicate scenario key "
+                    f"{scenario_key!r}: {case.id!r} in {split} conflicts with "
+                    f"{previous_scenario[1]!r} in {previous_scenario[0]}"
+                )
+            seen_scenarios[scenario_key] = (split, case.id)
 
     return CaseSuite(
         dev=split_cases["dev"],
@@ -853,6 +988,27 @@ def _load_schema(reference: str, eval_root: Path) -> type[BaseModel]:
     if not is_schema:
         raise CaseSetupError(f"Schema {reference!r} must be a Pydantic BaseModel subclass")
     return value
+
+
+def _git_repository_root(start: Path) -> Path:
+    """Resolve the repository root containing an evaluation asset."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+    except OSError:
+        result = None
+    if result is not None and result.returncode == 0 and result.stdout.strip():
+        return Path(result.stdout.strip()).resolve(strict=False)
+    # Temporary unit-test evaluation roots are not Git repositories.  A real
+    # evaluation checkout takes the Git-derived branch above; keeping the root
+    # local here preserves the CLI contract for isolated fixtures.
+    return start
 
 
 _SENSITIVE_OUTPUT_KEY = {
@@ -957,8 +1113,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not eval_root.is_dir():
             raise CaseSetupError(f"evaluation root does not exist: {args.eval_root}")
         schema = _load_schema(args.schema_ref, eval_root)
+        obligations_path = eval_root / "coverage-obligations.yaml"
+        obligations = load_coverage_obligations(
+            obligations_path, _git_repository_root(eval_root)
+        )
         paths = tuple(eval_root / f"{split}-cases.yaml" for split in _SPLITS)
-        suite = load_case_suite(paths, schema)
+        suite = load_case_suite(paths, schema, obligations=obligations)
         payload = _suite_payload(suite, eval_root, args.schema_ref)
         _write_json(args.output, payload)
     except (CaseSetupError, OSError, ValueError, TypeError) as error:
@@ -976,6 +1136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "CaseSetupError",
     "CaseSuite",
+    "CaseCoverage",
     "CoverageCategory",
     "CoverageObligation",
     "CoverageObligations",
@@ -990,6 +1151,7 @@ __all__ = [
     "load_coverage_obligations",
     "load_case_split",
     "load_case_suite",
+    "_scenario_key",
     "main",
 ]
 

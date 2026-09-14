@@ -186,6 +186,13 @@ def _validated_case(case_id: str = "a") -> ValidatedCase:
         expect={"output": {"action": "accept", "reason": "matched"}},
         dimensions=["routing"],
         rationale="the evidence determines the expected decision",
+        coverage={
+            "primary_obligation": "classify-input",
+            "secondary_obligations": [],
+            "variant": "normal",
+            "condition_id": "runner-test-condition",
+            "distinction": None,
+        },
     )
     return ValidatedCase(
         case=value,
@@ -436,6 +443,17 @@ def test_cli_uses_task3_validation_and_canonical_expected_alias(tmp_path: Path, 
                         "priority": "normal",
                         "dimensions": ["routing"],
                         "rationale": "production evidence determines the expected decision",
+                        "coverage": {
+                            "primary_obligation": "classify-input",
+                            "secondary_obligations": [],
+                            "variant": {
+                                "dev": "normal",
+                                "validation": "boundary",
+                                "acceptance": "natural_variation",
+                            }[split],
+                            "condition_id": f"{split}-cli-condition",
+                            "distinction": None,
+                        },
                     }
                 ],
                 sort_keys=False,
@@ -554,6 +572,13 @@ def test_cli_loads_selected_non_acceptance_split_without_acceptance_file(
                     "priority": "normal",
                     "dimensions": ["routing"],
                     "rationale": "production evidence determines the expected decision",
+                    "coverage": {
+                        "primary_obligation": "classify-input",
+                        "secondary_obligations": [],
+                        "variant": "normal" if dataset == "dev" else "boundary",
+                        "condition_id": f"{dataset}-selected-condition",
+                        "distinction": None,
+                    },
                 }
             ],
             sort_keys=False,
@@ -720,6 +745,13 @@ def test_cli_acceptance_loads_acceptance_split_without_unrelated_splits(
                     "priority": "normal",
                     "dimensions": ["routing"],
                     "rationale": "production evidence determines the expected decision",
+                    "coverage": {
+                        "primary_obligation": "classify-input",
+                        "secondary_obligations": [],
+                        "variant": "natural_variation",
+                        "condition_id": "acceptance-selected-condition",
+                        "distinction": None,
+                    },
                 }
             ],
             sort_keys=False,

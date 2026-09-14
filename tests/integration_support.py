@@ -47,7 +47,12 @@ from scripts.run_prompt_eval import (
     pending_slots,
 )
 from scripts.score_results import RunMetrics, score_run
-from scripts.validate_cases import CaseSuite, EvalCase, load_case_suite
+from scripts.validate_cases import (
+    CaseSuite,
+    EvalCase,
+    load_case_suite,
+    load_coverage_obligations,
+)
 from scripts.validate_workspace import WorkspaceError, prompt_id_for_path, validate_workspace
 
 
@@ -116,6 +121,12 @@ def _case(
     action: Literal["accept", "reject"] = "accept",
     priority: Literal["normal", "critical"] = "normal",
 ) -> dict[str, object]:
+    split = case_id.split("-", 1)[0]
+    variant = {
+        "dev": "normal",
+        "validation": "boundary",
+        "acceptance": "natural_variation",
+    }.get(split, "normal")
     return {
         "id": case_id,
         "semantic_family": family,
@@ -133,6 +144,13 @@ def _case(
         "priority": priority,
         "dimensions": ["routing", "deterministic-fixture"],
         "rationale": "the fixture contract fixes this complete production decision",
+        "coverage": {
+            "primary_obligation": "classify-input",
+            "secondary_obligations": [],
+            "variant": variant,
+            "condition_id": f"{case_id}-condition",
+            "distinction": None,
+        },
     }
 
 
@@ -212,6 +230,47 @@ def _write_complete_assets(repo: Path, prompt_id: str) -> Path:
         {
             "repeats": {"development": 5, "validation": 5, "acceptance": 10},
             "thresholds": {"normal": {"development": 4, "acceptance": 9}},
+        },
+    )
+    _write_yaml(
+        eval_root / "coverage-obligations.yaml",
+        {
+            "version": 1,
+            "categories": [
+                {
+                    "category": category,
+                    "applicability": "required",
+                    "evidence_checked": [],
+                }
+                for category in (
+                    "normal_path",
+                    "output_partition",
+                    "near_boundary",
+                    "field_boundary",
+                    "conditional_branch",
+                    "conflict",
+                    "ambiguity",
+                    "irrelevant_input",
+                    "fallback",
+                    "historical_regression",
+                    "adversarial",
+                )
+            ],
+            "obligations": [
+                {
+                    "id": "classify-input",
+                    "source": ["target_app/production.py"],
+                    "category": "normal_path",
+                    "risk": "normal",
+                    "rule": "return the fixture routing decision",
+                    "required_splits": {
+                        "dev": ["normal"],
+                        "validation": ["boundary"],
+                        "acceptance": ["natural_variation"],
+                    },
+                    "variant_exclusions": {},
+                }
+            ],
         },
     )
     for split, cases in _case_sets().items():
@@ -484,9 +543,13 @@ def _load_fixture_assets(
     first_case = EvalCase.model_validate(raw[0])
     call = adapter(repo / PROMPT_RELATIVE, first_case)
     schema = call["schema"]
+    obligations = load_coverage_obligations(
+        eval_root / "coverage-obligations.yaml", repo
+    )
     suite = load_case_suite(
         tuple(eval_root / f"{split}-cases.yaml" for split in ("dev", "validation", "acceptance")),
         schema,
+        obligations=obligations,
     )
     return eval_root, adapter, suite, schema
 

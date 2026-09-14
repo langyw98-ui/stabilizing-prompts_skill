@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from collections.abc import Mapping
 from typing import Literal
 
 import pytest
@@ -11,13 +12,17 @@ import yaml
 from pydantic import BaseModel, Field, ValidationError
 
 from scripts.validate_cases import (
+    CaseCoverage,
     CaseSetupError,
     CaseSuite,
+    EvalCase,
     coverage_obligations_hash,
     dataset_hash,
+    load_case_split,
     load_coverage_obligations,
     load_case_suite,
     main,
+    _scenario_key,
 )
 
 
@@ -47,6 +52,19 @@ def _case(
         "priority": "normal",
         "dimensions": ["routing"],
         "rationale": "the evidence determines the expected decision",
+        "coverage": {
+            "primary_obligation": "classify-input",
+            "secondary_obligations": [],
+            "variant": (
+                "boundary"
+                if case_id.startswith("validation-")
+                else "natural_variation"
+                if case_id.startswith("acceptance-")
+                else "normal"
+            ),
+            "condition_id": f"{case_id}-condition",
+            "distinction": None,
+        },
     }
     value.update(extra)
     return value
@@ -102,6 +120,58 @@ def write_obligations(root: Path, payload: dict[str, object]) -> Path:
     path = root / "coverage-obligations.yaml"
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return path
+
+
+@pytest.fixture
+def coverage_obligations(tmp_path: Path):
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["required_splits"] = {
+        "dev": ["normal", "boundary", "natural_variation"],
+        "validation": ["normal", "boundary", "natural_variation"],
+        "acceptance": ["normal", "boundary", "natural_variation"],
+    }
+    return load_coverage_obligations(
+        write_obligations(tmp_path, payload), tmp_path
+    )
+
+
+@pytest.fixture
+def case_files(tmp_path: Path) -> dict[str, Path]:
+    paths = write_case_sets(tmp_path)
+    return dict(zip(("dev", "validation", "acceptance"), paths, strict=True))
+
+
+@pytest.fixture
+def output_schema():
+    return Decision
+
+
+def read_cases(path: Path) -> list[dict[str, object]]:
+    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(value, list)
+    return value
+
+
+def write_cases(path: Path, cases: list[dict[str, object]]) -> None:
+    path.write_text(yaml.safe_dump(cases, sort_keys=False), encoding="utf-8")
+
+
+def remove_coverage(path: Path, *, case_id: str) -> None:
+    cases = read_cases(path)
+    next(case for case in cases if case["id"] == case_id).pop("coverage")
+    write_cases(path, cases)
+
+
+def duplicate_scenario_with_new_input(
+    case_files: Mapping[str, Path], *, source_split: str, target_split: str
+) -> None:
+    source = read_cases(case_files[source_split])[0]
+    target_cases = read_cases(case_files[target_split])
+    target_cases[0]["coverage"] = dict(source["coverage"])
+    target_cases[0]["input"] = {
+        "variables": {"text": "different wording only"}, "context": {}
+    }
+    write_cases(case_files[target_split], target_cases)
 
 
 def test_coverage_obligations_require_every_fixed_category(tmp_path: Path) -> None:
@@ -478,21 +548,185 @@ def write_case_sets(
     )
 
 
-def test_requires_complete_schema_object(tmp_path: Path) -> None:
+def test_case_coverage_metadata_is_required_and_parsed(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    suite = load_case_suite(
+        case_files.values(), output_schema, obligations=coverage_obligations
+    )
+
+    coverage = suite.dev[0].case.coverage
+    assert isinstance(coverage, CaseCoverage)
+    assert coverage.primary_obligation == "classify-input"
+    assert _scenario_key(suite.dev[0].case) == (
+        "classifyinput",
+        "normal",
+        "dev1condition",
+    )
+
+
+def test_case_requires_coverage_metadata(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    remove_coverage(case_files["dev"], case_id="dev-1")
+
+    with pytest.raises(CaseSetupError, match="coverage"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=coverage_obligations
+        )
+
+
+def test_load_case_split_validates_coverage_without_opening_obligations(
+    case_files, output_schema
+) -> None:
+    parsed = load_case_split(case_files["dev"], output_schema, "dev")
+
+    assert parsed[0].case.coverage.variant == "normal"
+
+
+def test_global_scenario_key_rejects_wording_only_variation(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    duplicate_scenario_with_new_input(
+        case_files, source_split="dev", target_split="validation"
+    )
+
+    with pytest.raises(CaseSetupError, match="scenario key"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=coverage_obligations
+        )
+
+
+def test_global_scenario_key_allows_substantive_variant_and_condition_changes(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    suite = load_case_suite(
+        case_files.values(), output_schema, obligations=coverage_obligations
+    )
+
+    assert len({_scenario_key(item.case) for item in suite.all_cases}) == 3
+
+
+def test_secondary_obligations_never_change_scenario_identity() -> None:
+    base = _case("dev-1", "routing-dev")
+    with_secondary = _case("dev-2", "routing-dev-2")
+    with_secondary["coverage"] = {
+        **base["coverage"],
+        "secondary_obligations": ["other-obligation"],
+    }
+
+    second = CaseCoverage.model_validate(with_secondary["coverage"])
+    assert second.secondary_obligations == ["other-obligation"]
+
+    first_case = EvalCase.model_validate(base)
+    second_case = EvalCase.model_validate(with_secondary)
+    assert _scenario_key(first_case) == _scenario_key(second_case)
+
+
+def test_case_coverage_rejects_non_slug_condition_id(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    cases = read_cases(case_files["dev"])
+    cases[0]["coverage"]["condition_id"] = "not a stable slug"
+    write_cases(case_files["dev"], cases)
+
+    with pytest.raises(CaseSetupError, match="condition_id"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=coverage_obligations
+        )
+
+
+def test_case_coverage_rejects_duplicate_secondary_or_primary_reference(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    cases = read_cases(case_files["dev"])
+    cases[0]["coverage"]["secondary_obligations"] = [
+        "classify-input",
+        "classify-input",
+    ]
+    write_cases(case_files["dev"], cases)
+
+    with pytest.raises(CaseSetupError, match="secondary_obligations"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=coverage_obligations
+        )
+
+
+def test_case_coverage_rejects_unknown_primary_obligation(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    cases = read_cases(case_files["dev"])
+    cases[0]["coverage"]["primary_obligation"] = "unknown-obligation"
+    write_cases(case_files["dev"], cases)
+
+    with pytest.raises(CaseSetupError, match="unknown primary obligation"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=coverage_obligations
+        )
+
+
+def test_case_coverage_rejects_unknown_secondary_obligation(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    cases = read_cases(case_files["dev"])
+    cases[0]["coverage"]["secondary_obligations"] = ["unknown-obligation"]
+    write_cases(case_files["dev"], cases)
+
+    with pytest.raises(CaseSetupError, match="unknown secondary obligation"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=coverage_obligations
+        )
+
+
+def test_case_coverage_rejects_unknown_fixed_variant(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    cases = read_cases(case_files["dev"])
+    cases[0]["coverage"]["variant"] = "project-specific"
+    write_cases(case_files["dev"], cases)
+
+    with pytest.raises(CaseSetupError, match="variant"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=coverage_obligations
+        )
+
+
+def test_rejects_exact_duplicate_inputs_within_one_split(
+    tmp_path: Path, coverage_obligations
+) -> None:
+    paths = write_case_sets(tmp_path)
+    cases = read_cases(paths[0])
+    duplicate = dict(cases[0])
+    duplicate["id"] = "dev-2"
+    duplicate["semantic_family"] = "independent-dev-family"
+    duplicate["coverage"] = {
+        **cases[0]["coverage"],
+        "condition_id": "another-condition",
+    }
+    cases.append(duplicate)
+    write_cases(paths[0], cases)
+
+    with pytest.raises(CaseSetupError, match="input fingerprint"):
+        load_case_suite(paths, Decision, obligations=coverage_obligations)
+
+
+def test_requires_complete_schema_object(tmp_path: Path, coverage_obligations) -> None:
     paths = write_case_sets(tmp_path, dev_expect={"action": "accept"})
 
     with pytest.raises(CaseSetupError, match="reason"):
-        load_case_suite(paths, Decision)
+        load_case_suite(paths, Decision, obligations=coverage_obligations)
 
 
-def test_rejects_duplicate_ids_and_cross_split_family_leakage(tmp_path: Path) -> None:
+def test_rejects_duplicate_ids_and_cross_split_family_leakage(
+    tmp_path: Path, coverage_obligations
+) -> None:
     duplicate_paths = write_case_sets(
         tmp_path / "duplicate",
         validation=[_case("dev-1", "different-family")],
     )
 
     with pytest.raises(CaseSetupError, match="duplicate.*id"):
-        load_case_suite(duplicate_paths, Decision)
+        load_case_suite(duplicate_paths, Decision, obligations=coverage_obligations)
 
     leaking_paths = write_case_sets(
         tmp_path / "leaking",
@@ -500,10 +734,12 @@ def test_rejects_duplicate_ids_and_cross_split_family_leakage(tmp_path: Path) ->
     )
 
     with pytest.raises(CaseSetupError, match="semantic family"):
-        load_case_suite(leaking_paths, Decision)
+        load_case_suite(leaking_paths, Decision, obligations=coverage_obligations)
 
 
-def test_rejects_exact_duplicate_inputs_across_splits(tmp_path: Path) -> None:
+def test_rejects_exact_duplicate_inputs_across_splits(
+    tmp_path: Path, coverage_obligations
+) -> None:
     paths = write_case_sets(
         tmp_path,
         validation=[
@@ -517,11 +753,11 @@ def test_rejects_exact_duplicate_inputs_across_splits(tmp_path: Path) -> None:
     )
 
     with pytest.raises(CaseSetupError, match="input fingerprint"):
-        load_case_suite(paths, Decision)
+        load_case_suite(paths, Decision, obligations=coverage_obligations)
 
 
 def test_rejects_recursively_normalized_duplicate_inputs_across_splits(
-    tmp_path: Path,
+    tmp_path: Path, coverage_obligations
 ) -> None:
     paths = write_case_sets(
         tmp_path,
@@ -544,13 +780,15 @@ def test_rejects_recursively_normalized_duplicate_inputs_across_splits(
     paths[0].write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
     with pytest.raises(CaseSetupError, match="input fingerprint"):
-        load_case_suite(paths, Decision)
+        load_case_suite(paths, Decision, obligations=coverage_obligations)
 
 
-def test_loads_all_splits_with_validated_production_models(tmp_path: Path) -> None:
+def test_loads_all_splits_with_validated_production_models(
+    tmp_path: Path, coverage_obligations
+) -> None:
     paths = write_case_sets(tmp_path)
 
-    suite = load_case_suite(paths, Decision)
+    suite = load_case_suite(paths, Decision, obligations=coverage_obligations)
 
     assert isinstance(suite, CaseSuite)
     assert [item.case.id for item in suite.dev] == ["dev-1"]
@@ -562,7 +800,7 @@ def test_loads_all_splits_with_validated_production_models(tmp_path: Path) -> No
 
 
 def test_accepts_complete_expected_object_using_production_alias(
-    tmp_path: Path,
+    tmp_path: Path, coverage_obligations
 ) -> None:
     alias_output = {"actionType": "accept", "reason": "matched"}
     paths = write_case_sets(
@@ -586,7 +824,7 @@ def test_accepts_complete_expected_object_using_production_alias(
         ],
     )
 
-    suite = load_case_suite(paths, AliasedDecision)
+    suite = load_case_suite(paths, AliasedDecision, obligations=coverage_obligations)
 
     expected = suite.dev[0].expected
     assert isinstance(expected, AliasedDecision)
@@ -595,17 +833,19 @@ def test_accepts_complete_expected_object_using_production_alias(
     assert expected.model_fields_set == {"action", "reason"}
 
 
-def test_rejects_unknown_case_fields(tmp_path: Path) -> None:
+def test_rejects_unknown_case_fields(tmp_path: Path, coverage_obligations) -> None:
     paths = write_case_sets(tmp_path)
     raw = yaml.safe_load(paths[0].read_text(encoding="utf-8"))
     raw[0]["unexpected"] = True
     paths[0].write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
     with pytest.raises(CaseSetupError, match="unexpected"):
-        load_case_suite(paths, Decision)
+        load_case_suite(paths, Decision, obligations=coverage_obligations)
 
 
-def test_dataset_hash_is_stable_for_yaml_case_order(tmp_path: Path) -> None:
+def test_dataset_hash_is_stable_for_yaml_case_order(
+    tmp_path: Path, coverage_obligations
+) -> None:
     first = write_case_sets(tmp_path / "first")
     second = write_case_sets(tmp_path / "second")
 
@@ -613,34 +853,42 @@ def test_dataset_hash_is_stable_for_yaml_case_order(tmp_path: Path) -> None:
     raw[0]["input"] = {"context": {}, "variables": {"split": "dev"}}
     second[0].write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
-    assert dataset_hash(load_case_suite(first, Decision)) == dataset_hash(
-        load_case_suite(second, Decision)
+    assert dataset_hash(
+        load_case_suite(first, Decision, obligations=coverage_obligations)
+    ) == dataset_hash(
+        load_case_suite(second, Decision, obligations=coverage_obligations)
     )
 
 
-def test_dataset_hash_changes_when_expected_output_changes(tmp_path: Path) -> None:
+def test_dataset_hash_changes_when_expected_output_changes(
+    tmp_path: Path, coverage_obligations
+) -> None:
     first = write_case_sets(tmp_path / "first")
     second = write_case_sets(tmp_path / "second")
     raw = yaml.safe_load(second[0].read_text(encoding="utf-8"))
     raw[0]["expect"]["output"]["reason"] = "different"
     second[0].write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
-    assert dataset_hash(load_case_suite(first, Decision)) != dataset_hash(
-        load_case_suite(second, Decision)
+    assert dataset_hash(
+        load_case_suite(first, Decision, obligations=coverage_obligations)
+    ) != dataset_hash(
+        load_case_suite(second, Decision, obligations=coverage_obligations)
     )
 
 
 def test_case_validation_cli_writes_machine_readable_suite(
-    tmp_path: Path,
+    tmp_path: Path, coverage_obligations
 ) -> None:
-    paths = write_case_sets(tmp_path / "eval")
+    eval_root = tmp_path / "eval"
+    paths = write_case_sets(eval_root)
+    write_obligations(eval_root, complete_obligations_payload())
     output = tmp_path / "suite.json"
 
     assert (
         main(
             [
                 "--eval-root",
-                str(tmp_path / "eval"),
+                    str(eval_root),
                 "--schema",
                 "tests.test_validate_cases:Decision",
                 "--output",
@@ -653,7 +901,9 @@ def test_case_validation_cli_writes_machine_readable_suite(
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["status"] == "valid"
     assert payload["schema"] == "tests.test_validate_cases:Decision"
-    assert payload["dataset_hash"] == dataset_hash(load_case_suite(paths, Decision))
+    assert payload["dataset_hash"] == dataset_hash(
+        load_case_suite(paths, Decision, obligations=coverage_obligations)
+    )
     assert [item["id"] for item in payload["splits"]["dev"]] == ["dev-1"]
     assert payload["splits"]["dev"][0]["expect"]["output"] == {
         "action": "accept",
