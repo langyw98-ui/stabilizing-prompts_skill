@@ -21,11 +21,261 @@ from typing import Any, Literal, TypeVar
 import unicodedata
 
 import yaml
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class CaseSetupError(ValueError):
     """Raised when case files cannot form a valid evaluation dataset."""
+
+
+FIXED_CATEGORIES = frozenset(
+    {
+        "normal_path",
+        "output_partition",
+        "near_boundary",
+        "field_boundary",
+        "conditional_branch",
+        "conflict",
+        "ambiguity",
+        "irrelevant_input",
+        "fallback",
+        "historical_regression",
+        "adversarial",
+    }
+)
+FIXED_VARIANTS = frozenset(
+    {
+        "normal",
+        "boundary",
+        "conflict",
+        "ambiguity",
+        "irrelevant",
+        "fallback",
+        "regression",
+        "adversarial",
+        "natural_variation",
+    }
+)
+MIN_CASES_PER_SPLIT = 30
+_SPLITS = ("dev", "validation", "acceptance")
+
+# This alias intentionally keeps the split and variant values open at the
+# model boundary.  The model validators below enforce the fixed variant set so
+# validation errors can identify the offending field and value.
+RequiredSplits = dict[
+    Literal["dev", "validation", "acceptance"], list[str]
+]
+
+
+class CoverageCategory(BaseModel):
+    """A fixed coverage category and its evidence-backed applicability."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    category: str
+    applicability: Literal["required", "not_applicable"]
+    evidence_checked: list[str] = Field(default_factory=list)
+    rationale: str | None = None
+
+    @field_validator("category")
+    @classmethod
+    def _require_fixed_category(cls, value: str) -> str:
+        if value not in FIXED_CATEGORIES:
+            raise ValueError(f"category is unknown: {value!r}")
+        return value
+
+    @field_validator("evidence_checked")
+    @classmethod
+    def _require_evidence_entries(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() for item in value):
+            raise ValueError("evidence_checked entries must not be blank")
+        return value
+
+    @field_validator("rationale")
+    @classmethod
+    def _require_non_blank_rationale(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("rationale must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def _require_not_applicable_evidence(self) -> "CoverageCategory":
+        if self.applicability == "not_applicable":
+            if not self.evidence_checked:
+                raise ValueError(
+                    "not_applicable category requires non-empty evidence_checked"
+                )
+            if self.rationale is None or not self.rationale.strip():
+                raise ValueError(
+                    "not_applicable category requires non-empty rationale"
+                )
+        return self
+
+
+class CoverageObligation(BaseModel):
+    """One evidence-backed business rule and its split/variant obligations."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    source: list[str]
+    category: str
+    risk: Literal["normal", "critical"]
+    rule: str
+    required_splits: RequiredSplits
+    variant_exclusions: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("id", "rule")
+    @classmethod
+    def _require_non_blank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("source")
+    @classmethod
+    def _require_sources(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("source must contain at least one repository path")
+        if any(not item.strip() for item in value):
+            raise ValueError("source entries must not be blank")
+        return value
+
+    @field_validator("category")
+    @classmethod
+    def _require_fixed_category(cls, value: str) -> str:
+        if value not in FIXED_CATEGORIES:
+            raise ValueError(f"category is unknown: {value!r}")
+        return value
+
+    @field_validator("required_splits")
+    @classmethod
+    def _validate_required_splits(cls, value: RequiredSplits) -> RequiredSplits:
+        if not value:
+            raise ValueError("required_splits must contain at least one split")
+        unknown_splits = set(value) - set(_SPLITS)
+        if unknown_splits:
+            unknown = ", ".join(sorted(map(str, unknown_splits)))
+            raise ValueError(f"required_splits contains unknown split(s): {unknown}")
+        for split, variants in value.items():
+            if not variants:
+                raise ValueError(
+                    f"required_splits.{split} must contain at least one variant"
+                )
+            if len(variants) != len(set(variants)):
+                raise ValueError(
+                    f"required_splits.{split} variants must not contain duplicates"
+                )
+            unknown_variants = set(variants) - FIXED_VARIANTS
+            if unknown_variants:
+                unknown = ", ".join(sorted(map(str, unknown_variants)))
+                raise ValueError(
+                    f"required_splits.{split} contains unknown variant(s): {unknown}"
+                )
+        return value
+
+    @field_validator("variant_exclusions")
+    @classmethod
+    def _validate_variant_exclusions(
+        cls, value: dict[str, str]
+    ) -> dict[str, str]:
+        unknown_variants = set(value) - FIXED_VARIANTS
+        if unknown_variants:
+            unknown = ", ".join(sorted(map(str, unknown_variants)))
+            raise ValueError(
+                f"variant_exclusions contains unknown variant(s): {unknown}"
+            )
+        blank_reasons = [variant for variant, reason in value.items() if not reason.strip()]
+        if blank_reasons:
+            raise ValueError(
+                "variant_exclusions reasons must not be blank for: "
+                + ", ".join(sorted(blank_reasons))
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_variant_coverage(self) -> "CoverageObligation":
+        declared = {
+            variant
+            for variants in self.required_splits.values()
+            for variant in variants
+        }
+        excluded = set(self.variant_exclusions)
+        declared_and_excluded = declared & excluded
+        if declared_and_excluded:
+            values = ", ".join(sorted(declared_and_excluded))
+            raise ValueError(
+                "variant_exclusions may only explain undeclared variants: " + values
+            )
+
+        if self.risk == "critical":
+            if "normal" not in declared:
+                raise ValueError(
+                    "critical obligation required_splits must include normal variant"
+                )
+            critical_variants = {"boundary", "conflict", "adversarial"}
+            if not declared & critical_variants:
+                raise ValueError(
+                    "critical obligation required_splits must include one of "
+                    "boundary, conflict, or adversarial variants"
+                )
+            missing_exclusions = critical_variants - declared - excluded
+            if missing_exclusions:
+                values = ", ".join(sorted(missing_exclusions))
+                raise ValueError(
+                    "critical obligation variant_exclusions must explain "
+                    f"undeclared variants: {values}"
+                )
+        return self
+
+
+class CoverageObligations(BaseModel):
+    """The complete frozen coverage-obligation asset."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: Literal[1]
+    categories: list[CoverageCategory] = Field(default_factory=list)
+    obligations: list[CoverageObligation] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_complete_asset(self) -> "CoverageObligations":
+        category_names = [category.category for category in self.categories]
+        duplicate_categories = {
+            category
+            for category in category_names
+            if category_names.count(category) > 1
+        }
+        if duplicate_categories:
+            values = ", ".join(sorted(duplicate_categories))
+            raise ValueError(f"duplicate category declaration(s): {values}")
+
+        missing_categories = FIXED_CATEGORIES - set(category_names)
+        if missing_categories:
+            values = ", ".join(sorted(missing_categories))
+            raise ValueError(f"missing category declaration(s): {values}")
+
+        category_by_name = {
+            category.category: category for category in self.categories
+        }
+        for obligation in self.obligations:
+            category = category_by_name[obligation.category]
+            if category.applicability != "required":
+                raise ValueError(
+                    "obligation category must be required, but "
+                    f"{obligation.category!r} is not_applicable"
+                )
+
+        obligation_ids = [obligation.id for obligation in self.obligations]
+        duplicate_ids = {
+            obligation_id
+            for obligation_id in obligation_ids
+            if obligation_ids.count(obligation_id) > 1
+        }
+        if duplicate_ids:
+            values = ", ".join(sorted(duplicate_ids))
+            raise ValueError(f"duplicate obligation id(s): {values}")
+        return self
 
 
 class EvalCase(BaseModel):
@@ -104,7 +354,6 @@ class CaseSuite:
             raise KeyError(f"unknown case split: {split}") from exc
 
 
-_SPLITS = ("dev", "validation", "acceptance")
 _SPLIT_ALIASES = {
     "dev": "dev",
     "development": "dev",
@@ -174,6 +423,60 @@ def _format_validation_error(error: Exception) -> str:
 
     text = str(error).replace("\n", "; ")
     return re.sub(r"\s+", " ", text).strip()
+
+
+def coverage_obligations_hash(path: Path) -> str:
+    """Hash the exact bytes of a coverage-obligation file."""
+
+    try:
+        content = Path(path).read_bytes()
+    except (OSError, TypeError, ValueError) as error:
+        raise CaseSetupError(
+            f"unable to hash coverage obligations: {error}"
+        ) from error
+    return hashlib.sha256(content).hexdigest()
+
+
+def load_coverage_obligations(path: Path, repo_root: Path) -> CoverageObligations:
+    """Load and validate a coverage-obligation asset and its evidence paths."""
+
+    try:
+        source_path = Path(path)
+        content = source_path.read_text(encoding="utf-8")
+    except (OSError, TypeError, ValueError, UnicodeError) as error:
+        raise CaseSetupError(
+            f"unable to read coverage obligations {path}: {error}"
+        ) from error
+
+    try:
+        raw = yaml.safe_load(content)
+    except yaml.YAMLError as error:
+        raise CaseSetupError(
+            f"invalid YAML in coverage obligations {path}: {error}"
+        ) from error
+
+    try:
+        value = CoverageObligations.model_validate(raw)
+    except Exception as error:
+        raise CaseSetupError(_format_validation_error(error)) from error
+
+    try:
+        root = Path(repo_root).resolve(strict=False)
+    except (OSError, TypeError, ValueError) as error:
+        raise CaseSetupError(f"repository root is invalid: {error}") from error
+
+    for obligation in value.obligations:
+        for source in obligation.source:
+            try:
+                candidate = (root / source).resolve(strict=False)
+                contained = candidate.is_relative_to(root)
+                exists = candidate.is_file()
+            except (OSError, TypeError, ValueError):
+                contained = False
+                exists = False
+            if not contained or not exists:
+                raise CaseSetupError(f"unknown obligation source: {source}")
+    return value
 
 
 def _normalized_family(value: str) -> str:
@@ -602,9 +905,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "CaseSetupError",
     "CaseSuite",
+    "CoverageCategory",
+    "CoverageObligation",
+    "CoverageObligations",
     "EvalCase",
+    "FIXED_CATEGORIES",
+    "FIXED_VARIANTS",
+    "MIN_CASES_PER_SPLIT",
+    "RequiredSplits",
     "ValidatedCase",
+    "coverage_obligations_hash",
     "dataset_hash",
+    "load_coverage_obligations",
     "load_case_split",
     "load_case_suite",
     "main",

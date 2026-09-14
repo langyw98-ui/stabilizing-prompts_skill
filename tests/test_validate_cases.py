@@ -13,7 +13,9 @@ from pydantic import BaseModel, Field
 from scripts.validate_cases import (
     CaseSetupError,
     CaseSuite,
+    coverage_obligations_hash,
     dataset_hash,
+    load_coverage_obligations,
     load_case_suite,
     main,
 )
@@ -54,6 +56,187 @@ def _write(path: Path, cases: list[dict[str, object]]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(cases, sort_keys=False), encoding="utf-8")
     return path
+
+
+def complete_obligations_payload() -> dict[str, object]:
+    categories = [
+        "normal_path",
+        "output_partition",
+        "near_boundary",
+        "field_boundary",
+        "conditional_branch",
+        "conflict",
+        "ambiguity",
+        "irrelevant_input",
+        "fallback",
+        "historical_regression",
+        "adversarial",
+    ]
+    return {
+        "version": 1,
+        "categories": [
+            {"category": name, "applicability": "required", "evidence_checked": []}
+            for name in categories
+        ],
+        "obligations": [
+            {
+                "id": "classify-input",
+                "source": ["evidence.py"],
+                "category": "normal_path",
+                "risk": "normal",
+                "rule": "return the evidenced routing decision",
+                "required_splits": {
+                    "dev": ["normal"],
+                    "validation": ["boundary"],
+                    "acceptance": ["natural_variation"],
+                },
+                "variant_exclusions": {},
+            }
+        ],
+    }
+
+
+def write_obligations(root: Path, payload: dict[str, object]) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "evidence.py").write_text("EVIDENCE = True\n", encoding="utf-8")
+    path = root / "coverage-obligations.yaml"
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def test_coverage_obligations_require_every_fixed_category(tmp_path: Path) -> None:
+    path = tmp_path / "coverage-obligations.yaml"
+    path.write_text("version: 1\ncategories: []\nobligations: []\n", encoding="utf-8")
+
+    with pytest.raises(CaseSetupError, match="missing categor"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_not_applicable_requires_evidence_and_rationale(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["categories"][0] = {
+        "category": "normal_path",
+        "applicability": "not_applicable",
+        "evidence_checked": [],
+        "rationale": "",
+    }
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="evidence_checked|rationale"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_duplicate_ids(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"].append(dict(payload["obligations"][0]))
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="obligation.*id"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_unknown_category(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["category"] = "project-specific"
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="category"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_unknown_variant(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["required_splits"]["dev"] = ["project-specific"]
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="variant"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_unknown_risk(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["risk"] = "urgent"
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="risk"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_not_applicable_category_reference(
+    tmp_path: Path,
+) -> None:
+    payload = complete_obligations_payload()
+    payload["categories"][0] = {
+        "category": "normal_path",
+        "applicability": "not_applicable",
+        "evidence_checked": ["repository-tests"],
+        "rationale": "the production flow has no normal path",
+    }
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="category"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_empty_source_list(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["source"] = []
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="source"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_missing_repository_source(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["source"] = ["missing/evidence.py"]
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="source"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_reject_empty_split_variant_list(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["required_splits"]["dev"] = []
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="required_splits|variant"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_critical_obligation_requires_normal_and_risky_variant(tmp_path: Path) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["risk"] = "critical"
+    payload["obligations"][0]["required_splits"] = {"dev": ["ambiguity"]}
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="normal|boundary|conflict|adversarial"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_critical_obligation_requires_exclusions_for_unused_risky_variants(
+    tmp_path: Path,
+) -> None:
+    payload = complete_obligations_payload()
+    payload["obligations"][0]["risk"] = "critical"
+    payload["obligations"][0]["required_splits"] = {"dev": ["normal", "boundary"]}
+    path = write_obligations(tmp_path, payload)
+
+    with pytest.raises(CaseSetupError, match="variant_exclusions"):
+        load_coverage_obligations(path, tmp_path)
+
+
+def test_coverage_obligations_hash_binds_exact_file_bytes(tmp_path: Path) -> None:
+    path = write_obligations(tmp_path, complete_obligations_payload())
+
+    first = coverage_obligations_hash(path)
+    assert len(first) == 64
+    assert coverage_obligations_hash(path) == first
+
+    path.write_bytes(path.read_bytes() + b"\n")
+
+    assert coverage_obligations_hash(path) != first
 
 
 def write_case_sets(
