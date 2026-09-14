@@ -5,11 +5,23 @@ import pytest
 
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "SKILL.md"
+CASE_SCHEMA = ROOT / "references" / "case-schema.md"
+BUSINESS_CONTRACT = ROOT / "references" / "business-contract.md"
 
 
 @pytest.fixture
 def skill_text() -> str:
     return SKILL.read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def case_schema_text() -> str:
+    return CASE_SCHEMA.read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def business_contract_text() -> str:
+    return BUSINESS_CONTRACT.read_text(encoding="utf-8")
 
 
 def _section(skill_text: str, heading: str, next_heading: str) -> str:
@@ -82,7 +94,7 @@ def test_tune_documents_confirmation_before_any_model_call(skill_text):
 
 
 def test_tune_separates_mechanical_coverage_from_human_saturation(skill_text):
-    tune = skill_text.split("## `verify`", 1)[0]
+    tune = _section(skill_text, "## tune", "## verify")
     mechanical = tune.index("mechanical coverage")
     saturation = tune.index("saturation statement")
     confirmation = tune.index("user confirmation")
@@ -91,6 +103,59 @@ def test_tune_separates_mechanical_coverage_from_human_saturation(skill_text):
     assert "invalidate" in tune
     assert "coverage_obligations_hash" in tune
     assert "run manifest binds" not in tune
+
+
+def test_case_schema_documents_required_coverage_metadata(case_schema_text):
+    example = case_schema_text.split("```yaml", 1)[1].split("```", 1)[0]
+    for field in (
+        "coverage:",
+        "primary_obligation:",
+        "secondary_obligations:",
+        "variant:",
+        "condition_id:",
+    ):
+        assert field in example
+    assert "每条案例必须" in case_schema_text
+
+
+def test_coverage_asset_lifecycle_is_proposed_frozen_then_committed(
+    skill_text, business_contract_text, case_schema_text
+):
+    tune = _section(skill_text, "## tune", "## verify")
+    proposed = tune.index("proposed/editable `coverage-obligations.yaml`")
+    frozen = tune.index("freezes the contract, coverage obligations")
+    committed = tune.index("after the model probe/smoke succeeds, commit")
+    assert proposed < frozen < committed
+
+    for text in (business_contract_text, case_schema_text):
+        assert "proposed/editable" in text
+        assert "frozen by explicit user confirmation" in text
+        assert "committed after the model probe/smoke" in text
+
+
+def test_confirmation_binds_complete_coverage_audit_evidence(skill_text):
+    tune = _section(skill_text, "## tune", "## verify")
+    confirmation = _section(
+        tune, "### 4. user confirmation (contract confirmation gate)",
+        "### 5. model probe/smoke",
+    )
+    for field in (
+        "coverage_obligations_hash",
+        "case_suite_hash",
+        "evidence_checked",
+        "saturation_statement",
+        "near-duplicate review confirmation/status",
+    ):
+        assert field in confirmation
+    assert "remains cycle state" in confirmation
+    assert "not a project asset or a CLI input" in confirmation
+
+
+def test_coverage_obligations_are_mandatory_inputs(skill_text):
+    tune = _section(skill_text, "## tune", "## verify")
+    assert "coverage-obligations.yaml` when present" not in tune
+    assert "mandatory proposed/editable `coverage-obligations.yaml`" in tune
+    assert "confirmed `coverage-obligations.yaml`" in tune
 
 
 def test_tune_documents_project_local_worktree_gate(skill_text):

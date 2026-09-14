@@ -133,12 +133,16 @@ unregistered evidenced boundaries, near-duplicate distinctions, total call
 slots, and that statement. Only explicit user confirmation permits the model
 probe/smoke.
 
-The confirmation record binds the exact-byte
-`coverage_obligations_hash` and `case_suite_hash` and remains cycle state. It
-is not a project asset, a confirmation file, a coverage-summary asset, or a
-CLI input. If any frozen asset changes, the confirmation and all old runs are
-invalid and the gate must be repeated. The run manifest format remains
-unchanged; coverage obligation hashes are not manifest fields.
+The proposed/editable coverage-obligations asset is frozen by explicit user
+confirmation and committed after the model probe/smoke at the asset-commit
+state. The confirmation record binds the exact-byte
+`coverage_obligations_hash`, `case_suite_hash`, `evidence_checked`,
+`saturation_statement`, and explicit near-duplicate review confirmation/status;
+it remains cycle state. It is not a project asset, a confirmation file, a
+coverage-summary asset, or a CLI input. If any frozen asset changes, the
+confirmation and all old runs are invalid and the gate must be repeated. The
+run manifest format remains unchanged; coverage obligation hashes are not
+manifest fields.
 
 For actual split sizes `D`, `V`, and `A`, the confirmation material shows at
 least the fixed planned slots:

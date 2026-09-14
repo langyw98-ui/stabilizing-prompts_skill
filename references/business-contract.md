@@ -49,8 +49,9 @@ The contract/cases/adapter package is a pre-model artifact. The confirmation
 record must bind the canonical Prompt path and hash, Schema reference, renderer
 and message-assembly entry points, critical dependency hashes, all three case
 file hashes, adapter identity, the fixed `kds` command/Python version,
-repetition counts, phase thresholds, and stop conditions. A plain approval of
-the Prompt wording is not sufficient.
+repetition counts, phase thresholds, stop conditions, `evidence_checked`,
+`saturation_statement`, and explicit near-duplicate review confirmation/status.
+A plain approval of the Prompt wording is not sufficient.
 
 The `tune` state uses:
 
@@ -74,12 +75,13 @@ explicit delivery confirmation later in the same cycle.
 
 ## Coverage obligation evidence and confirmation
 
-Before cases are generated, Codex derives the frozen
+Before cases are generated, Codex derives the proposed/editable
 `.prompt-evals/<prompt-id>/coverage-obligations.yaml` asset from production
 evidence. The target model cannot create obligations or expected business
-truth. The asset is reviewed with the contract, three case splits, adapter,
-and evaluation configuration, then committed and delivered by the existing
-success and failure-asset-only allowlists.
+truth. The proposed/editable asset is reviewed with the contract, three case
+splits, adapter, and evaluation configuration; it is frozen by explicit user confirmation and committed after the model probe/smoke at the asset-commit
+state. The committed asset is then delivered by the existing success and
+failure-asset-only allowlists.
 
 The two coverage layers have separate owners:
 
@@ -101,9 +103,11 @@ statement and the mechanical audit separately before confirming the frozen
 assets and permitting the model probe.
 
 The confirmation record remains cycle state. It binds
-`coverage_obligations_hash` and `case_suite_hash` in addition to the existing
-contract, adapter, configuration, and environment identities; it is not a
-project asset, confirmation file, coverage-summary asset, or CLI input. Any
-change to a frozen asset invalidates the confirmation and all old runs, which
-requires a fresh audit and user confirmation. The run manifest schema remains
-unchanged and does not contain the obligation hash.
+`coverage_obligations_hash`, `case_suite_hash`, `evidence_checked`,
+`saturation_statement`, and explicit near-duplicate review
+confirmation/status in addition to the existing contract, adapter,
+configuration, and environment identities; it is not a project asset,
+confirmation file, coverage-summary asset, or CLI input. Any change to a
+frozen asset invalidates the confirmation and all old runs, which requires a
+fresh audit and user confirmation. The run manifest schema remains unchanged
+and does not contain the obligation hash.

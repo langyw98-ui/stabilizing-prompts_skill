@@ -34,14 +34,25 @@ expect:
 priority: normal
 dimensions: []
 rationale: why-this-result-is-correct
+coverage:
+  primary_obligation: classify-input
+  secondary_obligations: []
+  variant: normal
+  condition_id: normal-classification
+  distinction: null
 ```
 
 `expect.output` 必须给出生产 Pydantic Schema 的完整预期对象，不支持只声明部分字段。案例在任何模型调用前通过同一个生产 Schema 的 `model_validate` 预验证；验证失败属于评测资产 `setup_error`，必须修正并重新确认案例。
 
+每条案例必须包含 `coverage` 元数据：`primary_obligation` 是唯一的主要义务，
+`secondary_obligations` 只能引用其他真实义务且不会贡献配额，`variant` 必须是
+校验器规定的固定值，`condition_id` 必须是描述独立业务条件的稳定 slug；
+疑似近重复或相近案例还必须提供实质性的 `distinction`。
+
 ### 8.1.1 覆盖义务资产
 
 案例生成前，Codex 根据生产 Schema、生产控制流、业务文档、测试集合和已确认
-历史故障建立冻结资产：
+历史故障建立 proposed/editable 资产：
 
 ```text
 .prompt-evals/<prompt-id>/coverage-obligations.yaml
@@ -53,9 +64,11 @@ required variants，以及固定覆盖类别的 `required` 或有证据理由的
 不能由目标模型输出反推。固定 variants 由校验器定义，案例的具体业务条件由
 稳定的 `condition_id` 表达。
 
-覆盖义务文件和三个 split 在确认门禁中一起校验、哈希、冻结、提交，并属于成功
-和失败资产交付白名单。它不是 CLI 的额外参数、确认文件或独立
-coverage-summary 交付资产。
+The proposed/editable asset is frozen by explicit user confirmation and
+committed after the model probe/smoke at the asset-commit state. The committed
+coverage obligation file and the three splits are then delivered through the
+success and failure-asset-only allowlists. It is not an extra CLI argument,
+confirmation file, or independent coverage-summary delivery asset.
 
 ### 8.1.2 机械覆盖与饱和确认
 
@@ -76,8 +89,10 @@ Codex + user:
 coverage 与矩阵完整性。Codex 再检查未登记的有证据边界和近重复差异，提出
 饱和声明；用户必须审阅机械结果、证据范围、声明、全部案例和预计调用槽位后，
 才能确认并允许第一次模型调用。确认记录绑定
-`coverage_obligations_hash` 和 `case_suite_hash`，仍属于周期状态而非项目资产。
-任何冻结资产变化都会使确认和全部旧运行失效，必须重新校验和确认。
+`coverage_obligations_hash`、`case_suite_hash`、`evidence_checked`、
+`saturation_statement` 和显式的近重复审阅确认/状态，仍属于周期状态而非
+项目资产或 CLI 输入。任何冻结资产变化都会使确认和全部旧运行失效，必须重新
+校验和确认。
 
 ### 8.2 开发集、验证集与验收集
 

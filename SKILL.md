@@ -133,8 +133,10 @@ repository or worktree and is never taken from model output.
 
 - Inputs: production Pydantic Schema and renderer/call-chain evidence,
   dependency files, existing `prompt-contract.yaml`/`eval-config.yaml` when
-  valid, any history that is already confirmed, and the frozen
-  `.prompt-evals/<prompt-id>/coverage-obligations.yaml` when present.
+  valid, and any history that is already confirmed.
+- Action: derive or update the mandatory proposed/editable
+  `coverage-obligations.yaml` from production evidence before generating
+  cases.
 - Command: `validate_cases.py --eval-root PATH --schema MODULE:CLASS --output CASE_SUITE_JSON`.
   Derive or update `coverage-obligations.yaml` from production evidence first,
   then validate all three split files together during asset construction; use
@@ -142,9 +144,10 @@ repository or worktree and is never taken from model output.
   the mechanical coverage gate: it validates schemas, counts, hard duplicates,
   explained near duplicates, quotas, category declarations, critical coverage,
   and matrix completeness.
-- Output: a proposed `prompt-contract.yaml`, `eval-config.yaml`,
+- Output: proposed/editable `prompt-contract.yaml`, `eval-config.yaml`,
   `dev-cases.yaml`, `validation-cases.yaml`, `acceptance-cases.yaml`,
-  `coverage-obligations.yaml`, `adapter.py`, and a coverage matrix, plus
+  mandatory proposed/editable `coverage-obligations.yaml`, `adapter.py`, and a
+  coverage matrix, plus
   `CASE_SUITE_JSON`. Every case has a complete expected object validated by the
   production Schema; IDs and semantic/input fingerprints are globally
   isolated across splits. The adapter must expose production messages and
@@ -162,7 +165,7 @@ repository or worktree and is never taken from model output.
 
 ### 4. user confirmation (contract confirmation gate)
 
-- Inputs: the proposed contract, frozen
+- Inputs: the proposed contract, mandatory proposed/editable
   `.prompt-evals/<prompt-id>/coverage-obligations.yaml`, complete case
   inputs/expected objects and sources, split coverage matrix and mechanical
   audit, the Codex evidence scan and saturation statement, adapter boundary,
@@ -173,8 +176,9 @@ repository or worktree and is never taken from model output.
   The user reviews the mechanical audit separately from Codex's evidence and
   saturation statement, then freezes the contract, coverage obligations, all
   three datasets, adapter, and evaluation settings only after confirmation.
-- Output: a confirmation record tied to the cycle and hashes of the frozen
-  assets, including `coverage_obligations_hash` and `case_suite_hash`. The
+- Output: a confirmation record tied to the cycle with frozen-asset hashes
+  `coverage_obligations_hash` and `case_suite_hash`, plus
+  `evidence_checked`, `saturation_statement`, and the explicit near-duplicate review confirmation/status (`near_duplicate_review_status`). The
   record remains cycle state, not a project asset or a CLI input.
 - Next: `model probe/smoke` only on an affirmative answer.
 - Stop: a declined, ambiguous, or cancelled confirmation leaves assets
@@ -205,7 +209,8 @@ repository or worktree and is never taken from model output.
 ### 6. asset commit
 
 - Inputs: frozen, validated assets and successful smoke evidence.
-- Action: commit the contract, configuration, three case files,
+- Action: after the model probe/smoke succeeds, commit the contract,
+  configuration, three case files,
   `.prompt-evals/<prompt-id>/coverage-obligations.yaml`, adapter, and the
   confirmed evaluation assets in the dedicated worktree. Do not edit, stage, or commit the target repository's `.gitignore`; evaluation outputs must
   remain under already-ignored `reports/`/`.runtime/` paths.
@@ -331,8 +336,8 @@ production prompt and performs no synchronization.
   candidate, update only the current Prompt hash/non-path fields in
   `prompt-contract.yaml`, and append compact failure/optimization history.
   On failure delivery, exclude the production Prompt and candidate. Commit the
-  selected deliverables, including the confirmed
-  `coverage-obligations.yaml` when present, in the same cycle worktree; never
+  selected deliverables, including the confirmed `coverage-obligations.yaml`,
+  in the same cycle worktree; never
   commit runtime candidates, reports, raw responses, credentials, or tokens.
 - Output: final committed worktree `HEAD` and a cycle state tied to the
   candidate/asset hashes.
