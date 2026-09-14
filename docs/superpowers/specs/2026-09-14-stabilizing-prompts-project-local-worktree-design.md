@@ -67,8 +67,8 @@ preflight
   -> persist WorktreeCycle
   -> derive coverage obligations from business evidence
   -> generate dev/validation/acceptance cases
-  -> validate minimum counts, uniqueness, and coverage saturation
-  -> user confirmation
+  -> validate minimum counts, uniqueness, and mechanical coverage completeness
+  -> Codex saturation statement and user confirmation
   -> model probe/smoke
   -> existing baseline, candidate, acceptance, and delivery lifecycle
 ```
@@ -117,18 +117,20 @@ Detached HEAD、无法解析的仓库身份或无法验证的 `HEAD` 同样是
 `create_cycle(..., worktree=...)`。
 
 生成 `prompt-slug` 和 `cycle-id` 后、创建任何目录或分支前，通过 Git 对最终
-目标形状下一个不存在的哨兵路径执行 ignore 查询：
+worktree 目录本身执行 ignore 查询：
 
 ```text
 git check-ignore --no-index --quiet -- \
-  .worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/.stabilizing-prompts-probe
+  .worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/
 ```
 
-该命令只查询规则，不创建哨兵文件。仓库 `.gitignore`、`.git/info/exclude` 或
-全局 excludes 中当前生效的任一规则都可以满足本地隔离门禁。实现可以额外使用
-`-v` 报告匹配规则来源，但不要求规则必须来自已提交的 `.gitignore`。查询不
-通过时返回 `setup_error`，并推荐用户自行把 `.worktrees/` 加入项目
-`.gitignore`、提交后重新运行。Skill 不修改或提交 `.gitignore`。
+该命令只查询规则，不创建目录或文件。门禁必须证明最终 worktree 目录整体被
+忽略；只匹配某个特殊子文件名的规则不能通过。仓库 `.gitignore`、
+`.git/info/exclude` 或全局 excludes 中当前生效的任一规则都可以满足本地隔离
+门禁。实现可以额外使用 `-v` 报告匹配规则来源，但不要求规则必须来自已提交的
+`.gitignore`。查询不通过时返回 `setup_error`，并推荐用户自行把
+`.worktrees/` 加入项目 `.gitignore`、提交后重新运行。Skill 不修改或提交
+`.gitignore`。
 
 如果 `.worktrees` 已存在但不是目录，或者解析后的目标目录逃逸
 `<repo>/.worktrees/`，返回 `setup_error`。ignore 门禁通过后，Skill 可以创建
@@ -339,9 +341,10 @@ coverage:
 
 4. 同一案例试图通过 secondary obligations 重复贡献配额。
 
-同一业务义务可以跨 split 出现，因为三个 split 都需要验证关键业务规则；但其
-输入、variant 或 condition 必须形成不同测试实例。现有跨 split 输入指纹、ID
-和泄漏检查继续保留，并与场景键检查共同执行。
+同一业务义务可以跨 split 出现，因为三个 split 都需要验证关键业务规则；但
+不同实例必须使用不同的 `variant`，或使用代表实质不同业务条件的
+`condition_id`，且输入指纹也必须不同。只改变输入措辞不能构成不同测试实例。
+现有跨 split 输入指纹、ID 和泄漏检查继续保留，并与场景键检查共同执行。
 
 ### 7.4 疑似近重复
 
@@ -393,27 +396,29 @@ Codex 必须先完成覆盖义务，再生成案例：
 - 普通义务按风险和适用性分配到一个或多个 split；
 - 分配优先扩大业务义务和边界维度覆盖，不追求三个 split 数量相等。
 
-### 8.3 覆盖饱和门禁
+### 8.3 机械覆盖门禁与人工饱和确认
 
-只有同时满足以下条件，案例资产才能进入用户确认：
+只有同时满足以下可机械校验的条件，案例资产才能进入用户确认：
 
 1. 每个 split 至少有 30 条有效案例；
 2. 每项义务的所有必需 split/variant 配额都已满足；
 3. 所有 fixed categories 均已标记 required 或有证据理由的 not_applicable；
 4. 所有 critical 义务完成其正常和适用的边界、冲突或对抗覆盖；
 5. 没有硬重复，且所有疑似近重复均提供了待用户审阅的非空 `distinction`；
-6. 对 Schema、生产分支、业务契约、历史故障和输入边界完成一轮系统扫描后，
-   没有尚未登记的、有证据支持的边界条件；
-7. coverage matrix 不存在缺口。
+6. coverage matrix 不存在缺口。
 
 30 是最低门槛而不是停止条件。达到 30 后发现新的有证据边界时，必须继续增加
 案例；三个 split 可以超过 30 且数量不同。不得为了增加数量生成无业务意义的
 笛卡尔积。
 
-第 6 项由 Codex 在 coverage summary 中列出已扫描证据和未发现新增边界的结论，
-再由用户确认。校验器只对已声明义务和案例做机械校验，不能替代用户判断义务
-提取是否完整。coverage summary 不新增独立项目资产；其扫描范围和结论记录在
-现有 confirmation record 中。
+机械门禁通过后，Codex 还必须对 Schema、生产分支、业务契约、历史故障和输入
+边界完成一轮系统扫描，在 coverage summary 中列出已扫描证据，并声明没有尚未
+登记的、有证据支持的边界条件。该声明由用户在确认门禁审阅和确认。机器校验
+通过不代表用户已经确认覆盖义务提取完整。
+
+coverage summary 不新增独立项目资产；其扫描范围和结论记录在现有
+confirmation record 中。校验器只对已声明义务和案例做机械校验，不读取
+confirmation record，也不能替代 Codex 和用户的完整性判断。
 
 ## 9. 校验输出和用户确认门禁
 
@@ -435,7 +440,7 @@ Codex 必须先完成覆盖义务，再生成案例：
 - 输入指纹和场景键冲突；
 - 疑似近重复案例对、相似度和 distinction；
 - required/not_applicable 类别及理由；
-- coverage saturation 的逐项状态；
+- 机械覆盖门禁的逐项状态；
 - 三个 split 和覆盖义务资产的内容哈希。
 
 以下任一情况返回非评分 `setup_error`：
@@ -482,7 +487,6 @@ paired acceptance slots = 10A + 10A
 
 - asset commit 必须包含该文件；
 - frozen confirmation record 必须绑定其内容哈希；
-- baseline 和后续 manifest 必须绑定该哈希；
 - 成功交付白名单包含该文件；
 - 用户确认失败资产交付时，失败资产白名单也包含该文件；
 - 对该文件的额外、缺失、未提交或哈希漂移继续触发现有交付冲突处理。
@@ -504,7 +508,7 @@ paired acceptance slots = 10A + 10A
   - 覆盖义务 Schema；
   - 每 split 30 条下限；
   - 场景键和近重复审计；
-  - 义务配额和覆盖饱和检查；
+  - 义务配额和机械覆盖完整性检查；
   - 扩展 `CASE_SUITE_JSON`。
 - `SKILL.md`
   - 更新 worktree 状态和 contract/cases/adapter 状态；
@@ -528,8 +532,8 @@ paired acceptance slots = 10A + 10A
 
 - 默认路径严格位于 `<repo>/.worktrees/stabilizing-prompts/...`；
 - `.worktrees/` 不存在但 ignore 规则覆盖时成功创建；
-- 实际目标形状未 ignore 时在创建分支和 worktree 前失败，包括根级哨兵被 ignore
-  但目标被否定规则重新包含的情况；
+- 实际 worktree 目录未 ignore 时在创建分支和 worktree 前失败，包括只有特殊
+  子文件名被 ignore，以及上级目录被 ignore 但目标被否定规则重新包含的情况；
 - `.worktrees` 是文件或目标路径逃逸时失败；
 - linked worktree 启动被拒绝，submodule 不被误判；
 - CLI 和 Python API 不再接受任意 worktree 路径；
@@ -556,13 +560,14 @@ paired acceptance slots = 10A + 10A
 - 疑似近重复阈值、Unicode 规范化、distinction 和审计输出具有确定性；缺少
   distinction 时失败，存在说明时保持 `status: valid` 并设置
   `requires_user_review`；
-- 同一义务跨 split 的不同实例可以通过；
+- 同一义务跨 split 使用不同 variant 或实质不同 condition、且输入指纹不同的
+  实例可以通过；仅改变输入措辞的实例失败；
 - 义务文件、三个 split 和 Schema 一起验证并生成稳定哈希；
-- `CASE_SUITE_JSON` 正确输出计数、覆盖缺口、重复审计和饱和状态；
+- `CASE_SUITE_JSON` 正确输出计数、覆盖缺口、重复审计和机械覆盖门禁状态；
 - confirmation record 绑定证据扫描摘要、义务哈希、案例哈希和近重复审阅确认，
   但不成为新的交付资产；
 - 生产证据不足 30 条独立案例时以 `setup_error` 停止且不允许降低门槛；
-- 新资产进入冻结记录、asset commit、manifest 和交付白名单；
+- 新资产进入冻结记录、asset commit 和交付白名单；
 - fake transport 集成测试反映实际案例数和固定 repeats，不发起真实模型请求；
 - 第一次模型调用前的任一资产失败都停止周期。
 
@@ -579,10 +584,12 @@ paired acceptance slots = 10A + 10A
    `setup_error`，不调用模型且不在原工作区调优；
 3. Skill 不修改或提交目标项目的 `.gitignore`；
 4. `dev`、`validation`、`acceptance` 各至少有 30 条有效案例；
-5. 达到 30 条后仍必须满足所有覆盖义务和覆盖饱和条件；
+5. 达到 30 条后仍必须通过机械覆盖门禁，并由 Codex 提出、用户确认覆盖饱和
+   声明；
 6. 硬重复和缺少 `distinction` 的疑似近重复不能用于满足数量或配额；带说明的
    疑似近重复必须经用户接受后才能冻结；
-7. 同一业务义务可以跨 split 验证，但案例实例必须不同；
+7. 同一业务义务可以跨 split 验证，但实例必须使用不同 variant 或实质不同的
+   condition，且输入指纹不同；
 8. 覆盖义务、完整案例、未适用理由、重复审计和预计调用量在模型调用前由用户
    明确确认；
 9. `coverage-obligations.yaml` 被正确冻结、哈希、提交并按结果类型安全交付；
