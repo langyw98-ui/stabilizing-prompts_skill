@@ -782,6 +782,192 @@ def _parse_split(
     return tuple(parsed)
 
 
+def _normalize_similarity_text(text: str) -> str:
+    """Normalize user-authored text for deterministic similarity checks."""
+
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = "".join(
+        character
+        for character in normalized
+        if not unicodedata.category(character).startswith("P")
+    )
+    return " ".join(normalized.split())
+
+
+def _mapping_path(path: str, key: object) -> str:
+    """Append a mapping key to a stable JSON-like field path."""
+
+    try:
+        encoded = json.dumps(key, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        encoded = json.dumps(str(key), ensure_ascii=False)
+    return f"{path}[{encoded}]"
+
+
+def _flatten_input(
+    value: object,
+    *,
+    path: str,
+    strings: list[tuple[str, str]],
+    scalars: list[tuple[str, object]],
+) -> None:
+    """Flatten input leaves while retaining paths for deterministic matching."""
+
+    if isinstance(value, Mapping):
+        for key in sorted(value, key=lambda item: str(item)):
+            _flatten_input(
+                value[key],
+                path=_mapping_path(path, key),
+                strings=strings,
+                scalars=scalars,
+            )
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _flatten_input(
+                item,
+                path=f"{path}[{index}]",
+                strings=strings,
+                scalars=scalars,
+            )
+        return
+    if isinstance(value, str):
+        strings.append((path, value))
+        return
+    scalars.append((path, value))
+
+
+def _text_signature(value: object) -> tuple[tuple[str, object], frozenset[str]]:
+    """Return the scalar and character-trigram signatures for an input."""
+
+    strings: list[tuple[str, str]] = []
+    scalars: list[tuple[str, object]] = []
+    _flatten_input(value, path="$", strings=strings, scalars=scalars)
+    normalized = "\n".join(
+        f"{path}={_normalize_similarity_text(text)}"
+        for path, text in sorted(strings)
+    )
+    grams = (
+        {normalized[index : index + 3] for index in range(len(normalized) - 2)}
+        if len(normalized) >= 3
+        else {normalized}
+    )
+    return tuple(sorted(scalars, key=lambda item: item[0])), frozenset(grams)
+
+
+def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
+    """Return Jaccard similarity for two immutable trigram sets."""
+
+    if not left and not right:
+        return 1.0
+    return len(left & right) / len(left | right)
+
+
+def _same_scalar_signature(
+    left: tuple[tuple[str, object], ...], right: tuple[tuple[str, object], ...]
+) -> bool:
+    """Compare scalar leaves without conflating Python values such as ``1`` and ``True``."""
+
+    if len(left) != len(right):
+        return False
+    return all(
+        left_item[0] == right_item[0]
+        and type(left_item[1]) is type(right_item[1])
+        and left_item[1] == right_item[1]
+        for left_item, right_item in zip(left, right, strict=True)
+    )
+
+
+def _canonical_expected(expected: BaseModel) -> str:
+    """Serialize a production expected object independently of input aliases."""
+
+    return _canonical_json(
+        expected.model_dump(mode="json"), label="production expected object"
+    )
+
+
+def _near_duplicate_pairs(
+    split_cases: Mapping[str, tuple[ValidatedCase, ...]],
+) -> tuple[Mapping[str, object], ...]:
+    """Find deterministic near-duplicate case pairs across the complete suite."""
+
+    ordered: list[tuple[int, str, str, ValidatedCase]] = []
+    split_order = {split: index for index, split in enumerate(_SPLITS)}
+    for split in _SPLITS:
+        for validated in sorted(
+            split_cases.get(split, ()), key=lambda item: item.case.id
+        ):
+            ordered.append((split_order[split], split, validated.case.id, validated))
+
+    signatures: dict[int, tuple[str, tuple[tuple[str, object], ...], frozenset[str]]] = {}
+    for index, (_rank, _split, _case_id, validated) in enumerate(ordered):
+        scalar_signature, text_grams = _text_signature(validated.case.input)
+        signatures[index] = (
+            _canonical_expected(validated.expected),
+            scalar_signature,
+            text_grams,
+        )
+
+    pairs: list[Mapping[str, object]] = []
+    for left_index, (_left_rank, left_split, left_id, left) in enumerate(ordered):
+        left_expected, left_scalars, left_grams = signatures[left_index]
+        for right_index in range(left_index + 1, len(ordered)):
+            _right_rank, right_split, right_id, right = ordered[right_index]
+            right_expected, right_scalars, right_grams = signatures[right_index]
+            if left.case.coverage.primary_obligation != right.case.coverage.primary_obligation:
+                continue
+            if left_expected != right_expected or not _same_scalar_signature(
+                left_scalars, right_scalars
+            ):
+                continue
+            similarity = _jaccard(left_grams, right_grams)
+            if similarity < 0.85:
+                continue
+            pairs.append(
+                {
+                    "left": {"split": left_split, "id": left_id},
+                    "right": {"split": right_split, "id": right_id},
+                    "primary_obligation": left.case.coverage.primary_obligation,
+                    "similarity": similarity,
+                    "distinction": {
+                        "left": left.case.coverage.distinction,
+                        "right": right.case.coverage.distinction,
+                    },
+                }
+            )
+    return tuple(pairs)
+
+
+def _near_duplicate_error(
+    pairs: Sequence[Mapping[str, object]],
+) -> CaseSetupError | None:
+    """Return a setup error when any suspected pair lacks a distinction."""
+
+    missing: list[str] = []
+    for pair in pairs:
+        distinctions = pair.get("distinction")
+        if not isinstance(distinctions, Mapping):
+            distinctions = {}
+        left_distinction = distinctions.get("left")
+        right_distinction = distinctions.get("right")
+        if not isinstance(left_distinction, str) or not left_distinction.strip():
+            left = pair.get("left")
+            missing.append(
+                f"{left!r} missing distinction"
+            )
+        if not isinstance(right_distinction, str) or not right_distinction.strip():
+            right = pair.get("right")
+            missing.append(
+                f"{right!r} missing distinction"
+            )
+    if missing:
+        return CaseSetupError(
+            "near duplicate pair(s) require nonblank distinction: "
+            + "; ".join(missing)
+        )
+    return None
+
+
 def _validate_coverage_references(
     case: EvalCase,
     *,
@@ -847,6 +1033,8 @@ def _validate_coverage_references(
 def _coverage_audit(
     split_cases: Mapping[str, tuple[ValidatedCase, ...]],
     obligations: CoverageObligations,
+    *,
+    near_duplicates: Sequence[Mapping[str, object]] = (),
 ) -> CoverageAudit:
     """Build the mechanical coverage audit after suite validation succeeds."""
 
@@ -949,9 +1137,14 @@ def _coverage_audit(
         # Hard duplicates are rejected before this audit is constructed.  The
         # empty tuple is therefore positive evidence that this gate passed.
         "hard_duplicates": True,
-        # Near-duplicate detection is added by the later audit extension.  A
-        # complete Task 3 suite has no such pairs to explain.
-        "near_duplicate_explanations": True,
+        "near_duplicate_explanations": all(
+            isinstance(pair.get("distinction"), Mapping)
+            and isinstance(pair["distinction"].get("left"), str)
+            and bool(pair["distinction"]["left"].strip())
+            and isinstance(pair["distinction"].get("right"), str)
+            and bool(pair["distinction"]["right"].strip())
+            for pair in near_duplicates
+        ),
         "coverage_matrix": (
             category_declarations
             and not missing_quotas
@@ -971,7 +1164,7 @@ def _coverage_audit(
         distributions=distributions,
         missing_quotas=missing_quotas,
         hard_duplicates=(),
-        near_duplicates=(),
+        near_duplicates=tuple(near_duplicates),
         mechanical_gates=mechanical_gates,
     )
 
@@ -1209,7 +1402,14 @@ def load_case_suite(
                 )
             seen_scenarios[scenario_key] = (split, case.id)
 
-    coverage_audit = _coverage_audit(split_cases, obligations)
+    near_duplicates = _near_duplicate_pairs(split_cases)
+    near_duplicate_error = _near_duplicate_error(near_duplicates)
+    if near_duplicate_error is not None:
+        raise near_duplicate_error
+
+    coverage_audit = _coverage_audit(
+        split_cases, obligations, near_duplicates=near_duplicates
+    )
     coverage_error = _coverage_gate_error(
         coverage_audit, obligations, split_cases
     )
@@ -1359,19 +1559,63 @@ def _redact_cli_value(value: object) -> object:
     return value
 
 
-def _suite_payload(suite: CaseSuite, eval_root: Path, schema_ref: str) -> dict[str, object]:
+def _file_sha256(path: Path, *, label: str) -> str:
+    """Return the exact-byte SHA-256 for one emitted evaluation asset."""
+
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except (OSError, TypeError, ValueError) as error:
+        raise CaseSetupError(f"unable to hash {label}: {error}") from error
+
+
+def _suite_payload(
+    suite: CaseSuite,
+    eval_root: Path,
+    schema_ref: str,
+    *,
+    obligations_path: Path | None = None,
+    split_paths: Mapping[str, Path] | None = None,
+) -> dict[str, object]:
     """Build the stable JSON representation written by the validation CLI."""
 
+    root = Path(eval_root)
+    obligation_path = obligations_path or root / "coverage-obligations.yaml"
+    paths = split_paths or {
+        split: root / f"{split}-cases.yaml" for split in _SPLITS
+    }
+    canonical_split_paths = {
+        split: Path(paths[split]) for split in _SPLITS
+    }
+    audit = suite.coverage_audit
+    case_suite_hash = dataset_hash(suite)
     return {
         "status": "valid",
-        "eval_root": str(eval_root.resolve(strict=False)),
+        "requires_user_review": bool(audit.near_duplicates),
+        "eval_root": str(root.resolve(strict=False)),
         "schema": schema_ref,
-        "dataset_hash": dataset_hash(suite),
-        "splits": {
-            split: [_redact_cli_value(_canonical_case(item)) for item in suite[split]]
+        "case_suite_hash": case_suite_hash,
+        "coverage_obligations_hash": coverage_obligations_hash(obligation_path),
+        "case_file_hashes": {
+            split: _file_sha256(canonical_split_paths[split], label=f"{split} cases")
             for split in _SPLITS
         },
-        "counts": {split: len(suite[split]) for split in _SPLITS},
+        "counts": audit.counts,
+        "coverage": {
+            "distributions": audit.distributions,
+            "missing_quotas": [list(item) for item in audit.missing_quotas],
+            "mechanical_gates": dict(audit.mechanical_gates),
+        },
+        "duplicates": {
+            "hard": list(audit.hard_duplicates),
+            "near": list(audit.near_duplicates),
+        },
+        "splits": {
+            split: [
+                _redact_cli_value(_canonical_case(item))
+                for item in sorted(suite[split], key=lambda item: item.case.id)
+            ]
+            for split in _SPLITS
+        },
     }
 
 
@@ -1430,7 +1674,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         paths = tuple(eval_root / f"{split}-cases.yaml" for split in _SPLITS)
         suite = load_case_suite(paths, schema, obligations=obligations)
-        payload = _suite_payload(suite, eval_root, args.schema_ref)
+        payload = _suite_payload(
+            suite,
+            eval_root,
+            args.schema_ref,
+            obligations_path=obligations_path,
+            split_paths={split: paths[index] for index, split in enumerate(_SPLITS)},
+        )
         _write_json(args.output, payload)
     except (CaseSetupError, OSError, ValueError, TypeError) as error:
         payload = {"status": "error", "error": _safe_error(error)}
@@ -1463,7 +1713,12 @@ __all__ = [
     "load_coverage_obligations",
     "load_case_split",
     "load_case_suite",
+    "_flatten_input",
+    "_jaccard",
+    "_near_duplicate_pairs",
+    "_normalize_similarity_text",
     "_scenario_key",
+    "_text_signature",
     "main",
 ]
 

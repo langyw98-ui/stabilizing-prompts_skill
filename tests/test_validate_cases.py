@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -9,7 +11,7 @@ from typing import Literal
 
 import pytest
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
 from scripts.validate_cases import (
     CaseCoverage,
@@ -24,7 +26,11 @@ from scripts.validate_cases import (
     load_coverage_obligations,
     load_case_suite,
     main,
+    _jaccard,
+    _near_duplicate_pairs,
+    _normalize_similarity_text,
     _scenario_key,
+    _text_signature,
 )
 
 
@@ -35,6 +41,13 @@ class Decision(BaseModel):
 
 class AliasedDecision(BaseModel):
     action: Literal["accept", "reject"] = Field(alias="actionType")
+    reason: str
+
+
+class FlexibleAliasedDecision(BaseModel):
+    action: Literal["accept", "reject"] = Field(
+        validation_alias=AliasChoices("actionType", "action")
+    )
     reason: str
 
 
@@ -279,6 +292,35 @@ def add_secondary_reference_to_every_case(path: Path, obligation_id: str) -> Non
     for case in cases:
         case["coverage"]["secondary_obligations"].append(obligation_id)
     write_cases(path, cases)
+
+
+def make_near_duplicate_pair(
+    case_files: Mapping[str, Path], *, distinction: str | None
+) -> None:
+    """Make the first two development cases similar without hard duplicating them."""
+
+    cases = read_cases(case_files["dev"])
+    left = cases[0]
+    right = copy.deepcopy(cases[1])
+    right["expect"] = copy.deepcopy(left["expect"])
+    right["coverage"]["primary_obligation"] = left["coverage"][
+        "primary_obligation"
+    ]
+
+    # Keep a long shared body so this helper exercises the trigram threshold;
+    # punctuation-only variation must still leave distinct exact inputs.
+    left_input = copy.deepcopy(left["input"])
+    left_input.setdefault("variables", {})["text"] = (
+        "The evidenced routing condition selects the accepted decision"
+    )
+    right_input = copy.deepcopy(left_input)
+    right_input["variables"]["text"] += "!"
+    left["input"] = left_input
+    right["input"] = right_input
+    left["coverage"]["distinction"] = distinction
+    right["coverage"]["distinction"] = distinction
+    cases[0], cases[1] = left, right
+    write_cases(case_files["dev"], cases)
 
 
 def test_coverage_obligations_require_every_fixed_category(tmp_path: Path) -> None:
@@ -1094,6 +1136,167 @@ def test_dataset_hash_changes_when_expected_output_changes(
     )
 
 
+def test_near_duplicate_without_distinction_fails(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    make_near_duplicate_pair(case_files, distinction=None)
+
+    with pytest.raises(CaseSetupError, match="near duplicate.*distinction"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=coverage_obligations
+        )
+
+
+def test_near_duplicate_with_distinction_requires_review(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    distinction = "different evidenced decision boundary"
+    make_near_duplicate_pair(case_files, distinction=distinction)
+
+    suite = load_case_suite(
+        case_files.values(), output_schema, obligations=coverage_obligations
+    )
+
+    pairs = suite.coverage_audit.near_duplicates
+    assert len(pairs) == 1
+    pair = pairs[0]
+    assert pair["left"] == {"split": "dev", "id": "dev-1"}
+    assert pair["right"] == {"split": "dev", "id": "dev-2"}
+    assert pair["primary_obligation"] == "classify-input"
+    assert pair["similarity"] >= 0.85
+    assert pair["distinction"] == {"left": distinction, "right": distinction}
+    assert suite.coverage_audit.mechanical_gates["near_duplicate_explanations"]
+
+
+def test_near_duplicate_pair_order_is_split_then_case_id(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    make_near_duplicate_pair(case_files, distinction="dev distinction")
+    validation_cases = read_cases(case_files["validation"])
+    left = validation_cases[0]
+    right = copy.deepcopy(validation_cases[1])
+    left["input"]["variables"]["text"] = "The evidenced validation boundary selects a decision"
+    right["input"] = copy.deepcopy(left["input"])
+    right["input"]["variables"]["text"] += "?"
+    right["expect"] = copy.deepcopy(left["expect"])
+    right["coverage"]["primary_obligation"] = left["coverage"][
+        "primary_obligation"
+    ]
+    left["coverage"]["distinction"] = "validation distinction"
+    right["coverage"]["distinction"] = "validation distinction"
+    validation_cases[0], validation_cases[1] = left, right
+    write_cases(case_files["validation"], validation_cases)
+
+    suite = load_case_suite(
+        case_files.values(), output_schema, obligations=coverage_obligations
+    )
+
+    pairs = suite.coverage_audit.near_duplicates
+    assert _near_duplicate_pairs(suite.splits) == pairs
+    assert [(pair["left"], pair["right"]) for pair in pairs] == [
+        (
+            {"split": "dev", "id": "dev-1"},
+            {"split": "dev", "id": "dev-2"},
+        ),
+        (
+            {"split": "validation", "id": "validation-1"},
+            {"split": "validation", "id": "validation-2"},
+        ),
+    ]
+
+
+def test_near_duplicate_similarity_normalizes_nfkc_case_punctuation_and_space() -> None:
+    assert _normalize_similarity_text(" ＡＢＣ，\tD！  E\n") == "abc d e"
+
+
+def test_jaccard_uses_inclusive_point_eighty_five_threshold() -> None:
+    left = frozenset("abcdefghijklmnopq")
+    right = frozenset("abcdefghijklmnopqrst")
+
+    assert _jaccard(left, right) == pytest.approx(0.85)
+    assert _jaccard(left, right) >= 0.85
+    assert _jaccard(frozenset({"x"}), frozenset({"y"})) < 0.85
+
+
+def test_text_signature_preserves_multiple_string_paths_and_non_string_leaves() -> None:
+    first = {
+        "variables": {"title": "One", "text": "Two"},
+        "context": {"region": "US", "attempt": 1},
+        "items": ["Three", {"enabled": True}],
+    }
+    reordered = {
+        "items": ["Three", {"enabled": True}],
+        "context": {"attempt": 1, "region": "US"},
+        "variables": {"text": "Two", "title": "One"},
+    }
+    changed_scalar = copy.deepcopy(reordered)
+    changed_scalar["context"]["attempt"] = 2
+
+    assert _text_signature(first) == _text_signature(reordered)
+    assert _text_signature(first)[0] != _text_signature(changed_scalar)[0]
+
+
+def test_text_signature_handles_short_strings() -> None:
+    first = _text_signature({"text": "Hi"})
+    assert _normalize_similarity_text("Hi") == "hi"
+    assert first[1]
+    assert first == _text_signature({"text": "hi"})
+    assert _jaccard(first[1], first[1]) == 1.0
+
+
+def test_near_duplicate_requires_same_expected_and_scalar_signature(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    cases = read_cases(case_files["dev"])
+    left = cases[0]
+    right = copy.deepcopy(cases[1])
+    right["coverage"]["primary_obligation"] = left["coverage"][
+        "primary_obligation"
+    ]
+    right["input"] = copy.deepcopy(left["input"])
+    right["input"]["variables"]["text"] = "A wholly unrelated decision boundary"
+    left["input"]["variables"]["text"] = "A shared evidenced decision boundary"
+    right["input"]["context"]["extra"] = 9
+    right["coverage"]["distinction"] = "different scalar branch"
+    left["coverage"]["distinction"] = "different scalar branch"
+    cases[0], cases[1] = left, right
+    write_cases(case_files["dev"], cases)
+
+    suite = load_case_suite(
+        case_files.values(), output_schema, obligations=coverage_obligations
+    )
+
+    assert suite.coverage_audit.near_duplicates == ()
+
+
+def test_near_duplicate_uses_normalized_production_expected_object(
+    case_files, coverage_obligations
+) -> None:
+    cases = read_cases(case_files["dev"])
+    left = cases[0]
+    right = copy.deepcopy(cases[1])
+    right["coverage"]["primary_obligation"] = left["coverage"][
+        "primary_obligation"
+    ]
+    left["input"]["variables"]["text"] = "A shared evidenced decision boundary"
+    right["input"] = copy.deepcopy(left["input"])
+    right["input"]["variables"]["text"] += "?"
+    left["coverage"]["distinction"] = "same production decision, different alias spelling"
+    right["coverage"]["distinction"] = "same production decision, different alias spelling"
+    left["expect"]["output"] = {"actionType": "accept", "reason": "matched"}
+    right["expect"]["output"] = {"action": "accept", "reason": "matched"}
+    cases[0], cases[1] = left, right
+    write_cases(case_files["dev"], cases)
+
+    # AliasedDecision is needed to prove that aliases normalize to one
+    # production expected object before grouping.
+    suite = load_case_suite(
+        case_files.values(), FlexibleAliasedDecision, obligations=coverage_obligations
+    )
+
+    assert suite.coverage_audit.near_duplicates
+
+
 def test_case_validation_cli_writes_machine_readable_suite(
     tmp_path: Path, coverage_obligations
 ) -> None:
@@ -1118,16 +1321,61 @@ def test_case_validation_cli_writes_machine_readable_suite(
 
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["status"] == "valid"
+    assert payload["requires_user_review"] is False
     assert payload["schema"] == "tests.test_validate_cases:Decision"
-    assert payload["dataset_hash"] == dataset_hash(
-        load_case_suite(paths, Decision, obligations=coverage_obligations)
+    suite = load_case_suite(paths, Decision, obligations=coverage_obligations)
+    assert payload["case_suite_hash"] == dataset_hash(suite)
+    assert payload["coverage_obligations_hash"] == coverage_obligations_hash(
+        eval_root / "coverage-obligations.yaml"
     )
+    assert payload["case_file_hashes"] == {
+        split: hashlib.sha256(paths[index].read_bytes()).hexdigest()
+        for index, split in enumerate(("dev", "validation", "acceptance"))
+    }
+    assert payload["counts"] == suite.coverage_audit.counts
+    assert payload["coverage"]["distributions"] == suite.coverage_audit.distributions
+    assert payload["coverage"]["missing_quotas"] == []
+    assert payload["coverage"]["mechanical_gates"] == suite.coverage_audit.mechanical_gates
+    assert payload["duplicates"] == {"hard": [], "near": []}
     assert len(payload["splits"]["dev"]) == 30
     assert payload["splits"]["dev"][0]["id"] == "dev-1"
     assert payload["splits"]["dev"][0]["expect"]["output"] == {
         "action": "accept",
         "reason": "matched",
     }
+
+
+def test_case_validation_cli_reports_explained_near_duplicates_for_review(
+    tmp_path: Path,
+) -> None:
+    eval_root = tmp_path / "eval"
+    paths = write_case_sets(eval_root)
+    write_obligations(eval_root, complete_obligations_payload())
+    case_files = dict(zip(("dev", "validation", "acceptance"), paths, strict=True))
+    make_near_duplicate_pair(
+        case_files, distinction="different evidenced decision boundary"
+    )
+    output = tmp_path / "suite.json"
+
+    assert (
+        main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--schema",
+                "tests.test_validate_cases:Decision",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["status"] == "valid"
+    assert payload["requires_user_review"] is True
+    assert len(payload["duplicates"]["near"]) == 1
+    assert payload["duplicates"]["near"][0]["similarity"] >= 0.85
 
 
 def test_case_validation_cli_writes_explicit_error_for_invalid_assets(
