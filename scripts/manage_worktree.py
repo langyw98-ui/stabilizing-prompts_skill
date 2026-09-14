@@ -413,11 +413,38 @@ def _safe_slug(value: str) -> str:
     return result or "prompt"
 
 
+def _cycle_worktree_path(root: Path, prompt_id: str, identity: str) -> Path:
+    target = (
+        root / ".worktrees" / "stabilizing-prompts" / f"{_safe_slug(prompt_id)}-{identity}"
+    ).resolve(strict=False)
+    expected_parent = (root / ".worktrees" / "stabilizing-prompts").resolve(strict=False)
+    if target.parent != expected_parent:
+        raise WorktreeError("derived worktree path escapes .worktrees/stabilizing-prompts")
+    return target
+
+
+def _require_ignored_worktree(root: Path, target: Path) -> None:
+    relative = target.relative_to(root).as_posix() + "/"
+    result = _git(
+        root,
+        "check-ignore",
+        "--no-index",
+        "--quiet",
+        "--",
+        relative,
+        check=False,
+    )
+    if result.returncode == 1:
+        raise WorktreeError(f"worktree directory is not ignored: {relative}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+        raise WorktreeError(f"unable to verify worktree ignore rule: {detail}")
+
+
 def create_cycle(
     original_repo: Path,
     prompt_id: str,
     *,
-    worktree: Path | None = None,
     branch: str | None = None,
     prompt_path: Path | str | None = None,
 ) -> WorktreeCycle:
@@ -436,20 +463,39 @@ def create_cycle(
 
     identity = uuid.uuid4().hex[:12]
     slug = _safe_slug(prompt_id)
-    selected_branch = branch or f"stabilizing-prompts/{slug}-{identity}"
-    if not selected_branch.strip() or selected_branch.endswith("/"):
-        raise WorktreeError("branch must be a concrete Git branch name")
-    selected_worktree = (
-        Path(worktree).resolve(strict=False)
-        if worktree is not None
-        else root.parent / f".{root.name}-stabilizing-prompts-{slug}-{identity}"
+    selected_branch = branch if branch is not None else f"stabilizing-prompts/{slug}-{identity}"
+    worktrees_root = root / ".worktrees"
+    if worktrees_root.exists() and not worktrees_root.is_dir():
+        raise WorktreeError(".worktrees is not a directory")
+    if (
+        not isinstance(selected_branch, str)
+        or not selected_branch.strip()
+        or selected_branch.startswith("refs/")
+    ):
+        raise WorktreeError(f"invalid branch: {selected_branch!r}")
+    branch_result = _git(root, "check-ref-format", "--branch", selected_branch, check=False)
+    if branch_result.returncode != 0:
+        raise WorktreeError(f"invalid branch: {selected_branch}")
+    existing_branch = _git(
+        root,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{selected_branch}",
+        check=False,
     )
-    if _path_is_within(selected_worktree, root):
-        raise WorktreeError(
-            f"worktree path must be outside original repository: {selected_worktree}"
-        )
+    if existing_branch.returncode == 0:
+        raise WorktreeError(f"branch already exists: {selected_branch}")
+    if existing_branch.returncode != 1:
+        detail = (existing_branch.stderr or existing_branch.stdout).decode(
+            "utf-8", "replace"
+        ).strip()
+        raise WorktreeError(f"unable to verify branch availability: {detail}")
+
+    selected_worktree = _cycle_worktree_path(root, prompt_id, identity)
     if selected_worktree.exists():
         raise WorktreeError(f"worktree path already exists: {selected_worktree}")
+    _require_ignored_worktree(root, selected_worktree)
     selected_worktree.parent.mkdir(parents=True, exist_ok=True)
     _git(root, "worktree", "add", "-b", selected_branch, str(selected_worktree), base)
     return WorktreeCycle(
@@ -1282,7 +1328,6 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--repo", type=Path, required=True)
     create.add_argument("--prompt-id", required=True)
     create.add_argument("--state", type=Path, required=True)
-    create.add_argument("--worktree", type=Path)
     create.add_argument("--branch")
 
     build = commands.add_parser("build-patch")
@@ -1306,7 +1351,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             cycle = create_cycle(
                 args.repo,
                 args.prompt_id,
-                worktree=args.worktree,
                 branch=args.branch,
             )
             save_cycle(cycle, args.state)

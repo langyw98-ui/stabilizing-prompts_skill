@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 from pathlib import Path
 import subprocess
+import uuid
 
 import pytest
 
@@ -18,6 +19,7 @@ from scripts.manage_worktree import (
     apply_delivery_patch,
     build_delivery_patch,
     create_cycle,
+    main,
     preflight_patch,
 )
 
@@ -38,7 +40,7 @@ def snapshot_workspace(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in root.rglob("*")
-        if path.is_file() and ".git" not in path.parts
+        if path.is_file() and ".git" not in path.parts and ".worktrees" not in path.parts
     }
 
 
@@ -57,7 +59,8 @@ def make_repo(path: Path) -> tuple[Path, str]:
         "prompt_path: prompts/classify.md\n",
         encoding="utf-8",
     )
-    git(path, "add", "prompts/classify.md", ".prompt-evals")
+    (path / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
+    git(path, "add", ".gitignore", "prompts/classify.md", ".prompt-evals")
     git(path, "commit", "-m", "initial prompt assets")
     return path, prompt_id
 
@@ -118,6 +121,169 @@ def test_cycle_base_is_original_head(repo: tuple[Path, str]) -> None:
     assert cycle.original_repo == original.resolve()
     assert cycle.worktree.is_dir()
     assert cycle.branch
+
+
+def _freeze_cycle_uuid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        manage_worktree.uuid,
+        "uuid4",
+        lambda: uuid.UUID("0123456789ab00000000000000000000"),
+    )
+
+
+def test_cycle_uses_fixed_project_local_path(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    _freeze_cycle_uuid(monkeypatch)
+
+    cycle = create_cycle(original, prompt_id)
+
+    assert cycle.worktree.parent == original / ".worktrees" / "stabilizing-prompts"
+    assert cycle.worktree.name.startswith("classify--abc123-")
+    assert git(original, "status", "--short") == ""
+
+
+def test_create_cycle_rejects_special_child_only_ignore(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    original, prompt_id = make_repo(tmp_path / "repo")
+    _freeze_cycle_uuid(monkeypatch)
+    (original / ".gitignore").write_text(
+        "**/.stabilizing-prompts-probe\n", encoding="utf-8"
+    )
+    git(original, "add", ".gitignore")
+    git(original, "commit", "-m", "ignore only probe")
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_workspace(original)
+
+    with pytest.raises(WorktreeError, match="ignored"):
+        create_cycle(original, prompt_id)
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_workspace(original) == before_files
+    assert not (original / ".worktrees").exists()
+
+
+def test_create_cycle_api_rejects_removed_worktree_keyword(
+    repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    original, prompt_id = repo
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_workspace(original)
+
+    with pytest.raises(TypeError, match="worktree"):
+        create_cycle(original, prompt_id, worktree=tmp_path / "custom")
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_workspace(original) == before_files
+
+
+def test_create_cycle_rejects_worktrees_file_before_git_add(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    _freeze_cycle_uuid(monkeypatch)
+    (original / ".worktrees").write_text("not a directory\n", encoding="utf-8")
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_workspace(original)
+
+    with pytest.raises(WorktreeError, match=r"\.worktrees is not a directory"):
+        create_cycle(original, prompt_id)
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_workspace(original) == before_files
+
+
+def test_create_cycle_rejects_target_reincluded_by_negation_rule(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    _freeze_cycle_uuid(monkeypatch)
+    target_name = "classify--abc123-0123456789ab"
+    (original / ".gitignore").write_text(
+        ".worktrees/*\n"
+        "!.worktrees/stabilizing-prompts/\n"
+        f"!.worktrees/stabilizing-prompts/{target_name}/\n",
+        encoding="utf-8",
+    )
+    git(original, "add", ".gitignore")
+    git(original, "commit", "-m", "re-include fixed target")
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_workspace(original)
+
+    with pytest.raises(WorktreeError, match="not ignored"):
+        create_cycle(original, prompt_id)
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_workspace(original) == before_files
+
+
+def test_create_cycle_rejects_existing_derived_target(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    _freeze_cycle_uuid(monkeypatch)
+    target = original / ".worktrees" / "stabilizing-prompts" / "classify--abc123-0123456789ab"
+    target.mkdir(parents=True)
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_workspace(original)
+
+    with pytest.raises(WorktreeError, match="already exists"):
+        create_cycle(original, prompt_id)
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_workspace(original) == before_files
+
+
+def test_create_cycle_rejects_existing_custom_branch(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    _freeze_cycle_uuid(monkeypatch)
+    git(original, "branch", "existing-cycle")
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_workspace(original)
+
+    with pytest.raises(WorktreeError, match="already exists"):
+        create_cycle(original, prompt_id, branch="existing-cycle")
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_workspace(original) == before_files
+    assert not (
+        original / ".worktrees" / "stabilizing-prompts" / "classify--abc123-0123456789ab"
+    ).exists()
+
+
+def test_create_cycle_accepts_safe_custom_branch_without_changing_path(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    _freeze_cycle_uuid(monkeypatch)
+
+    cycle = create_cycle(original, prompt_id, branch="custom/cycle")
+
+    assert cycle.branch == "custom/cycle"
+    assert cycle.worktree == (
+        original / ".worktrees" / "stabilizing-prompts" / "classify--abc123-0123456789ab"
+    ).resolve()
+
+
+@pytest.mark.parametrize("branch", ["bad branch", "refs/heads/main", "topic..bad"])
+def test_create_cycle_rejects_invalid_custom_branch(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch, branch: str
+) -> None:
+    original, prompt_id = repo
+    _freeze_cycle_uuid(monkeypatch)
+    before_branches = git(original, "branch", "--format=%(refname:short)")
+    before_files = snapshot_workspace(original)
+
+    with pytest.raises(WorktreeError, match="invalid branch"):
+        create_cycle(original, prompt_id, branch=branch)
+
+    assert git(original, "branch", "--format=%(refname:short)") == before_branches
+    assert snapshot_workspace(original) == before_files
+    assert not (
+        original / ".worktrees" / "stabilizing-prompts" / "classify--abc123-0123456789ab"
+    ).exists()
 
 
 def test_create_cycle_rejects_linked_worktree_before_writes(
@@ -449,13 +615,24 @@ def test_build_rejects_deleting_canonical_prompt(
         build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST)
 
 
-def test_create_cycle_rejects_worktree_inside_original_repository(
-    repo: tuple[Path, str],
+def test_create_cli_rejects_worktree_option(
+    repo: tuple[Path, str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     original, prompt_id = repo
-    inside = original / "nested-worktree"
 
-    with pytest.raises(WorktreeError, match="outside"):
-        create_cycle(original, prompt_id, worktree=inside)
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "create",
+                "--repo",
+                str(original),
+                "--prompt-id",
+                prompt_id,
+                "--state",
+                str(tmp_path / "state.json"),
+                "--worktree",
+                str(tmp_path / "custom"),
+            ]
+        )
 
-    assert not inside.exists()
+    assert error.value.code == 2
