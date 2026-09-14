@@ -406,8 +406,9 @@ must pass `--mode verify`. A verify invocation rejects `--dataset acceptance`
 before opening any manifest or case file, importing the adapter, or
 constructing the model client.
 
-`validate_cases.py` consumes the frozen `coverage-obligations.yaml` during
-asset construction. Coverage obligations add no CLI option or command.
+`validate_cases.py` consumes the mandatory proposed/editable
+`coverage-obligations.yaml` during asset construction. User confirmation
+freezes the asset; coverage obligations add no CLI option or command.
 
 ## verify
 

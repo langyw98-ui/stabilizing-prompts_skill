@@ -156,6 +156,9 @@ def test_coverage_obligations_are_mandatory_inputs(skill_text):
     assert "coverage-obligations.yaml` when present" not in tune
     assert "mandatory proposed/editable `coverage-obligations.yaml`" in tune
     assert "confirmed `coverage-obligations.yaml`" in tune
+    assert "consumes the frozen `coverage-obligations.yaml` during" not in skill_text
+    assert "consumes the mandatory proposed/editable" in skill_text
+    assert "`coverage-obligations.yaml` during asset construction" in skill_text
 
 
 def test_tune_documents_project_local_worktree_gate(skill_text):
