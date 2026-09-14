@@ -65,6 +65,17 @@ repository or worktree and is never taken from model output.
 ### 2. worktree
 
 - Inputs: the preflight snapshot and its stable `prompt_id`.
+- Setup sequence:
+
+  ```text
+  resolve primary checkout identity
+  -> reject linked worktree or detached HEAD
+  -> derive .worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/
+  -> verify that directory is ignored with git check-ignore
+  -> create branch and worktree with git worktree add
+  -> persist WorktreeCycle
+  ```
+
 - Preflight: resolve the primary workspace identity, then reject a linked
   worktree or detached `HEAD`. Derive the fixed target
   `.worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/` inside the target
@@ -79,12 +90,12 @@ repository or worktree and is never taken from model output.
 - Next: `contract/cases/adapter`, in this same worktree and cycle. Never make a
   second worktree for bootstrap or for candidate rounds. The worktree and
   branch are not automatically deleted.
-- Stop: reject a repository-root mismatch, linked worktree, detached `HEAD`,
-  missing ignore coverage, stale/invalid cycle, or critical dependency change
-  before any model call. Fail closed: never fall back to tuning in the
-  original checkout. Preserve the original workspace and report the precise
-  reason; retained worktrees and branches require manual inspection or
-  cleanup.
+- Setup stop: reject a repository-root mismatch, linked worktree, detached
+  `HEAD`, missing ignore coverage, invalid branch, `git worktree add` failure,
+  or WorktreeCycle state-persistence failure before the first model call. Fail
+  closed: never fall back to tuning in the original checkout. Preserve the
+  original workspace and report the precise reason; retained worktrees and
+  branches require manual inspection or cleanup.
 
 ### 3. contract/cases/adapter
 
@@ -294,6 +305,12 @@ production prompt and performs no synchronization.
   unstaged to the original workspace. Success may include the production
   prompt and confirmed assets; failure excludes the production prompt and
   candidate. The original worktree and branch remain for inspection.
+- Delivery-time stale-state guard: after model phases and immediately before
+  synchronization, re-check the original `HEAD == cycle_base_commit`, final
+  worktree `HEAD`, and committed contract identity. A stale/invalid cycle,
+  `HEAD` drift, or worktree commit mismatch stops delivery. These guards run at
+  delivery time and are not setup checks that promise to precede the first
+  model call.
 - Safety/stop behavior: regenerate from trusted cycle state at delivery time;
   compare Git-reported changed paths and patch paths exactly with the derived
   allowlist, rejecting reports/runtime/unrelated files, deletions, or extra

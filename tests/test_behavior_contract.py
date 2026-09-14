@@ -62,7 +62,18 @@ def test_tune_rejects_unignored_project_local_worktree_before_model_call(
 
 def test_tune_creates_project_local_worktree_before_model_call(tmp_path: Path) -> None:
     target_repo = build_target_repo(tmp_path / "target-repo")
-    transport = CountingTransport(scenario="no-change")
+    worktree_root = target_repo / ".worktrees" / "stabilizing-prompts"
+
+    class GateObservingTransport(CountingTransport):
+        def __init__(self) -> None:
+            super().__init__(scenario="no-change")
+            self.worktree_ready_at_call: list[bool] = []
+
+        def invoke(self, messages: object) -> object:
+            self.worktree_ready_at_call.append(worktree_root.is_dir())
+            return super().invoke(messages)
+
+    transport = GateObservingTransport()
 
     result = run_tune_with_fake_transport(
         target_repo,
@@ -71,8 +82,8 @@ def test_tune_creates_project_local_worktree_before_model_call(tmp_path: Path) -
     )
 
     assert result.stop_reason == "no_change_needed"
-    assert transport.call_count > 0
-    worktree_root = target_repo / ".worktrees" / "stabilizing-prompts"
+    assert transport.worktree_ready_at_call
+    assert all(transport.worktree_ready_at_call)
     worktrees = tuple(worktree_root.iterdir())
     assert len(worktrees) == 1
     assert worktrees[0].is_dir()

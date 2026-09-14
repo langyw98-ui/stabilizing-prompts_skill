@@ -16,7 +16,7 @@ resolve primary checkout identity
 -> reject linked worktree or detached HEAD
 -> derive .worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/
 -> verify that directory is ignored with git check-ignore
--> create branch and worktree
+-> create branch and worktree with git worktree add
 -> persist WorktreeCycle
 ```
 
@@ -24,9 +24,12 @@ resolve primary checkout identity
 `.worktrees/stabilizing-prompts/` 下；调用方不能提供替代路径。必须在
 创建目录或分支前验证最终目录已被 Git 忽略，`.gitignore` never modified
 automatically。任何 primary-workspace、detached-HEAD、路径或 ignore gate
-失败都停止本周期，在任何 model call 前返回 setup error；never fall back
-to tuning in the original checkout。保留的 worktree 和 branch 需要用户
-手动检查或清理。
+失败、`git worktree add` 失败或 WorktreeCycle state-persistence 失败都停止
+本周期，在第一个 model call 前返回 setup error；never fall back to tuning
+in the original checkout。保留的 worktree 和 branch 需要用户手动检查或
+清理。Delivery-time 的 cycle-base/HEAD、worktree commit 和 contract identity
+stale-state guards 在模型阶段之后、同步前执行，可能在已有模型调用后停止
+交付；它们不是第一个 model call 之前的 setup gate。
 
 完整流程：
 

@@ -89,6 +89,31 @@ def test_tune_documents_project_local_worktree_gate(skill_text):
     assert "never" in tune and "fall back" in tune
     assert "--worktree" not in tune
 
+    setup_steps = (
+        "resolve primary checkout identity",
+        "reject linked worktree or detached HEAD",
+        "derive .worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/",
+        "verify that directory is ignored with git check-ignore",
+        "create branch and worktree with git worktree add",
+        "persist WorktreeCycle",
+    )
+    positions = [tune.index(step) for step in setup_steps]
+    assert positions == sorted(positions)
+
+
+def test_tune_separates_delivery_stale_state_guard_from_setup_gate(skill_text):
+    tune = skill_text.split("## verify", 1)[0]
+    worktree = _section(tune, "### 2. worktree", "### 3. contract/cases/adapter")
+    delivery = _section(tune, "### 13. allowlisted synchronization", "### CLI contracts")
+
+    assert "before the first model call" in worktree
+    assert "git worktree add" in worktree
+    assert "state-persistence failure" in worktree
+    assert "stale/invalid cycle" not in worktree
+    assert "critical dependency change" not in worktree
+    assert "Delivery-time stale-state guard" in delivery
+    assert "after model phases" in delivery
+
 
 def test_tune_documents_cycle_worktree_continuity_and_acceptance_ownership(skill_text):
     tune = _section(skill_text, "## tune", "## verify")
