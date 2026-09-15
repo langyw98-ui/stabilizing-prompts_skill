@@ -144,6 +144,18 @@ confirmation and all old runs are invalid and the gate must be repeated. The
 run manifest format remains unchanged; coverage obligation hashes are not
 manifest fields.
 
+The three raw `case_file_hashes` in `CASE_SUITE_JSON` remain useful for exact
+file identity, but they are distinct from `case_suite_hash`: the latter is the
+canonical, split-aware hash after production expected-object normalization and
+deterministic unordered-container serialization. A YAML reformat may change a
+raw file hash while leaving the canonical suite hash unchanged.
+
+The payload also exposes the ordered category applicability/evidence/rationale
+rows, the explicit obligation/split/variant coverage matrix, and structured
+input/scenario conflict records. Invalid suites remain `status: error`; their
+duplicate conflict records are diagnostic output and never make a suite
+eligible for evaluation.
+
 For actual split sizes `D`, `V`, and `A`, the confirmation material shows at
 least the fixed planned slots:
 

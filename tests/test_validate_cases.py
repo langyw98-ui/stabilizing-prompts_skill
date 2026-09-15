@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -27,9 +28,11 @@ from scripts.validate_cases import (
     load_case_suite,
     main,
     _jaccard,
+    _git_repository_root,
     _near_duplicate_pairs,
     _normalize_similarity_text,
     _scenario_key,
+    _split_paths,
     _text_signature,
 )
 
@@ -108,7 +111,14 @@ def complete_obligations_payload() -> dict[str, object]:
     return {
         "version": 1,
         "categories": [
-            {"category": name, "applicability": "required", "evidence_checked": []}
+            {
+                "category": name,
+                "applicability": "required" if name == "normal_path" else "not_applicable",
+                "evidence_checked": [] if name == "normal_path" else ["repository-tests"],
+                "rationale": None
+                if name == "normal_path"
+                else f"the fixture has no evidenced {name} behavior",
+            }
             for name in categories
         ],
         "obligations": [
@@ -783,6 +793,82 @@ def test_missing_required_split_variant_quota_is_reported(
         load_case_suite(case_files.values(), output_schema, obligations=obligations)
 
 
+def test_required_category_without_obligation_fails_matrix_completeness(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    payload = coverage_obligations.model_dump(mode="json")
+    payload["categories"] = [
+        *payload["categories"],
+    ]
+    payload["categories"] = [
+        {
+            **category,
+            "applicability": (
+                "required"
+                if category["category"] == "output_partition"
+                else category["applicability"]
+            ),
+            "evidence_checked": (
+                []
+                if category["category"] == "output_partition"
+                else category["evidence_checked"]
+            ),
+            "rationale": None
+            if category["category"] == "output_partition"
+            else category["rationale"],
+        }
+        for category in payload["categories"]
+    ]
+    obligations = CoverageObligations.model_validate(payload)
+
+    with pytest.raises(CaseSetupError, match="output_partition.*obligation"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=obligations
+        )
+
+
+def test_required_category_with_unobserved_obligation_fails_matrix_completeness(
+    case_files, output_schema, coverage_obligations
+) -> None:
+    payload = coverage_obligations.model_dump(mode="json")
+    payload["categories"] = [
+        {
+            **category,
+            "applicability": (
+                "required"
+                if category["category"] == "output_partition"
+                else category["applicability"]
+            ),
+            "evidence_checked": (
+                []
+                if category["category"] == "output_partition"
+                else category["evidence_checked"]
+            ),
+            "rationale": None
+            if category["category"] == "output_partition"
+            else category["rationale"],
+        }
+        for category in payload["categories"]
+    ]
+    payload["obligations"].append(
+        {
+            "id": "partition-input",
+            "source": ["evidence.py"],
+            "category": "output_partition",
+            "risk": "normal",
+            "rule": "partition the evidenced routing decisions",
+            "required_splits": {"dev": ["normal"]},
+            "variant_exclusions": {},
+        }
+    )
+    obligations = CoverageObligations.model_validate(payload)
+
+    with pytest.raises(CaseSetupError, match="output_partition.*primary"):
+        load_case_suite(
+            case_files.values(), output_schema, obligations=obligations
+        )
+
+
 def test_secondary_obligations_do_not_satisfy_quota(
     case_files, output_schema, coverage_obligations
 ) -> None:
@@ -1314,7 +1400,8 @@ def test_case_validation_cli_writes_machine_readable_suite(
                 "tests.test_validate_cases:Decision",
                 "--output",
                 str(output),
-            ]
+            ],
+            repo_root=eval_root,
         )
         == 0
     )
@@ -1343,6 +1430,187 @@ def test_case_validation_cli_writes_machine_readable_suite(
         "action": "accept",
         "reason": "matched",
     }
+    category_rows = payload["coverage"]["categories"]
+    assert category_rows[0]["category"] == "adversarial"
+    assert all(
+        {"category", "applicability", "evidence_checked", "rationale"}
+        <= set(row)
+        for row in category_rows
+    )
+    assert payload["coverage"]["matrix"] == payload["coverage_matrix"]
+    assert payload["coverage"]["matrix"]["missing_categories"] == []
+    assert payload["coverage"]["matrix"]["missing_quotas"] == []
+
+
+def test_case_validation_cli_reports_structured_input_and_scenario_conflicts(
+    tmp_path: Path,
+) -> None:
+    eval_root = tmp_path / "eval"
+    paths = write_case_sets(eval_root)
+    write_obligations(eval_root, complete_obligations_payload())
+
+    cases = read_cases(paths[0])
+    cases[1]["input"] = copy.deepcopy(cases[0]["input"])
+    write_cases(paths[0], cases)
+    output = tmp_path / "suite-error.json"
+
+    assert (
+        main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--schema",
+                "tests.test_validate_cases:Decision",
+                "--output",
+                str(output),
+            ],
+            repo_root=eval_root,
+        )
+        == 2
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["status"] == "error"
+    assert payload["duplicates"]["hard"]
+    assert payload["duplicates"]["hard"][0]["kind"] == "input_fingerprint"
+    assert payload["conflicts"]["input"] == payload["duplicates"]["hard"]
+    assert {
+        "left",
+        "right",
+        "fingerprint",
+        "kind",
+    } <= set(payload["duplicates"]["hard"][0])
+
+    # A distinct input with the same normalized scenario is a separate hard
+    # conflict and is reported through the same deterministic error contract.
+    cases = read_cases(paths[0])
+    cases[1]["input"] = {
+        "variables": {"split": "dev", "message": "different evidence"},
+        "context": {},
+    }
+    cases[1]["coverage"] = copy.deepcopy(cases[0]["coverage"])
+    write_cases(paths[0], cases)
+    assert (
+        main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--schema",
+                "tests.test_validate_cases:Decision",
+                "--output",
+                str(output),
+            ],
+            repo_root=eval_root,
+        )
+        == 2
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert any(
+        item["kind"] == "scenario_key" for item in payload["duplicates"]["hard"]
+    )
+    assert payload["conflicts"]["scenario"]
+
+
+def test_case_validation_cli_validates_obligations_before_schema_import(
+    tmp_path: Path,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    (eval_root / "side_effect_schema.py").write_text(
+        "from pathlib import Path\n"
+        "Path(__file__).with_name('schema-imported.marker').write_text('bad')\n"
+        "from pydantic import BaseModel\n"
+        "class Decision(BaseModel):\n"
+        "    action: str\n"
+        "    reason: str\n",
+        encoding="utf-8",
+    )
+    (eval_root / "coverage-obligations.yaml").write_text(
+        "version: 1\ncategories: []\nobligations: []\n", encoding="utf-8"
+    )
+    output = tmp_path / "suite-error.json"
+
+    assert (
+        main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--schema",
+                "side_effect_schema:Decision",
+                "--output",
+                str(output),
+            ],
+            repo_root=eval_root,
+        )
+        == 2
+    )
+    assert not (eval_root / "schema-imported.marker").exists()
+
+
+def test_canonical_serializer_sorts_unordered_values_across_hash_seeds() -> None:
+    code = (
+        "from scripts.validate_cases import _canonical_json; "
+        "print(_canonical_json({'values': {'alpha', 'beta', 'gamma'}, "
+        "'frozen': frozenset({3, 1, 2})}, label='test'))"
+    )
+    outputs = []
+    for seed in ("1", "2", "3"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        outputs.append(result.stdout.strip())
+
+    assert outputs[0] == outputs[1] == outputs[2]
+    assert outputs[0] == (
+        '{"frozen":[1,2,3],"values":["alpha","beta","gamma"]}'
+    )
+
+
+def test_production_expected_normalization_sorts_set_fields_across_hash_seeds() -> None:
+    code = (
+        "from pydantic import BaseModel\n"
+        "from scripts.validate_cases import _canonical_expected\n"
+        "class Output(BaseModel):\n"
+        "    labels: set[str]\n"
+        "print(_canonical_expected(Output(labels={'alpha', 'beta', 'gamma'})))"
+    )
+    outputs = []
+    for seed in ("11", "12", "13"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        outputs.append(result.stdout.strip())
+
+    assert outputs[0] == outputs[1] == outputs[2]
+    assert outputs[0] == '{"labels":["alpha","beta","gamma"]}'
+
+
+def test_split_paths_reject_unordered_iterables() -> None:
+    with pytest.raises(CaseSetupError, match="ordered"):
+        _split_paths({"dev.yaml", "validation.yaml", "acceptance.yaml"})
+
+
+def test_repository_root_resolution_fails_closed_without_explicit_injection(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(CaseSetupError, match="repository root"):
+        _git_repository_root(tmp_path)
+
+    assert _git_repository_root(tmp_path, explicit_root=tmp_path) == tmp_path.resolve()
 
 
 def test_case_validation_cli_reports_explained_near_duplicates_for_review(
@@ -1366,7 +1634,8 @@ def test_case_validation_cli_reports_explained_near_duplicates_for_review(
                 "tests.test_validate_cases:Decision",
                 "--output",
                 str(output),
-            ]
+            ],
+            repo_root=eval_root,
         )
         == 0
     )
@@ -1394,7 +1663,8 @@ def test_case_validation_cli_writes_explicit_error_for_invalid_assets(
                 "tests.test_validate_cases:Decision",
                 "--output",
                 str(output),
-            ]
+            ],
+            repo_root=eval_root,
         )
         == 2
     )

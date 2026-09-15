@@ -112,7 +112,7 @@ repository or worktree and is never taken from model output.
   repository; never accept a caller-selected worktree path.
 - Ignore gate: run `git check-ignore --no-index --quiet` for the final target
   directory before creating its parent, branch, or worktree. The target
-  Do not edit, stage, or commit the target repository's `.gitignore`. Before invoking `tune`, the user must establish an ignore rule that
+  directory must already be covered by an ignore rule. Do not edit, stage, or commit the target repository's `.gitignore`. Before invoking `tune`, the user must establish an ignore rule that
   covers `.worktrees/` (in the project rules, `.git/info/exclude`, or a global
   excludes file); if the rule is missing, stop with `setup_error`.
 - Command: `manage_worktree.py create --repo PATH --prompt-id ID --state PATH [--branch BRANCH]`.
@@ -156,6 +156,11 @@ repository or worktree and is never taken from model output.
   failures, and input boundaries; Codex and the user review scanned evidence,
   unregistered evidenced boundaries, near-duplicate distinctions, total call
   slots, and the saturation statement.
+- Hashes in `CASE_SUITE_JSON` have distinct meanings: each
+  `case_file_hashes.<split>` value is the exact raw-byte SHA-256 of that split
+  file, while `case_suite_hash` is the canonical hash of validated cases,
+  normalized production expected objects, and split identity. YAML formatting
+  changes can affect a raw file hash without changing the canonical suite hash.
 - Next: `user confirmation`. No acceptance case is run in this state.
 - Stop: pause for user adjudication on business evidence conflict or an
   uncertain truth. Invalid cases, Schema import, adapter fidelity, path

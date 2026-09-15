@@ -47,8 +47,8 @@ Skill 生成 `prompt-contract.yaml`，至少包含：
 
 The contract/cases/adapter package is a pre-model artifact. The confirmation
 record must bind the canonical Prompt path and hash, Schema reference, renderer
-and message-assembly entry points, critical dependency hashes, all three case
-file hashes, adapter identity, the fixed `kds` command/Python version,
+and message-assembly entry points, critical dependency hashes, the canonical
+`case_suite_hash`, adapter identity, the fixed `kds` command/Python version,
 repetition counts, phase thresholds, stop conditions, `evidence_checked`,
 `saturation_statement`, and explicit near-duplicate review confirmation/status.
 A plain approval of the Prompt wording is not sufficient.
@@ -61,7 +61,10 @@ validate_cases.py --eval-root PATH --schema MODULE:CLASS --output CASE_SUITE_JSO
 ```
 
 `WORKSPACE_JSON` is a read-only repository snapshot. `CASE_SUITE_JSON` is the
-validated, split-aware case summary and dataset hash. The proposed contract,
+validated, split-aware case summary. Its `case_file_hashes` values are exact
+raw-byte SHA-256 hashes of the three YAML files; its `case_suite_hash` is a
+canonical hash of validated cases, normalized production expected objects, and
+split identity. The proposed contract,
 complete expected objects, coverage matrix, and adapter boundary are shown to
 the user together with those outputs. Only an explicit confirmation freezes
 them and permits the fixed local-model probe. If evidence conflicts, a path or

@@ -9,8 +9,10 @@ keep validation and acceptance data from leaking into development data.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass
+from datetime import date, datetime, time
+from enum import Enum
 import hashlib
 import importlib
 import json
@@ -27,6 +29,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 class CaseSetupError(ValueError):
     """Raised when case files cannot form a valid evaluation dataset."""
+
+    def __init__(
+        self, message: str, *, details: Mapping[str, object] | None = None
+    ) -> None:
+        super().__init__(message)
+        self.details = dict(details or {})
 
 
 FIXED_CATEGORIES = frozenset(
@@ -491,6 +499,8 @@ class CoverageAudit:
     missing_quotas: tuple[tuple[str, str, str], ...]
     hard_duplicates: tuple[Mapping[str, object], ...]
     near_duplicates: tuple[Mapping[str, object], ...]
+    categories: tuple[Mapping[str, object], ...]
+    coverage_matrix: Mapping[str, object]
     mechanical_gates: Mapping[str, bool]
 
     def __post_init__(self) -> None:
@@ -500,6 +510,8 @@ class CoverageAudit:
             "missing_quotas",
             "hard_duplicates",
             "near_duplicates",
+            "categories",
+            "coverage_matrix",
             "mechanical_gates",
         ):
             object.__setattr__(
@@ -574,6 +586,11 @@ def _split_paths(paths: object) -> dict[str, Path]:
             if name in result:
                 raise CaseSetupError(f"case split supplied more than once: {name}")
             result[name] = Path(raw_path)
+    elif isinstance(paths, Set):
+        raise CaseSetupError(
+            "load_case_suite paths must be an ordered iterable; unordered sets "
+            "cannot determine dev, validation, acceptance"
+        )
     elif isinstance(paths, Iterable) and not isinstance(
         paths, (str, bytes, bytearray)
     ):
@@ -712,15 +729,68 @@ def _normalize_input_strings(value: object) -> object:
         return [_normalize_input_strings(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_normalize_input_strings(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return {
+            _normalize_input_strings(item)
+            for item in value
+        }
+    return value
+
+
+def _canonical_sort_key(value: object) -> str:
+    """Return a stable JSON key for an already canonical value."""
+
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _canonicalize_json(value: object) -> object:
+    """Recursively produce deterministic, JSON-compatible data.
+
+    Mappings are ordered by their canonical key representation, ordered
+    sequences retain their order, and unordered containers are converted to
+    sorted arrays.  This is intentionally shared by input fingerprints,
+    expected-object normalization, and dataset hashes.
+    """
+
+    if isinstance(value, BaseModel):
+        # ``mode='python'`` preserves set/frozenset fields.  Converting to
+        # JSON mode first would lose the distinction and retain hash-seed
+        # dependent iteration order in the resulting list.
+        return _canonicalize_json(value.model_dump(mode="python"))
+    if isinstance(value, Enum):
+        return _canonicalize_json(value.value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        items = [
+            (key, _canonicalize_json(item)) for key, item in value.items()
+        ]
+        items.sort(key=lambda item: _canonical_sort_key(item[0]))
+        return {key: item for key, item in items}
+    if isinstance(value, (set, frozenset)):
+        items = [_canonicalize_json(item) for item in value]
+        items.sort(key=_canonical_sort_key)
+        return items
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_json(item) for item in value]
     return value
 
 
 def _canonical_json(value: object, *, label: str) -> str:
+    """Serialize JSON-compatible values with deterministic unordered sets."""
+
     try:
+        canonical = _canonicalize_json(value)
         return json.dumps(
-            value,
+            canonical,
             ensure_ascii=False,
-            sort_keys=True,
+            sort_keys=False,
             separators=(",", ":"),
             allow_nan=False,
         )
@@ -831,6 +901,19 @@ def _flatten_input(
                 scalars=scalars,
             )
         return
+    if isinstance(value, (set, frozenset)):
+        ordered = sorted(
+            value,
+            key=lambda item: _canonical_sort_key(_canonicalize_json(item)),
+        )
+        for index, item in enumerate(ordered):
+            _flatten_input(
+                item,
+                path=f"{path}[{index}]",
+                strings=strings,
+                scalars=scalars,
+            )
+        return
     if isinstance(value, str):
         strings.append((path, value))
         return
@@ -881,9 +964,7 @@ def _same_scalar_signature(
 def _canonical_expected(expected: BaseModel) -> str:
     """Serialize a production expected object independently of input aliases."""
 
-    return _canonical_json(
-        expected.model_dump(mode="json"), label="production expected object"
-    )
+    return _canonical_json(expected, label="production expected object")
 
 
 def _near_duplicate_pairs(
@@ -963,7 +1044,11 @@ def _near_duplicate_error(
     if missing:
         return CaseSetupError(
             "near duplicate pair(s) require nonblank distinction: "
-            + "; ".join(missing)
+            + "; ".join(missing),
+            details={
+                "duplicates": {"hard": [], "near": list(pairs)},
+                "conflicts": {"input": [], "scenario": []},
+            },
         )
     return None
 
@@ -1057,13 +1142,26 @@ def _coverage_audit(
     split_distribution: dict[str, int] = {}
     variant_distribution: dict[str, int] = {}
     observed: set[tuple[str, str, str]] = set()
+    observed_by_quota: dict[tuple[str, str, str], list[str]] = {}
+    observed_by_category: dict[str, list[Mapping[str, object]]] = {}
 
     for split in _SPLITS:
         split_distribution[split] = len(split_cases[split])
         for validated in split_cases[split]:
             coverage = validated.case.coverage
             obligation = by_id[coverage.primary_obligation]
-            observed.add((obligation.id, split, coverage.variant))
+            quota_key = (obligation.id, split, coverage.variant)
+            observed.add(quota_key)
+            observed_by_quota.setdefault(quota_key, []).append(validated.case.id)
+            observed_by_category.setdefault(obligation.category, []).append(
+                {
+                    "split": split,
+                    "id": validated.case.id,
+                    "obligation": obligation.id,
+                    "variant": coverage.variant,
+                    "condition_id": coverage.condition_id,
+                }
+            )
             category_distribution[obligation.category] = (
                 category_distribution.get(obligation.category, 0) + 1
             )
@@ -1098,6 +1196,88 @@ def _coverage_audit(
             for category in obligations.categories
         )
     )
+
+    category_rows: list[Mapping[str, object]] = []
+    missing_categories: list[str] = []
+    for category_name in sorted(category_by_name):
+        category = category_by_name[category_name]
+        obligation_ids = tuple(
+            sorted(
+                obligation.id
+                for obligation in ordered_obligations
+                if obligation.category == category_name
+            )
+        )
+        observed_cases = tuple(
+            sorted(
+                observed_by_category.get(category_name, ()),
+                key=lambda item: (
+                    _SPLITS.index(str(item["split"])),
+                    str(item["id"]),
+                ),
+            )
+        )
+        if category.applicability == "not_applicable":
+            status = "not_applicable"
+            complete = True
+        elif not obligation_ids:
+            status = "missing_obligation"
+            complete = False
+            missing_categories.append(category_name)
+        elif not observed_cases:
+            status = "missing_primary_coverage"
+            complete = False
+            missing_categories.append(category_name)
+        else:
+            status = "complete"
+            complete = True
+        category_rows.append(
+            {
+                "category": category_name,
+                "applicability": category.applicability,
+                "evidence_checked": tuple(category.evidence_checked),
+                "rationale": category.rationale,
+                "obligations": obligation_ids,
+                "observed_primary_cases": observed_cases,
+                "status": status,
+                "complete": complete,
+            }
+        )
+
+    obligation_rows: list[Mapping[str, object]] = []
+    for obligation in ordered_obligations:
+        requirements: list[Mapping[str, object]] = []
+        for split in _SPLITS:
+            for variant in sorted(obligation.required_splits.get(split, ())):
+                quota_key = (obligation.id, split, variant)
+                case_ids = tuple(sorted(observed_by_quota.get(quota_key, ())))
+                requirements.append(
+                    {
+                        "split": split,
+                        "variant": variant,
+                        "case_ids": case_ids,
+                        "complete": bool(case_ids),
+                    }
+                )
+        obligation_rows.append(
+            {
+                "obligation": obligation.id,
+                "category": obligation.category,
+                "risk": obligation.risk,
+                "requirements": tuple(requirements),
+                "complete": all(
+                    bool(requirement["complete"]) for requirement in requirements
+                ),
+            }
+        )
+
+    coverage_matrix = {
+        "categories": tuple(category_rows),
+        "obligations": tuple(obligation_rows),
+        "missing_categories": tuple(sorted(missing_categories)),
+        "missing_quotas": tuple(missing_quotas),
+    }
+    category_coverage = not missing_categories
 
     critical_coverage = True
     critical_variants = {"boundary", "conflict", "adversarial"}
@@ -1147,6 +1327,7 @@ def _coverage_audit(
         ),
         "coverage_matrix": (
             category_declarations
+            and category_coverage
             and not missing_quotas
             and critical_coverage
         ),
@@ -1165,6 +1346,8 @@ def _coverage_audit(
         missing_quotas=missing_quotas,
         hard_duplicates=(),
         near_duplicates=tuple(near_duplicates),
+        categories=tuple(category_rows),
+        coverage_matrix=coverage_matrix,
         mechanical_gates=mechanical_gates,
     )
 
@@ -1245,6 +1428,21 @@ def _coverage_gate_error(
                     + ", ".join(sorted(missing_exclusions))
                 )
 
+    matrix_categories = audit.coverage_matrix.get("categories", ())
+    for category in matrix_categories:
+        if not isinstance(category, Mapping) or category.get("complete"):
+            continue
+        category_name = category.get("category", "<unknown>")
+        status = category.get("status")
+        if status == "missing_obligation":
+            failures.append(
+                f"required category {category_name!r} has no obligation"
+            )
+        elif status == "missing_primary_coverage":
+            failures.append(
+                f"required category {category_name!r} has no observed primary coverage"
+            )
+
     if not audit.mechanical_gates["coverage_matrix"]:
         failures.append("coverage matrix is incomplete")
 
@@ -1299,6 +1497,57 @@ def load_case_split(
     return parsed
 
 
+def _conflict_reference(split: str, case_id: str) -> dict[str, str]:
+    """Return a stable, redaction-safe reference to one case."""
+
+    return {"split": split, "id": case_id}
+
+
+def _hard_conflict_error(
+    hard_duplicates: Sequence[Mapping[str, object]],
+    *,
+    input_conflicts: Sequence[Mapping[str, object]],
+    scenario_conflicts: Sequence[Mapping[str, object]],
+    semantic_conflicts: Sequence[Mapping[str, object]],
+) -> CaseSetupError:
+    """Build a setup error carrying deterministic duplicate/conflict details."""
+
+    messages: list[str] = []
+    for conflict in hard_duplicates:
+        kind = conflict.get("kind")
+        left = conflict.get("left")
+        right = conflict.get("right")
+        if kind == "case_id":
+            messages.append(f"duplicate case id {conflict.get('key')!r}: {left!r} conflicts with {right!r}")
+        elif kind == "input_fingerprint":
+            messages.append(f"duplicate input fingerprint: {left!r} conflicts with {right!r}")
+        elif kind == "scenario_key":
+            messages.append(f"duplicate scenario key {conflict.get('key')!r}: {left!r} conflicts with {right!r}")
+        elif kind == "normalized_input_fingerprint":
+            messages.append(
+                f"normalized input fingerprint leakage across splits: {left!r} conflicts with {right!r}"
+            )
+    for conflict in semantic_conflicts:
+        messages.append(
+            "semantic family leakage across splits: "
+            f"{conflict.get('right')!r} conflicts with {conflict.get('left')!r}"
+        )
+    if not messages:
+        messages.append("case identity conflicts were detected")
+    details = {
+        "duplicates": {"hard": list(hard_duplicates), "near": []},
+        "conflicts": {
+            "input": list(input_conflicts),
+            "scenario": list(scenario_conflicts),
+            "semantic_family": list(semantic_conflicts),
+        },
+    }
+    return CaseSetupError(
+        "case identity validation failed: " + "; ".join(messages),
+        details=details,
+    )
+
+
 def load_case_suite(
     paths: object,
     schema: type[_SchemaT],
@@ -1334,6 +1583,10 @@ def load_case_suite(
     seen_inputs: dict[str, tuple[str, str]] = {}
     seen_normalized_inputs: dict[str, tuple[str, str]] = {}
     seen_scenarios: dict[tuple[str, str, str], tuple[str, str]] = {}
+    hard_duplicates: list[Mapping[str, object]] = []
+    input_conflicts: list[Mapping[str, object]] = []
+    scenario_conflicts: list[Mapping[str, object]] = []
+    semantic_conflicts: list[Mapping[str, object]] = []
     for split in _SPLITS:
         for validated in split_cases[split]:
             case = validated.case
@@ -1342,10 +1595,16 @@ def load_case_suite(
             )
             previous_split = seen_ids.get(case.id)
             if previous_split is not None:
-                raise CaseSetupError(
-                    f"duplicate case id {case.id!r} in {previous_split} and {split}"
+                hard_duplicates.append(
+                    {
+                        "kind": "case_id",
+                        "key": case.id,
+                        "left": _conflict_reference(previous_split, case.id),
+                        "right": _conflict_reference(split, case.id),
+                    }
                 )
-            seen_ids[case.id] = split
+            else:
+                seen_ids[case.id] = split
 
             family = _normalized_family(case.semantic_family)
             if not family:
@@ -1354,12 +1613,17 @@ def load_case_suite(
                 )
             previous = seen_families.get(family)
             if previous is not None and previous[0] != split:
-                raise CaseSetupError(
-                    "semantic family leakage across splits: "
-                    f"{case.semantic_family!r} in {split} conflicts with "
-                    f"{previous[1]!r} in {previous[0]}"
+                semantic_conflicts.append(
+                    {
+                        "kind": "semantic_family",
+                        "key": family,
+                        "left": _conflict_reference(previous[0], previous[1]),
+                        "right": _conflict_reference(split, case.id),
+                        "value": case.semantic_family,
+                    }
                 )
-            seen_families.setdefault(family, (split, case.semantic_family))
+            else:
+                seen_families.setdefault(family, (split, case.semantic_family))
 
             input_fingerprint = _canonical_json(
                 case.input, label=f"{split} case {case.id!r} input"
@@ -1370,11 +1634,16 @@ def load_case_suite(
             )
             previous_input = seen_inputs.get(input_fingerprint)
             if previous_input is not None:
-                raise CaseSetupError(
-                    "duplicate input fingerprint: "
-                    f"{case.id!r} in {split} conflicts with "
-                    f"{previous_input[1]!r} in {previous_input[0]}"
-                )
+                conflict = {
+                    "kind": "input_fingerprint",
+                    "fingerprint": input_fingerprint,
+                    "left": _conflict_reference(previous_input[0], previous_input[1]),
+                    "right": _conflict_reference(split, case.id),
+                }
+                input_conflicts.append(conflict)
+                hard_duplicates.append(conflict)
+            else:
+                seen_inputs[input_fingerprint] = (split, case.id)
             previous_normalized_input = seen_normalized_inputs.get(
                 normalized_input_fingerprint
             )
@@ -1382,25 +1651,43 @@ def load_case_suite(
                 previous_normalized_input is not None
                 and previous_normalized_input[0] != split
             ):
-                raise CaseSetupError(
-                    "normalized input fingerprint leakage across splits: "
-                    f"{case.id!r} in {split} conflicts with "
-                    f"{previous_normalized_input[1]!r} in {previous_normalized_input[0]}"
+                conflict = {
+                    "kind": "normalized_input_fingerprint",
+                    "fingerprint": normalized_input_fingerprint,
+                    "left": _conflict_reference(
+                        previous_normalized_input[0], previous_normalized_input[1]
+                    ),
+                    "right": _conflict_reference(split, case.id),
+                }
+                input_conflicts.append(conflict)
+                hard_duplicates.append(conflict)
+            else:
+                seen_normalized_inputs[normalized_input_fingerprint] = (
+                    split,
+                    case.id,
                 )
-            seen_inputs.setdefault(input_fingerprint, (split, case.id))
-            seen_normalized_inputs.setdefault(
-                normalized_input_fingerprint, (split, case.id)
-            )
 
             scenario_key = _scenario_key(case)
             previous_scenario = seen_scenarios.get(scenario_key)
             if previous_scenario is not None:
-                raise CaseSetupError(
-                    "duplicate scenario key "
-                    f"{scenario_key!r}: {case.id!r} in {split} conflicts with "
-                    f"{previous_scenario[1]!r} in {previous_scenario[0]}"
-                )
-            seen_scenarios[scenario_key] = (split, case.id)
+                conflict = {
+                    "kind": "scenario_key",
+                    "key": list(scenario_key),
+                    "left": _conflict_reference(previous_scenario[0], previous_scenario[1]),
+                    "right": _conflict_reference(split, case.id),
+                }
+                scenario_conflicts.append(conflict)
+                hard_duplicates.append(conflict)
+            else:
+                seen_scenarios[scenario_key] = (split, case.id)
+
+    if hard_duplicates or semantic_conflicts:
+        raise _hard_conflict_error(
+            hard_duplicates,
+            input_conflicts=input_conflicts,
+            scenario_conflicts=scenario_conflicts,
+            semantic_conflicts=semantic_conflicts,
+        )
 
     near_duplicates = _near_duplicate_pairs(split_cases)
     near_duplicate_error = _near_duplicate_error(near_duplicates)
@@ -1425,12 +1712,15 @@ def load_case_suite(
 
 
 def _canonical_case(validated: ValidatedCase) -> dict[str, Any]:
-    data = validated.case.model_dump(mode="json")
+    data = validated.case.model_dump(mode="python")
     # The production model is the authoritative serialization for the expected
     # output, preventing equivalent Pydantic inputs from producing two hashes.
     data["expect"] = dict(data["expect"])
-    data["expect"]["output"] = validated.expected.model_dump(mode="json")
-    return data
+    data["expect"]["output"] = validated.expected.model_dump(mode="python")
+    canonical = json.loads(_canonical_json(data, label="case"))
+    if not isinstance(canonical, dict):
+        raise CaseSetupError("case must serialize to a JSON object")
+    return canonical
 
 
 def dataset_hash(suite: CaseSuite) -> str:
@@ -1446,12 +1736,7 @@ def dataset_hash(suite: CaseSuite) -> str:
         ]
         for split in _SPLITS
     }
-    canonical = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    canonical = _canonical_json(payload, label="case suite").encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -1501,8 +1786,16 @@ def _load_schema(reference: str, eval_root: Path) -> type[BaseModel]:
     return value
 
 
-def _git_repository_root(start: Path) -> Path:
+def _git_repository_root(
+    start: Path, *, explicit_root: Path | None = None
+) -> Path:
     """Resolve the repository root containing an evaluation asset."""
+
+    if explicit_root is not None:
+        try:
+            return Path(explicit_root).resolve(strict=False)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise CaseSetupError(f"repository root is invalid: {error}") from error
 
     try:
         result = subprocess.run(
@@ -1512,14 +1805,13 @@ def _git_repository_root(start: Path) -> Path:
             encoding="utf-8",
             check=False,
         )
-    except OSError:
-        result = None
+    except OSError as error:
+        raise CaseSetupError(f"unable to resolve repository root: {error}") from error
     if result is not None and result.returncode == 0 and result.stdout.strip():
         return Path(result.stdout.strip()).resolve(strict=False)
-    # Temporary unit-test evaluation roots are not Git repositories.  A real
-    # evaluation checkout takes the Git-derived branch above; keeping the root
-    # local here preserves the CLI contract for isolated fixtures.
-    return start
+    detail = (result.stderr or result.stdout).strip() if result is not None else ""
+    suffix = f": {detail}" if detail else ""
+    raise CaseSetupError(f"unable to resolve repository root for {start}{suffix}")
 
 
 _SENSITIVE_OUTPUT_KEY = {
@@ -1600,7 +1892,10 @@ def _suite_payload(
             for split in _SPLITS
         },
         "counts": audit.counts,
+        "coverage_matrix": audit.coverage_matrix,
         "coverage": {
+            "categories": audit.categories,
+            "matrix": audit.coverage_matrix,
             "distributions": audit.distributions,
             "missing_quotas": [list(item) for item in audit.missing_quotas],
             "mechanical_gates": dict(audit.mechanical_gates),
@@ -1659,7 +1954,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None, *, repo_root: Path | None = None
+) -> int:
     """Validate all three case splits and write a machine-readable summary."""
 
     args = _parser().parse_args(argv)
@@ -1667,11 +1964,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         eval_root = args.eval_root.resolve(strict=False)
         if not eval_root.is_dir():
             raise CaseSetupError(f"evaluation root does not exist: {args.eval_root}")
-        schema = _load_schema(args.schema_ref, eval_root)
         obligations_path = eval_root / "coverage-obligations.yaml"
         obligations = load_coverage_obligations(
-            obligations_path, _git_repository_root(eval_root)
+            obligations_path,
+            _git_repository_root(eval_root, explicit_root=repo_root),
         )
+        schema = _load_schema(args.schema_ref, eval_root)
         paths = tuple(eval_root / f"{split}-cases.yaml" for split in _SPLITS)
         suite = load_case_suite(paths, schema, obligations=obligations)
         payload = _suite_payload(
@@ -1684,6 +1982,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_json(args.output, payload)
     except (CaseSetupError, OSError, ValueError, TypeError) as error:
         payload = {"status": "error", "error": _safe_error(error)}
+        details = getattr(error, "details", None)
+        if isinstance(details, Mapping):
+            payload.update(_redact_cli_value(details))
         try:
             _write_json(args.output, payload)
         except OSError as write_error:
@@ -1713,6 +2014,8 @@ __all__ = [
     "load_coverage_obligations",
     "load_case_split",
     "load_case_suite",
+    "_canonical_json",
+    "_canonical_expected",
     "_flatten_input",
     "_jaccard",
     "_near_duplicate_pairs",

@@ -593,6 +593,34 @@ _FIXTURE_CASE_CATALOG = (
 )
 
 
+# Each non-default primary obligation below is backed by a distinct catalog
+# boundary.  The mapping keeps the integration asset honest: every required
+# category has real primary cases instead of being declared merely to satisfy
+# the fixed category list.
+_FIXTURE_OBLIGATION_BY_INDEX = {
+    0: "partition-output",
+    4: "near-boundary",
+    5: "field-boundary",
+    6: "near-boundary",
+    9: "near-boundary",
+    10: "partition-output",
+    11: "conditional-branch",
+    14: "partition-output",
+    15: "conditional-branch",
+    16: "partition-output",
+    18: "untrusted-device-adversarial",
+    19: "untrusted-device-adversarial",
+    20: "partition-output",
+    22: "partition-output",
+    23: "near-boundary",
+    24: "field-boundary",
+    25: "field-boundary",
+    26: "partition-output",
+    27: "conditional-branch",
+    28: "precedence-conflict",
+}
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -783,7 +811,14 @@ def _case_sets() -> dict[str, list[dict[str, object]]]:
     }
     return {
         split: [
-            make_case(split, index, variant=variant)
+            make_case(
+                split,
+                index,
+                obligation=_FIXTURE_OBLIGATION_BY_INDEX.get(
+                    index, "classify-input"
+                ),
+                variant=variant,
+            )
             for index in range(30)
         ]
         for split, variant in variants.items()
@@ -830,6 +865,19 @@ def _write_complete_assets(repo: Path, prompt_id: str) -> Path:
             "thresholds": {"normal": {"development": 4, "acceptance": 9}},
         },
     )
+    required_categories = {
+        "normal_path",
+        "output_partition",
+        "near_boundary",
+        "field_boundary",
+        "conditional_branch",
+        "conflict",
+        "adversarial",
+    }
+    category_evidence = [
+        "target_app/production.py",
+        "repository-tests",
+    ]
     _write_yaml(
         eval_root / "coverage-obligations.yaml",
         {
@@ -837,8 +885,21 @@ def _write_complete_assets(repo: Path, prompt_id: str) -> Path:
             "categories": [
                 {
                     "category": category,
-                    "applicability": "required",
-                    "evidence_checked": [],
+                    "applicability": (
+                        "required"
+                        if category in required_categories
+                        else "not_applicable"
+                    ),
+                    "evidence_checked": category_evidence,
+                    "rationale": (
+                        None
+                        if category in required_categories
+                        else (
+                            "The fixture has no evidenced ambiguity, irrelevant "
+                            "input, explicit fallback, or confirmed historical "
+                            "regression behavior."
+                        )
+                    ),
                 }
                 for category in (
                     "normal_path",
@@ -867,7 +928,30 @@ def _write_complete_assets(repo: Path, prompt_id: str) -> Path:
                         "acceptance": ["natural_variation"],
                     },
                     "variant_exclusions": {},
-                }
+                },
+                *[
+                    {
+                        "id": obligation_id,
+                        "source": ["target_app/production.py"],
+                        "category": category,
+                        "risk": "normal",
+                        "rule": f"exercise the evidenced {category} routing boundary",
+                        "required_splits": {
+                            "dev": ["normal"],
+                            "validation": ["boundary"],
+                            "acceptance": ["natural_variation"],
+                        },
+                        "variant_exclusions": {},
+                    }
+                    for category, obligation_id in (
+                        ("output_partition", "partition-output"),
+                        ("near_boundary", "near-boundary"),
+                        ("field_boundary", "field-boundary"),
+                        ("conditional_branch", "conditional-branch"),
+                        ("conflict", "precedence-conflict"),
+                        ("adversarial", "untrusted-device-adversarial"),
+                    )
+                ],
             ],
         },
     )
