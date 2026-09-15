@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 import importlib
 import json
@@ -793,7 +794,7 @@ def _canonical_tagged(value: object) -> object:
             "items": [_canonical_tagged(item) for item in value],
         }
     else:
-        body = {"kind": "scalar", "value": _canonicalize_json(value)}
+        body = {"kind": "scalar", "value": _canonical_tagged_scalar(value)}
     return {"type": [type_module, type_name], "value": body}
 
 
@@ -803,11 +804,90 @@ def _canonical_tagged_sort_key(value: object) -> str:
     return _canonical_sort_key(_canonical_tagged(value))
 
 
+def _canonical_container_shape(value: object) -> object:
+    """Describe container ordering semantics without serializing scalar values."""
+
+    if isinstance(value, Mapping):
+        members = [
+            (_canonical_container_shape(key), _canonical_container_shape(item))
+            for key, item in value.items()
+        ]
+        members.sort(
+            key=lambda pair: (
+                _canonical_sort_key(pair[0]),
+                _canonical_sort_key(pair[1]),
+            )
+        )
+        return {"kind": "mapping", "items": [[key, item] for key, item in members]}
+    if isinstance(value, (set, frozenset)):
+        member_by_key = {
+            _canonical_sort_key(shape): shape
+            for shape in (_canonical_container_shape(item) for item in value)
+        }
+        members = [member_by_key[key] for key in sorted(member_by_key)]
+        return {"kind": "unordered", "items": members}
+    if isinstance(value, (list, tuple)):
+        return {
+            "kind": "ordered",
+            "items": [_canonical_container_shape(item) for item in value],
+        }
+    return {"kind": "scalar"}
+
+
+def _canonical_tagged_scalar(value: object) -> object:
+    """Return safe scalar metadata for deterministic tie-breaking.
+
+    Configured Pydantic encoders are available only for the paired JSON value,
+    so raw bytes must never be passed through the default UTF-8 encoder here.
+    Hex metadata is deterministic for every byte sequence, including invalid
+    UTF-8; it is not part of the emitted canonical value.
+    """
+
+    if isinstance(value, bytes):
+        return {"encoding": "hex", "value": value.hex()}
+    if isinstance(value, bytearray):
+        return {"encoding": "hex", "value": bytes(value).hex()}
+    if isinstance(value, memoryview):
+        return {"encoding": "hex", "value": value.tobytes().hex()}
+    if value is None:
+        return {"encoding": "none"}
+    if isinstance(value, str):
+        return {"encoding": "text", "value": value}
+    if isinstance(value, bool):
+        return {"encoding": "bool", "value": value}
+    if isinstance(value, int):
+        return {"encoding": "int", "value": value}
+    if isinstance(value, float):
+        return {"encoding": "float", "value": repr(value)}
+    if isinstance(value, Enum):
+        return {"encoding": "enum", "value": str(value)}
+    if type(value).__module__ in {"datetime", "decimal", "pathlib", "uuid"}:
+        return {"encoding": "text", "value": str(value)}
+    return {"encoding": "type-only"}
+
+
+def _canonical_shape_matchable(value: object) -> bool:
+    """Return whether raw-value shape matching may use standalone JSON mode."""
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return False
+    if isinstance(value, Mapping):
+        return all(
+            _canonical_shape_matchable(key)
+            and _canonical_shape_matchable(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (set, frozenset, list, tuple)):
+        return all(_canonical_shape_matchable(item) for item in value)
+    return True
+
+
 def _canonicalize_unordered(
     raw: object,
     encoded: object | None = None,
     *,
     paired_items: Sequence[tuple[object, object]] | None = None,
+    enforce_cardinality: bool = True,
 ) -> object:
     """Canonicalize an unordered container without losing raw/JSON pairing.
 
@@ -816,10 +896,25 @@ def _canonicalize_unordered(
     ``paired_items`` carries an explicit raw-element to JSON-element mapping.
     Otherwise we match equivalent canonical shapes and use a deterministic raw
     shape template for nested unordered values.  No independently unordered
-    raw/JSON lists are zipped together.
+    raw/JSON lists are zipped together.  Cardinality is enforced for actual
+    raw/JSON pairings; the fallback template disables that check because its
+    raw member is only a shape witness, not the associated member.
     """
 
     raw_items = tuple(raw)  # type: ignore[arg-type]
+
+    if encoded is not None and enforce_cardinality:
+        if not isinstance(encoded, (list, tuple)):
+            raise CaseSetupError(
+                "unsupported aggregate/unordered serialization: JSON output for "
+                f"a set/frozenset must be a list with {len(raw_items)} element(s)"
+            )
+        if len(encoded) != len(raw_items):
+            raise CaseSetupError(
+                "unsupported aggregate/unordered serialization: JSON output has "
+                f"{len(encoded)} element(s) for {len(raw_items)} raw set/frozenset "
+                "element(s)"
+            )
 
     if paired_items is not None and len(paired_items) == len(raw_items):
         decorated = [
@@ -850,11 +945,6 @@ def _canonicalize_unordered(
         )
         return [item for item, _raw_tag in decorated]
 
-    if not isinstance(encoded, (list, tuple)):
-        # A field serializer may intentionally replace the set with another
-        # JSON value.  Preserve that value rather than manufacturing a list.
-        return _canonicalize_json(encoded)
-
     encoded_items = list(encoded)
 
     # First recover associations from the canonical raw shape.  The candidate
@@ -864,18 +954,33 @@ def _canonicalize_unordered(
         remaining = list(range(len(encoded_items)))
         matched: list[tuple[object, object]] = []
         for raw_item in sorted(raw_items, key=_canonical_tagged_sort_key):
-            raw_shape = _canonicalize_json(raw_item)
-            candidates = [
-                (
-                    index,
-                    _canonicalize_with_json_hint(raw_item, encoded_items[index]),
-                )
-                for index in remaining
-            ]
+            if not _canonical_shape_matchable(raw_item):
+                matched = []
+                break
+            try:
+                raw_shape = _canonicalize_json(raw_item)
+                raw_shape_key = _canonical_sort_key(raw_shape)
+                candidates = [
+                    (
+                        index,
+                        _canonicalize_with_json_hint(
+                            raw_item, encoded_items[index]
+                        ),
+                    )
+                    for index in remaining
+                ]
+            except CaseSetupError:
+                raise
+            except (TypeError, ValueError, OverflowError):
+                # A configured serializer may have no standalone raw-value
+                # encoding (notably invalid UTF-8 bytes).  Skip shape matching
+                # and use the paired JSON values in the fallback below.
+                matched = []
+                break
             equivalent = [
                 (index, candidate)
                 for index, candidate in candidates
-                if _canonical_sort_key(candidate) == _canonical_sort_key(raw_shape)
+                if _canonical_sort_key(candidate) == raw_shape_key
             ]
             if not equivalent:
                 matched = []
@@ -902,13 +1007,24 @@ def _canonicalize_unordered(
     # shape template to each encoded member so nested set/frozenset structure
     # is still normalized, then sort by the resulting JSON value and tag.
     templates = sorted(raw_items, key=_canonical_tagged_sort_key)
+    shapes = {
+        _canonical_sort_key(_canonical_container_shape(item))
+        for item in templates
+    }
+    if len(shapes) > 1:
+        raise CaseSetupError(
+            "ambiguous unordered serialization: heterogeneous nested member "
+            "shapes cannot be mapped to the paired JSON elements"
+        )
     if not templates:
         canonical_encoded = [(_canonicalize_json(item), None) for item in encoded_items]
     else:
         template = templates[0]
         canonical_encoded = [
             (
-                _canonicalize_with_json_hint(template, item),
+                _canonicalize_with_json_hint(
+                    template, item, enforce_cardinality=False
+                ),
                 _canonical_tagged(template),
             )
             for item in encoded_items
@@ -964,6 +1080,7 @@ def _canonicalize_with_json_hint(
     encoded: object,
     *,
     paired_items: Sequence[tuple[object, object]] | None = None,
+    enforce_cardinality: bool = True,
 ) -> object:
     """Canonicalize a Python-mode value while retaining its JSON-mode value.
 
@@ -975,7 +1092,11 @@ def _canonicalize_with_json_hint(
     """
 
     if isinstance(raw, BaseModel):
-        return _canonicalize_model(raw, encoded_hint=encoded)
+        return _canonicalize_model(
+            raw,
+            encoded_hint=encoded,
+            enforce_cardinality=enforce_cardinality,
+        )
 
     if isinstance(raw, Mapping):
         if not isinstance(encoded, Mapping):
@@ -1002,20 +1123,33 @@ def _canonicalize_with_json_hint(
             items.append(
                 (
                     _canonicalize_json(encoded_key_value),
-                    _canonicalize_with_json_hint(raw_item, encoded_item),
+                    _canonicalize_with_json_hint(
+                        raw_item,
+                        encoded_item,
+                        enforce_cardinality=enforce_cardinality,
+                    ),
                 )
             )
         items.sort(key=lambda item: _canonical_sort_key(item[0]))
         return {key: item for key, item in items}
 
     if isinstance(raw, (set, frozenset)):
-        return _canonicalize_unordered(raw, encoded, paired_items=paired_items)
+        return _canonicalize_unordered(
+            raw,
+            encoded,
+            paired_items=paired_items,
+            enforce_cardinality=enforce_cardinality,
+        )
 
     if isinstance(raw, (list, tuple)):
         if not isinstance(encoded, (list, tuple)) or len(raw) != len(encoded):
             return _canonicalize_json(encoded)
         return [
-            _canonicalize_with_json_hint(raw_item, encoded_item)
+            _canonicalize_with_json_hint(
+                raw_item,
+                encoded_item,
+                enforce_cardinality=enforce_cardinality,
+            )
             for raw_item, encoded_item in zip(raw, encoded, strict=True)
         ]
 
@@ -1025,7 +1159,10 @@ def _canonicalize_with_json_hint(
 
 
 def _canonicalize_model(
-    model: BaseModel, *, encoded_hint: object = _MISSING
+    model: BaseModel,
+    *,
+    encoded_hint: object = _MISSING,
+    enforce_cardinality: bool = True,
 ) -> object:
     """Canonicalize a model while retaining field-level JSON serializers."""
 
@@ -1057,6 +1194,7 @@ def _canonicalize_model(
                 raw_item,
                 encoded_item,
                 paired_items=paired_items,
+                enforce_cardinality=enforce_cardinality,
             )
         items.append((_canonicalize_json(key), canonical_item))
 
@@ -1132,6 +1270,8 @@ def _canonical_json(value: object, *, label: str) -> str:
             separators=(",", ":"),
             allow_nan=False,
         )
+    except CaseSetupError:
+        raise
     except (TypeError, ValueError) as exc:
         raise CaseSetupError(f"{label} must contain JSON-compatible values: {exc}") from exc
 

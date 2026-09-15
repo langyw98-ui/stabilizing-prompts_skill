@@ -29,6 +29,7 @@ from scripts.validate_cases import (
     main,
     _jaccard,
     _canonical_json,
+    _canonical_expected,
     _git_repository_root,
     _near_duplicate_pairs,
     _normalize_similarity_text,
@@ -1849,6 +1850,104 @@ def test_nested_unordered_sets_preserve_configured_and_custom_json_serializers()
 
     assert outputs[0] == outputs[1] == outputs[2]
     assert json.loads(outputs[0]) == json.loads(expected_outputs[0])
+
+
+def test_aggregate_unordered_serializer_cardinality_change_fails_closed() -> None:
+    from pydantic import field_serializer
+
+    class Output(BaseModel):
+        values: set[str]
+
+        @field_serializer("values", when_used="json")
+        def serialize_values(self, values: set[str]) -> list[str]:
+            return ["aggregate", str(len(values))]
+
+    with pytest.raises(CaseSetupError, match="aggregate.*unordered|unordered.*aggregate"):
+        _canonical_expected(Output(values={"alpha", "beta", "gamma"}))
+
+
+def test_invalid_utf8_base64_set_serialization_is_deterministic() -> None:
+    code = (
+        "import json\n"
+        "from pydantic import BaseModel, ConfigDict\n"
+        "from scripts.validate_cases import _canonical_expected\n"
+        "class Output(BaseModel):\n"
+        "    model_config = ConfigDict(ser_json_bytes='base64')\n"
+        "    values: set[bytes]\n"
+        "    nested: set[frozenset[bytes]]\n"
+        "    deep: set[frozenset[frozenset[bytes]]]\n"
+        "value = Output(\n"
+        "    values={bytes([254]), bytes([255])},\n"
+        "    nested={frozenset({bytes([252]), bytes([253])}), frozenset({bytes([250]), bytes([251])})},\n"
+        "    deep={\n"
+        "        frozenset({frozenset({bytes([240]), bytes([241])}), frozenset({bytes([242])})}),\n"
+        "        frozenset({frozenset({bytes([243]), bytes([244]), bytes([245])}), frozenset({bytes([246])})}),\n"
+        "    },\n"
+        ")\n"
+        "raw = value.model_dump(mode='json')\n"
+        "raw['values'] = sorted(raw['values'])\n"
+        "raw['nested'] = sorted(sorted(item) for item in raw['nested'])\n"
+        "raw['deep'] = sorted(sorted(sorted(inner) for inner in outer) for outer in raw['deep'])\n"
+        "print(_canonical_expected(value))\n"
+        "print(json.dumps(raw, separators=(',', ':')))\n"
+    )
+    outputs = []
+    expected_outputs = []
+    for seed in ("71", "72", "73"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        lines = result.stdout.splitlines()
+        assert len(lines) == 2
+        outputs.append(lines[0])
+        expected_outputs.append(lines[1])
+
+    assert outputs[0] == outputs[1] == outputs[2]
+    assert json.loads(outputs[0]) == json.loads(expected_outputs[0])
+    assert json.loads(outputs[0])["values"] == ["_g==", "_w=="]
+
+
+def test_ambiguous_mixed_unordered_member_shapes_fail_closed() -> None:
+    from pydantic import field_serializer
+
+    class Output(BaseModel):
+        values: set[object]
+
+        @field_serializer("values", when_used="json")
+        def serialize_values(self, values: set[object]) -> object:
+            if len(values) == 1:
+                return {"probe": "not-an-element-list"}
+            return [
+                [f"json:{item}" for item in value]
+                for value in values
+            ]
+
+    value = Output(values={frozenset({"a", "b"}), ("b", "a")})
+    with pytest.raises(CaseSetupError, match="ambiguous.*unordered|unordered.*ambiguous"):
+        _canonical_expected(value)
+
+
+def test_ordinary_pydantic_json_schema_canonicalization_is_unchanged() -> None:
+    class Output(BaseModel):
+        labels: set[str]
+        ordered: list[tuple[str, int]]
+
+    value = Output(
+        labels={"beta", "alpha"},
+        ordered=[("first", 1), ("second", 2)],
+    )
+    canonical = json.loads(_canonical_expected(value))
+    expected = value.model_dump(mode="json")
+    expected["labels"] = sorted(expected["labels"])
+    assert canonical == expected
 
 
 def test_text_signature_sorts_heterogeneous_unordered_inputs_across_hash_seeds() -> None:
