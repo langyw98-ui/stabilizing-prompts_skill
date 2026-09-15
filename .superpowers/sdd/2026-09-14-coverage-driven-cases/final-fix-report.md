@@ -253,3 +253,73 @@ rtk git diff --check
 
 The pre-existing untracked `scripts/__pycache__/` and `tests/__pycache__/`
 directories were preserved and not staged in Round 4.
+
+## Final review fix report — Round 5
+
+Round 5 baseline: `fad260063defc72e314e8cd1ca535a9df6aa643a`
+
+Implementation commit: `b67be9aa6b9b9d95ac9c21f71de705f6e34ab284`
+(`fix: fail closed for exotic unordered serializers`)
+
+### Fixes
+
+- Unordered JSON outputs now require a list with the same cardinality as the
+  raw set/frozenset. Aggregate or non-list serializers fail with a deterministic
+  `unsupported aggregate/unordered serialization` `CaseSetupError` instead of
+  manufacturing canonical members.
+- Typed ordering metadata no longer calls unconfigured Pydantic JSON encoding
+  for raw scalar members. Bytes and byte-like values use deterministic hex
+  metadata, while paired `mode="json"` values remain authoritative; invalid
+  UTF-8 bytes therefore continue to support configured base64 serialization.
+- When a fallback unordered mapping would mix ordered and unordered nested
+  member shapes, canonicalization fails closed with an explicit ambiguity
+  error. Homogeneous nested sets, including varying cardinalities, remain
+  recursively deterministic through a shape-witness fallback.
+- Regression tests cover cardinality-changing serializers, invalid UTF-8
+  configured byte sets (including nested/deep sets), mixed frozenset/tuple
+  aggregate shapes, and ordinary Pydantic JSON schemas.
+
+### Verification
+
+All commands were run from the implementation worktree with the pinned `kds`
+environment.
+
+```text
+rtk conda run -n kds python -m pytest tests/test_validate_cases.py -q -k "nested_unordered_sets or configured_and_custom_json_serializers or aggregate_unordered_serializer or invalid_utf8_base64 or ambiguous_mixed_unordered or ordinary_pydantic_json_schema"
+......                                                                   [100%]
+6 passed, 82 deselected in 3.12s
+
+rtk conda run -n kds python -m pytest tests/test_validate_cases.py -q -k "canonical or pydantic_json_scalars or paired_json_set_values or nested_unordered"
+.......                                                                  [100%]
+7 passed, 81 deselected in 5.21s
+
+rtk conda run -n kds python -m pytest tests/test_validate_cases.py -q
+..............s......................................................... [ 81%]
+................                                                         [100%]
+87 passed, 1 skipped in 22.41s
+
+rtk conda run -n kds python -m pytest tests/test_integration_tune.py tests/test_integration_verify.py -q
+..............................                                           [100%]
+30 passed in 196.08s (0:03:16)
+
+rtk conda run -n kds python -m pytest tests/test_skill_instructions.py tests/test_skill_structure.py -q
+.....................                                                    [100%]
+21 passed in 0.07s
+
+rtk conda run -n kds python -m pytest -q
+........................................................................ [ 24%]
+........................................................................ [ 48%]
+.............................................................s.......... [ 72%]
+........................................................................ [ 96%]
+............                                                             [100%]
+299 passed, 1 skipped in 447.46s (0:07:27)
+
+rtk conda run -n kds ruff check scripts/validate_cases.py tests/test_validate_cases.py
+All checks passed!
+
+rtk git diff --check
+(no output; exit 0)
+```
+
+The pre-existing untracked `scripts/__pycache__/` and `tests/__pycache__/`
+directories were preserved and not staged in Round 5.
