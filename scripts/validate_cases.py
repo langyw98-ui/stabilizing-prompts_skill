@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -748,6 +749,45 @@ def _canonical_sort_key(value: object) -> str:
     )
 
 
+def _canonical_type_key(value: object) -> tuple[str, str]:
+    """Return deterministic type metadata for an unordered member tie-break."""
+
+    value_type = type(value)
+    return value_type.__module__, value_type.__qualname__
+
+
+def _canonicalize_unordered(
+    raw: object, encoded: object | None = None
+) -> object:
+    """Canonicalize an unordered container using its paired JSON values."""
+
+    raw_items = tuple(raw)  # type: ignore[arg-type]
+    if encoded is None:
+        encoded_items = [_canonicalize_json(item) for item in raw_items]
+    elif isinstance(encoded, (list, tuple)):
+        # The paired JSON values are authoritative.  In particular, do not
+        # re-encode bytes or JSON-only serializer results from raw_items.
+        encoded_items = [_canonicalize_json(item) for item in encoded]
+    else:
+        # A field serializer may intentionally replace the set with another
+        # JSON value.  Preserve that value rather than manufacturing a list.
+        return _canonicalize_json(encoded)
+
+    decorated = [
+        (
+            item,
+            _canonical_type_key(raw_items[index])
+            if index < len(raw_items)
+            else ("", ""),
+        )
+        for index, item in enumerate(encoded_items)
+    ]
+    # Type metadata only breaks equal JSON-value ties.  It is deliberately not
+    # derived from hash/repr/order, so collisions remain cross-process stable.
+    decorated.sort(key=lambda item: (_canonical_sort_key(item[0]), item[1]))
+    return [item for item, _type_key in decorated]
+
+
 def _canonicalize_with_json_hint(raw: object, encoded: object) -> object:
     """Canonicalize a Python-mode value while retaining its JSON-mode value.
 
@@ -767,14 +807,18 @@ def _canonicalize_with_json_hint(raw: object, encoded: object) -> object:
             for key, item in encoded.items()
         }
         items: list[tuple[object, object]] = []
-        for raw_key, raw_item in raw.items():
+        encoded_items = list(encoded.items())
+        for index, (raw_key, raw_item) in enumerate(raw.items()):
             encoded_key = _canonicalize_json(raw_key)
             encoded_pair = encoded_by_key.get(_canonical_sort_key(encoded_key))
             if encoded_pair is None:
                 # A serializer may transform mapping keys in a way that is not
-                # recoverable from the Python-mode value.  The JSON-mode
-                # representation remains the authoritative safe fallback.
-                return _canonicalize_json(encoded)
+                # recoverable from the Python-mode value.  Pydantic preserves
+                # mapping iteration order, so pair by position as a safe
+                # fallback and still retain nested set ordering.
+                if index >= len(encoded_items):
+                    return _canonicalize_json(encoded)
+                encoded_pair = encoded_items[index]
             encoded_key_value, encoded_item = encoded_pair
             items.append(
                 (
@@ -786,12 +830,7 @@ def _canonicalize_with_json_hint(raw: object, encoded: object) -> object:
         return {key: item for key, item in items}
 
     if isinstance(raw, (set, frozenset)):
-        # The encoded list's iteration order is hash-seed dependent.  Each raw
-        # member is encoded independently and sorted by its canonical JSON
-        # representation instead.
-        items = [_canonicalize_json(item) for item in raw]
-        items.sort(key=_canonical_sort_key)
-        return items
+        return _canonicalize_unordered(raw, encoded)
 
     if isinstance(raw, (list, tuple)):
         if not isinstance(encoded, (list, tuple)) or len(raw) != len(encoded):
@@ -829,22 +868,32 @@ def _canonicalize_json(value: object) -> object:
         items.sort(key=lambda item: _canonical_sort_key(item[0]))
         return {key: item for key, item in items}
     if isinstance(value, (set, frozenset)):
-        items = [_canonicalize_json(item) for item in value]
-        items.sort(key=_canonical_sort_key)
-        return items
+        return _canonicalize_unordered(value)
     if isinstance(value, (list, tuple)):
         return [_canonicalize_json(item) for item in value]
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        # Pydantic's default JSON output represents NaN and infinities as null;
+        # finite floats are already JSON scalars and must not be recursively
+        # passed through a converter that returns a fresh float object.
+        return value if math.isfinite(value) else None
     try:
         # This is Pydantic's same core conversion used by JSON serialization,
         # including Decimal, UUID, bytes, date/time, Path, timedelta, and
-        # other supported scalar encodings.  Recurse in case a custom scalar
-        # serializer returns a container that itself needs canonicalization.
-        encoded = to_jsonable_python(value)
+        # other supported scalar encodings.  Pydantic recursively converts any
+        # container result before it reaches this function.
+        encoded = to_jsonable_python(value, inf_nan_mode="null")
     except (TypeError, ValueError, OverflowError):
         return value
-    if encoded is value:
-        return value
-    return _canonicalize_json(encoded)
+    if encoded is None or isinstance(encoded, (str, int, bool)):
+        return encoded
+    if isinstance(encoded, float):
+        return encoded if math.isfinite(encoded) else None
+    # Pydantic's conversion is recursive for container results.  Returning a
+    # remaining unsupported value lets the outer JSON dump raise a normal
+    # setup error instead of using identity as a recursion escape hatch.
+    return encoded
 
 
 def _canonical_json(value: object, *, label: str) -> str:
@@ -1687,13 +1736,13 @@ def load_case_suite(
                 semantic_conflicts.append(
                     {
                         "kind": "semantic_family",
-                        "key": family,
+                        "fingerprint": _conflict_fingerprint(family),
                         "left": _conflict_reference(previous[0], previous[1]),
                         "right": _conflict_reference(split, case.id),
                     }
                 )
             else:
-                seen_families.setdefault(family, (split, case.semantic_family))
+                seen_families.setdefault(family, (split, case.id))
 
             input_fingerprint = _canonical_json(
                 case.input, label=f"{split} case {case.id!r} input"

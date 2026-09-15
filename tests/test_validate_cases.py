@@ -28,6 +28,7 @@ from scripts.validate_cases import (
     load_case_suite,
     main,
     _jaccard,
+    _canonical_json,
     _git_repository_root,
     _near_duplicate_pairs,
     _normalize_similarity_text,
@@ -1627,6 +1628,175 @@ def test_production_expected_normalization_preserves_pydantic_json_scalars() -> 
     canonical = json.loads(canonical_outputs[0])
     expected = json.loads(expected_outputs[0])
     assert canonical == expected
+
+
+def test_canonical_serializer_handles_finite_and_nonfinite_float_values() -> None:
+    code = (
+        "import json\n"
+        "from pydantic import BaseModel\n"
+        "from scripts.validate_cases import _canonical_expected\n"
+        "class Output(BaseModel):\n"
+        "    finite: float\n"
+        "    nan: float\n"
+        "    positive_inf: float\n"
+        "    negative_inf: float\n"
+        "value = Output(finite=1.25, nan=float('nan'), "
+        "positive_inf=float('inf'), negative_inf=-float('inf'))\n"
+        "print(_canonical_expected(value))\n"
+        "print(value.model_dump_json())\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    lines = result.stdout.splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0]) == json.loads(lines[1])
+    assert json.loads(lines[0]) == {
+        "finite": 1.25,
+        "nan": None,
+        "positive_inf": None,
+        "negative_inf": None,
+    }
+    assert _canonical_json({"finite": 1.25}, label="float test") == (
+        '{"finite":1.25}'
+    )
+
+
+def test_case_validation_cli_accepts_finite_float_inputs_without_recursion_error(
+    tmp_path: Path,
+) -> None:
+    eval_root = tmp_path / "eval"
+    paths = write_case_sets(eval_root)
+    write_obligations(eval_root, complete_obligations_payload())
+    cases = read_cases(paths[0])
+    cases[0]["input"]["context"].update(
+        {
+            "threshold": 1.25,
+            "nan": float("nan"),
+            "positive_inf": float("inf"),
+            "negative_inf": -float("inf"),
+        }
+    )
+    write_cases(paths[0], cases)
+    output = tmp_path / "suite.json"
+
+    assert (
+        main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--schema",
+                "tests.test_validate_cases:Decision",
+                "--output",
+                str(output),
+            ],
+            repo_root=eval_root,
+        )
+        == 0
+    )
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == "valid"
+
+
+def test_production_expected_normalization_uses_paired_json_set_values() -> None:
+    code = (
+        "import json\n"
+        "from pydantic import BaseModel, ConfigDict, field_serializer\n"
+        "from pathlib import Path\n"
+        "from scripts.validate_cases import _canonical_expected\n"
+        "class Output(BaseModel):\n"
+        "    model_config = ConfigDict(ser_json_bytes='base64')\n"
+        "    bytes_values: set[bytes | str]\n"
+        "    path_values: set[Path | str]\n"
+        "    json_values: set[str]\n"
+        "    @field_serializer('json_values', when_used='json')\n"
+        "    def serialize_json_values(self, values: set[str]) -> list[str]:\n"
+        "        return [f'json:{value}' for value in values]\n"
+        "value = Output(\n"
+        "    bytes_values={b'a', 'a'}, path_values={Path('a'), 'a'},\n"
+        "    json_values={'beta', 'alpha'},\n"
+        ")\n"
+        "raw = value.model_dump(mode='json')\n"
+        "for key in ('bytes_values', 'path_values', 'json_values'):\n"
+        "    raw[key] = sorted(raw[key])\n"
+        "print(_canonical_expected(value))\n"
+        "print(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(',', ':')))\n"
+    )
+    canonical_outputs = []
+    expected_outputs = []
+    for seed in ("31", "32", "33"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = result.stdout.splitlines()
+        assert len(lines) == 2
+        canonical_outputs.append(lines[0])
+        expected_outputs.append(lines[1])
+
+    assert canonical_outputs[0] == canonical_outputs[1] == canonical_outputs[2]
+    canonical = json.loads(canonical_outputs[0])
+    expected = json.loads(expected_outputs[0])
+    assert canonical == expected
+    assert canonical["bytes_values"] == ["YQ==", "a"]
+    assert canonical["json_values"] == ["json:alpha", "json:beta"]
+    assert canonical["path_values"] == ["a", "a"]
+
+
+def test_case_validation_cli_redacts_semantic_family_conflicts(
+    tmp_path: Path,
+) -> None:
+    eval_root = tmp_path / "eval"
+    paths = write_case_sets(eval_root)
+    write_obligations(eval_root, complete_obligations_payload())
+
+    secret_family = "family-derived-from-password-token-secret"
+    dev_cases = read_cases(paths[0])
+    validation_cases = read_cases(paths[1])
+    dev_cases[0]["semantic_family"] = secret_family
+    validation_cases[0]["semantic_family"] = secret_family
+    write_cases(paths[0], dev_cases)
+    write_cases(paths[1], validation_cases)
+    output = tmp_path / "suite-error.json"
+
+    assert (
+        main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--schema",
+                "tests.test_validate_cases:Decision",
+                "--output",
+                str(output),
+            ],
+            repo_root=eval_root,
+        )
+        == 2
+    )
+
+    output_text = output.read_text(encoding="utf-8")
+    assert secret_family not in output_text
+    payload = json.loads(output_text)
+    conflict = payload["conflicts"]["semantic_family"][0]
+    fingerprint = conflict["fingerprint"]
+    assert len(fingerprint) == 64
+    assert all(character in "0123456789abcdef" for character in fingerprint)
+    assert fingerprint == hashlib.sha256(
+        "familyderivedfrompasswordtokensecret".encode("utf-8")
+    ).hexdigest()
+    assert conflict["kind"] == "semantic_family"
+    assert conflict["left"] == {"split": "dev", "id": "dev-1"}
+    assert conflict["right"] == {"split": "validation", "id": "validation-1"}
 
 
 def test_case_validation_cli_validates_obligations_before_schema_import(
