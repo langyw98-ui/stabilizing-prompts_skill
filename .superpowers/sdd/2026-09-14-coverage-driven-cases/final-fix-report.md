@@ -187,3 +187,69 @@ rtk conda run -n kds python -m pytest -q
 
 The pre-existing untracked `scripts/__pycache__/` and `tests/__pycache__/`
 directories were preserved and not staged in Round 3.
+
+## Final review fix report — Round 4
+
+Round 4 baseline: `7b3c8974d47d77b58314575fed3b9956bf5bd571`
+
+Implementation commit: `60d99c8b158b0761efbaa11709262f782f3ad137`
+(`fix: stabilize nested canonical containers and input signatures`)
+
+### Fixes
+
+- Recursive unordered expected serialization now carries explicit raw-element
+  to JSON-element associations. Pydantic model copies provide singleton
+  element serialization with the production config and field serializers;
+  nested set/frozenset members are then canonicalized recursively without
+  zipping independent unordered traversals. A deterministic typed fallback
+  preserves nested unordered shape when a serializer changes scalar values.
+- A shared recursively tagged representation now supplies total ordering for
+  unordered values. `_flatten_input` uses it for paths and signatures, so
+  heterogeneous JSON-colliding values such as bytes/strings and paths/strings
+  remain stable and type-distinguishable across hash seeds. Redacted unordered
+  diagnostics use the same ordering helper.
+- Subprocess regressions cover nested and deeply nested sets, configured
+  base64 bytes, JSON-only custom serializers, and heterogeneous input values
+  across multiple `PYTHONHASHSEED` values. Ordered list/tuple behavior remains
+  unchanged.
+
+### Verification
+
+All commands were run from the implementation worktree with the pinned `kds`
+environment.
+
+```text
+rtk conda run -n kds python -m pytest tests/test_validate_cases.py -q -k "nested_unordered_sets or heterogeneous_unordered_inputs"
+...                                                                      [100%]
+3 passed, 81 deselected in 3.13s
+
+rtk conda run -n kds python -m pytest tests/test_validate_cases.py -q
+..............s......................................................... [ 85%]
+............                                                             [100%]
+83 passed, 1 skipped in 24.72s
+
+rtk conda run -n kds python -m pytest tests/test_integration_tune.py tests/test_integration_verify.py -q
+..............................                                           [100%]
+30 passed in 187.55s (0:03:07)
+
+rtk conda run -n kds python -m pytest tests/test_skill_instructions.py tests/test_skill_structure.py -q
+.....................                                                    [100%]
+21 passed in 0.49s
+
+rtk conda run -n kds python -m pytest -q
+........................................................................ [ 24%]
+........................................................................ [ 48%]
+.............................................................s.......... [ 72%]
+........................................................................ [ 97%]
+........                                                                 [100%]
+295 passed, 1 skipped in 404.02s (0:06:44)
+
+rtk conda run -n kds ruff check scripts/validate_cases.py tests/test_validate_cases.py
+All checks passed!
+
+rtk git diff --check
+(no output; exit 0)
+```
+
+The pre-existing untracked `scripts/__pycache__/` and `tests/__pycache__/`
+directories were preserved and not staged in Round 4.
