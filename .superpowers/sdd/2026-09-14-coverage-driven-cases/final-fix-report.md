@@ -124,3 +124,66 @@ rtk conda run -n kds python -m pytest -q
 
 The pre-existing untracked `scripts/__pycache__/` and `tests/__pycache__/`
 directories were preserved and not staged in Round 2.
+
+## Final review fix report — Round 3
+
+Round 3 baseline: `ead38c1322d140fae0eb26069c1dff2abb95edae`
+
+Implementation commit: `bf714346885d042e29f1819135f44728e9bd3359`
+(`fix: stabilize float and semantic conflict canonicalization`)
+
+### Fixes
+
+- The canonical serializer now terminates ordinary finite floats without
+  identity-based recursion and maps NaN/infinity to Pydantic's default JSON
+  `null` representation. This applies to expected models, input fingerprints,
+  suite hashes, and CLI output.
+- Unordered model containers now sort the paired `model_dump(mode="json")`
+  elements rather than re-encoding raw Python members. Deterministic module
+  and qualified-type metadata breaks equal-JSON tie cases without depending on
+  hash order, preserving configured base64 bytes and JSON-only field
+  serializers.
+- Semantic-family diagnostics now expose a SHA-256 fingerprint and the true
+  prior/current split and case IDs. Raw normalized family text is omitted from
+  both `duplicates` details and `CASE_SUITE_JSON` error output.
+
+### Verification
+
+All commands were run from the implementation worktree with the pinned `kds`
+environment.
+
+```text
+rtk conda run -n kds python -m pytest tests/test_validate_cases.py -q -k "float or paired_json_set_values or semantic_family_conflicts"
+....                                                                     [100%]
+4 passed, 77 deselected in 2.11s
+
+rtk conda run -n kds python -m pytest tests/test_validate_cases.py -q
+..............s......................................................... [ 88%]
+.........                                                                [100%]
+80 passed, 1 skipped in 17.00s
+
+rtk conda run -n kds python -m pytest tests/test_integration_tune.py tests/test_integration_verify.py -q
+..............................                                           [100%]
+30 passed in 199.48s (0:03:19)
+
+rtk conda run -n kds python -m pytest tests/test_skill_instructions.py tests/test_skill_structure.py -q
+.....................                                                    [100%]
+21 passed in 0.08s
+
+rtk conda run -n kds ruff check scripts/validate_cases.py tests/test_validate_cases.py
+All checks passed!
+
+rtk git diff --check
+(no output; exit 0)
+
+rtk conda run -n kds python -m pytest -q
+........................................................................ [ 24%]
+........................................................................ [ 49%]
+.............................................................s.......... [ 73%]
+........................................................................ [ 98%]
+.....                                                                    [100%]
+292 passed, 1 skipped in 404.55s (0:06:44)
+```
+
+The pre-existing untracked `scripts/__pycache__/` and `tests/__pycache__/`
+directories were preserved and not staged in Round 3.
