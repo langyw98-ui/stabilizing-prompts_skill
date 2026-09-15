@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.integration_support import (
     CountingTransport,
     TuneResult,
     assert_delivered_files_unstaged_or_untracked,
     build_target_repo,
+    make_case,
+    remove_last_case,
     run_tune_with_fake_transport,
     workspace_snapshot,
 )
@@ -17,6 +21,169 @@ from tests.integration_support import (
 @pytest.fixture
 def target_repo(tmp_path: Path) -> Path:
     return build_target_repo(tmp_path / "target-repo")
+
+
+def _coverage_root(target_repo: Path) -> Path:
+    return next(target_repo.glob(".prompt-evals/*"))
+
+
+def test_tune_stops_before_transport_when_mechanical_coverage_fails(
+    tmp_path: Path,
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo", complete_assets=True)
+    validation_path = _coverage_root(target_repo) / "validation-cases.yaml"
+    remove_last_case(validation_path)
+    transport = CountingTransport()
+
+    result = run_tune_with_fake_transport(target_repo, transport=transport)
+
+    assert result.stop_reason == "setup_error"
+    assert transport.calls == []
+    assert result.baseline_dev is None
+
+    cases = yaml.safe_load(validation_path.read_text(encoding="utf-8"))
+    cases.append(make_case("validation", 29, variant="boundary"))
+    validation_path.write_text(
+        yaml.safe_dump(cases, sort_keys=False), encoding="utf-8"
+    )
+    renewed = run_tune_with_fake_transport(target_repo, transport=transport)
+    assert renewed.stop_reason == "delivered"
+    assert transport.calls
+
+
+def test_actual_case_counts_drive_fixed_repeat_slots(target_repo: Path) -> None:
+    result = run_tune_with_fake_transport(target_repo, scenario="no-change")
+
+    assert result.baseline_dev is not None
+    assert result.baseline_validation is not None
+    assert len(result.baseline_dev.slots) == 30 * 5
+    assert len(result.baseline_validation.slots) == 30 * 5
+    assert result.slot_estimates == {
+        "baseline_slots": 30 * 5 + 30 * 5,
+        "one_full_promoted_candidate_round": 30 * 5 + 30 * 5 + 30 * 5,
+        "affected_dev_pre_run_slots": 30 * 5,
+        "paired_acceptance_slots": 30 * 10 + 30 * 10,
+    }
+    worktree = next((target_repo / ".worktrees" / "stabilizing-prompts").iterdir())
+    runtime = next(worktree.glob(".prompt-evals/*")) / ".runtime"
+    baseline_payload = yaml.safe_load(
+        (runtime / "baseline-dev.json").read_text(encoding="utf-8")
+    )
+    validation_payload = yaml.safe_load(
+        (runtime / "baseline-validation.json").read_text(encoding="utf-8")
+    )
+    assert len(baseline_payload["slots"]) == 30 * 5
+    assert len(validation_payload["slots"]) == 30 * 5
+
+
+def test_changed_coverage_hash_invalidates_confirmation_and_baseline(
+    tmp_path: Path,
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo", complete_assets=True)
+    transport = CountingTransport(scenario="no-change")
+
+    initial = run_tune_with_fake_transport(
+        target_repo, scenario="no-change", transport=transport
+    )
+    assert initial.stop_reason == "no_change_needed"
+    assert initial.coverage_obligations_hash is not None
+    assert initial.case_suite_hash is not None
+    calls_before_change = len(transport.calls)
+
+    obligations_path = _coverage_root(target_repo) / "coverage-obligations.yaml"
+    obligations_path.write_text(
+        obligations_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    stale_transport = CountingTransport(scenario="no-change")
+    stale = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        transport=stale_transport,
+        confirmation_hashes=(
+            initial.coverage_obligations_hash,
+            initial.case_suite_hash,
+        ),
+    )
+
+    assert stale.stop_reason == "setup_error"
+    assert stale.baseline_dev is None
+    assert stale_transport.calls == []
+    assert len(transport.calls) == calls_before_change
+
+    renewed = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        transport=CountingTransport(scenario="no-change"),
+    )
+    assert renewed.stop_reason == "no_change_needed"
+    assert renewed.transport_calls > 0
+
+
+def test_explained_near_duplicate_requires_confirmation_before_probe(
+    tmp_path: Path,
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo", complete_assets=True)
+    dev_path = _coverage_root(target_repo) / "dev-cases.yaml"
+    cases = yaml.safe_load(dev_path.read_text(encoding="utf-8"))
+    left = cases[0]
+    right = copy.deepcopy(cases[2])
+    right["expect"] = copy.deepcopy(left["expect"])
+    right["coverage"]["primary_obligation"] = left["coverage"][
+        "primary_obligation"
+    ]
+    right["input"] = copy.deepcopy(left["input"])
+    right["input"]["variables"]["message"] += "!"
+    cases[0], cases[2] = left, right
+    dev_path.write_text(yaml.safe_dump(cases, sort_keys=False), encoding="utf-8")
+
+    transport = CountingTransport(scenario="no-change")
+    unexplained = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        transport=transport,
+    )
+    assert unexplained.stop_reason == "setup_error"
+    assert transport.calls == []
+
+    cases = yaml.safe_load(dev_path.read_text(encoding="utf-8"))
+    cases[0]["coverage"]["distinction"] = "different evidenced decision boundary"
+    cases[2]["coverage"]["distinction"] = "different evidenced decision boundary"
+    dev_path.write_text(yaml.safe_dump(cases, sort_keys=False), encoding="utf-8")
+
+    unreviewed = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        transport=transport,
+        confirm_near_duplicate_review=False,
+    )
+
+    assert unreviewed.stop_reason == "setup_error"
+    assert transport.calls == []
+
+    reviewed = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        transport=transport,
+        confirm_near_duplicate_review=True,
+    )
+    assert reviewed.stop_reason == "no_change_needed"
+    assert transport.calls
+
+
+def test_acceptance_remains_unread_before_candidate_freeze_with_coverage(
+    target_repo: Path,
+) -> None:
+    result = run_tune_with_fake_transport(target_repo)
+
+    events = result.lifecycle_events
+    freeze_index = events.index("candidate-freeze")
+    acceptance_index = events.index("phase:acceptance-baseline")
+    assert freeze_index < acceptance_index
+    assert not any(
+        event.startswith("call:acceptance-")
+        for event in events[:freeze_index]
+    )
 
 
 def test_tune_initializes_and_delivers_only_after_acceptance_and_confirmation(
@@ -31,6 +198,11 @@ def test_tune_initializes_and_delivers_only_after_acceptance_and_confirmation(
     assert isinstance(result, TuneResult)
     assert result.acceptance_activities == 1
     assert result.delivered_prompt_hash == result.frozen_candidate_hash
+    assert result.confirmation_hashes == (
+        result.coverage_obligations_hash,
+        result.case_suite_hash,
+    )
+    assert result.lifecycle_events.index("confirmation") < result.lifecycle_events.index("probe")
     assert result.transport_calls == len(result.raw_evidence)
     assert_delivered_files_unstaged_or_untracked(target_repo, result.delivered_paths)
     assert (target_repo / "prompts" / "classify.md").read_text(encoding="utf-8") == result.candidate_prompt

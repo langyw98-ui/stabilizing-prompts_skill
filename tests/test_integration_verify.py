@@ -37,7 +37,7 @@ def test_verify_runs_selected_development_dataset_through_real_cli_chain(
     assert result.status == "complete"
     assert result.dataset == "dev"
     assert result.mode == "verify"
-    assert transport.call_count == 10
+    assert transport.call_count == 30 * 5
     after = {
         path: path.read_bytes()
         for path in target_repo.rglob("*")
@@ -185,7 +185,7 @@ def test_project_transport_setting_is_ignored_by_production_client_path(
 
     assert code == 0
     assert len(constructor_calls) == 1
-    assert transport.call_count == 10
+    assert transport.call_count == 30 * 5
     assert "transport" not in constructor_calls[0]
     assert transport.transport_identity == "test-only-counting-transport"
     assert transport.structured_output_kwargs

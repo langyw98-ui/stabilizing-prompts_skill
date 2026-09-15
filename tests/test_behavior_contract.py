@@ -7,6 +7,7 @@ import pytest
 
 from scripts.local_model_client import safe_client_config
 from scripts.manage_worktree import WorktreeError
+from scripts.validate_workspace import prompt_id_for_path
 from scripts.run_prompt_eval import _redacted, _safe_serialize
 from tests.integration_support import (
     CountingTransport,
@@ -133,3 +134,24 @@ def test_failure_assets_never_include_candidate_text_or_token(tmp_path: Path) ->
     )
     assert result.candidate_prompt not in delivered_text
     assert "integration-sentinel-token" not in delivered_text
+
+
+@pytest.mark.parametrize("result_kind", ["success", "failure"])
+def test_delivery_contains_coverage_obligations_for_both_results(
+    tmp_path: Path, result_kind: str
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo")
+    if result_kind == "success":
+        result = run_tune_with_fake_transport(target_repo)
+    else:
+        result = run_tune_with_fake_transport(
+            target_repo,
+            scenario="acceptance-failure",
+            confirm_failure_delivery=True,
+        )
+
+    prompt_id = prompt_id_for_path("prompts/classify.md")
+    coverage_path = f".prompt-evals/{prompt_id}/coverage-obligations.yaml"
+    assert coverage_path in result.delivered_paths
+    if result_kind == "failure":
+        assert "prompts/classify.md" not in result.delivered_paths
