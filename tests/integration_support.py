@@ -9,6 +9,7 @@ files in disposable Git fixtures.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field, replace
 import hashlib
@@ -65,6 +66,532 @@ FIXTURE_SOURCE = Path(__file__).parent / "fixtures" / "target_repo"
 PROMPT_RELATIVE = "prompts/classify.md"
 DEPENDENCY_RELATIVE = "target_app/production.py"
 
+DEFAULT_EVIDENCE_CHECKED = (
+    "target_app/production.py",
+    "prompts/classify.md",
+    "references/business-contract.md",
+    "repository-tests",
+)
+DEFAULT_SATURATION_STATEMENT = (
+    "Scanned the production Schema, renderer, business contract, and fixture "
+    "history; no additional evidence-backed boundaries remain."
+)
+NEAR_DUPLICATE_REVIEW_NOT_REQUIRED = "not_required"
+NEAR_DUPLICATE_REVIEW_CONFIRMED = "confirmed"
+NEAR_DUPLICATE_REVIEW_REJECTED = "rejected"
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmationRecord:
+    """All user-confirmed evidence that gates the first model call."""
+
+    coverage_obligations_hash: str
+    case_suite_hash: str
+    evidence_checked: tuple[str, ...]
+    saturation_statement: str
+    near_duplicate_review_status: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.coverage_obligations_hash, str):
+            raise TypeError("coverage_obligations_hash must be a string")
+        if not isinstance(self.case_suite_hash, str):
+            raise TypeError("case_suite_hash must be a string")
+        if not isinstance(self.evidence_checked, tuple) or any(
+            not isinstance(item, str) for item in self.evidence_checked
+        ):
+            raise TypeError("evidence_checked must be a tuple of strings")
+        if not isinstance(self.saturation_statement, str):
+            raise TypeError("saturation_statement must be a string")
+        if not isinstance(self.near_duplicate_review_status, str):
+            raise TypeError("near_duplicate_review_status must be a string")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "coverage_obligations_hash": self.coverage_obligations_hash,
+            "case_suite_hash": self.case_suite_hash,
+            "evidence_checked": list(self.evidence_checked),
+            "saturation_statement": self.saturation_statement,
+            "near_duplicate_review_status": self.near_duplicate_review_status,
+        }
+
+
+# Keep a descriptive alias available to integration callers that refer to the
+# cycle value as coverage confirmation rather than a generic record.
+CoverageConfirmation = ConfirmationRecord
+
+
+@dataclass(frozen=True, slots=True)
+class _FixtureCaseSpec:
+    """One business boundary in the deterministic routing catalog."""
+
+    boundary: str
+    message: str
+    channel: str
+    account_status: str
+    risk_level: str
+    amount_cents: int
+    jurisdiction: str
+    device_trust: str
+    velocity: int
+    consent: bool
+    partner_status: str
+    expected_action: Literal["accept", "reject"]
+    expected_reason: str
+
+
+_FIXTURE_CASE_CATALOG = (
+    _FixtureCaseSpec(
+        "known-web-low-risk",
+        "Verified customer submits a low-risk web request within the standard limit.",
+        "web",
+        "verified",
+        "low",
+        2500,
+        "us",
+        "known",
+        0,
+        True,
+        "not_applicable",
+        "accept",
+        "verified-low-risk",
+    ),
+    _FixtureCaseSpec(
+        "trusted-api-small",
+        "Verified service account sends a trusted low-risk API request.",
+        "api",
+        "verified",
+        "low",
+        1200,
+        "gb",
+        "trusted",
+        1,
+        True,
+        "not_applicable",
+        "accept",
+        "verified-low-risk",
+    ),
+    _FixtureCaseSpec(
+        "consented-mobile",
+        "Verified customer uses a known mobile device for a consented request.",
+        "mobile",
+        "verified",
+        "low",
+        750,
+        "ca",
+        "known",
+        0,
+        True,
+        "not_applicable",
+        "accept",
+        "verified-low-risk",
+    ),
+    _FixtureCaseSpec(
+        "approved-partner",
+        "Verified partner traffic arrives through an approved integration.",
+        "partner",
+        "verified",
+        "low",
+        500,
+        "fr",
+        "known",
+        0,
+        True,
+        "trusted",
+        "accept",
+        "verified-low-risk",
+    ),
+    _FixtureCaseSpec(
+        "batch-at-limit",
+        "Verified batch settlement reaches the published amount boundary.",
+        "batch",
+        "verified",
+        "low",
+        100000,
+        "de",
+        "trusted",
+        2,
+        True,
+        "not_applicable",
+        "accept",
+        "verified-low-risk",
+    ),
+    _FixtureCaseSpec(
+        "zero-amount-web",
+        "Verified web request carries the permitted zero-value amount.",
+        "web",
+        "verified",
+        "low",
+        0,
+        "jp",
+        "known",
+        0,
+        True,
+        "not_applicable",
+        "accept",
+        "verified-low-risk",
+    ),
+    _FixtureCaseSpec(
+        "mobile-velocity-boundary",
+        "Verified mobile customer remains at the hourly velocity boundary.",
+        "mobile",
+        "verified",
+        "low",
+        300,
+        "au",
+        "trusted",
+        3,
+        True,
+        "not_applicable",
+        "accept",
+        "verified-low-risk",
+    ),
+    _FixtureCaseSpec(
+        "trusted-api-euro",
+        "Verified European service sends a low-risk API request.",
+        "api",
+        "verified",
+        "low",
+        4200,
+        "nl",
+        "known",
+        1,
+        True,
+        "not_applicable",
+        "accept",
+        "verified-low-risk",
+    ),
+    _FixtureCaseSpec(
+        "strong-partner-device",
+        "Verified partner traffic uses a strongly trusted device signal.",
+        "partner",
+        "verified",
+        "low",
+        6400,
+        "sg",
+        "trusted",
+        2,
+        True,
+        "trusted",
+        "accept",
+        "verified-low-risk",
+    ),
+    _FixtureCaseSpec(
+        "web-upper-amount-boundary",
+        "Verified web customer reaches the inclusive upper amount boundary.",
+        "web",
+        "verified",
+        "low",
+        100000,
+        "us",
+        "trusted",
+        3,
+        True,
+        "not_applicable",
+        "accept",
+        "verified-low-risk",
+    ),
+    _FixtureCaseSpec(
+        "suspended-account",
+        "Suspended account attempts an otherwise low-risk web request.",
+        "web",
+        "suspended",
+        "low",
+        50,
+        "us",
+        "known",
+        0,
+        True,
+        "not_applicable",
+        "reject",
+        "account-not-eligible",
+    ),
+    _FixtureCaseSpec(
+        "closed-account",
+        "Closed account submits a low-risk mobile request.",
+        "mobile",
+        "closed",
+        "low",
+        70,
+        "ca",
+        "trusted",
+        0,
+        True,
+        "not_applicable",
+        "reject",
+        "account-not-eligible",
+    ),
+    _FixtureCaseSpec(
+        "pending-account",
+        "Pending account sends a low-risk API request before verification.",
+        "api",
+        "pending",
+        "low",
+        90,
+        "gb",
+        "trusted",
+        1,
+        True,
+        "not_applicable",
+        "reject",
+        "account-not-eligible",
+    ),
+    _FixtureCaseSpec(
+        "unverified-account",
+        "Unverified account reaches the partner entry boundary.",
+        "partner",
+        "unverified",
+        "low",
+        110,
+        "fr",
+        "known",
+        0,
+        True,
+        "trusted",
+        "reject",
+        "account-not-eligible",
+    ),
+    _FixtureCaseSpec(
+        "sanctioned-jurisdiction",
+        "Verified customer originates in a sanctioned jurisdiction.",
+        "web",
+        "verified",
+        "low",
+        150,
+        "sanctioned",
+        "known",
+        0,
+        True,
+        "not_applicable",
+        "reject",
+        "jurisdiction-blocked",
+    ),
+    _FixtureCaseSpec(
+        "restricted-jurisdiction",
+        "Verified API request comes from a restricted jurisdiction.",
+        "api",
+        "verified",
+        "low",
+        250,
+        "restricted",
+        "trusted",
+        1,
+        True,
+        "not_applicable",
+        "reject",
+        "jurisdiction-blocked",
+    ),
+    _FixtureCaseSpec(
+        "high-risk-web",
+        "Verified web customer is classified with elevated risk.",
+        "web",
+        "verified",
+        "high",
+        400,
+        "us",
+        "known",
+        0,
+        True,
+        "not_applicable",
+        "reject",
+        "elevated-risk",
+    ),
+    _FixtureCaseSpec(
+        "high-risk-api",
+        "Verified API request crosses the elevated-risk boundary.",
+        "api",
+        "verified",
+        "high",
+        450,
+        "gb",
+        "trusted",
+        1,
+        True,
+        "not_applicable",
+        "reject",
+        "elevated-risk",
+    ),
+    _FixtureCaseSpec(
+        "unknown-device",
+        "Verified mobile request lacks a recognized device signal.",
+        "mobile",
+        "verified",
+        "low",
+        600,
+        "ca",
+        "unknown",
+        0,
+        True,
+        "not_applicable",
+        "reject",
+        "device-untrusted",
+    ),
+    _FixtureCaseSpec(
+        "untrusted-device",
+        "Verified web request carries an explicitly untrusted device signal.",
+        "web",
+        "verified",
+        "low",
+        650,
+        "us",
+        "untrusted",
+        0,
+        True,
+        "not_applicable",
+        "reject",
+        "device-untrusted",
+    ),
+    _FixtureCaseSpec(
+        "velocity-exceeded-web",
+        "Verified web account exceeds the hourly request velocity.",
+        "web",
+        "verified",
+        "low",
+        700,
+        "us",
+        "known",
+        4,
+        True,
+        "not_applicable",
+        "reject",
+        "velocity-limit",
+    ),
+    _FixtureCaseSpec(
+        "velocity-exceeded-partner",
+        "Verified partner integration exceeds the hourly request velocity.",
+        "partner",
+        "verified",
+        "low",
+        750,
+        "fr",
+        "trusted",
+        5,
+        True,
+        "trusted",
+        "reject",
+        "velocity-limit",
+    ),
+    _FixtureCaseSpec(
+        "amount-over-limit-web",
+        "Verified web request exceeds the published amount limit by one cent.",
+        "web",
+        "verified",
+        "low",
+        100001,
+        "us",
+        "known",
+        0,
+        True,
+        "not_applicable",
+        "reject",
+        "amount-limit",
+    ),
+    _FixtureCaseSpec(
+        "amount-over-limit-batch",
+        "Verified batch settlement substantially exceeds the amount limit.",
+        "batch",
+        "verified",
+        "low",
+        250000,
+        "de",
+        "trusted",
+        2,
+        True,
+        "not_applicable",
+        "reject",
+        "amount-limit",
+    ),
+    _FixtureCaseSpec(
+        "missing-consent-web",
+        "Verified web customer has not supplied the required consent.",
+        "web",
+        "verified",
+        "low",
+        800,
+        "us",
+        "known",
+        0,
+        False,
+        "not_applicable",
+        "reject",
+        "consent-required",
+    ),
+    _FixtureCaseSpec(
+        "missing-consent-mobile",
+        "Verified mobile customer withdraws consent before submission.",
+        "mobile",
+        "verified",
+        "low",
+        850,
+        "ca",
+        "trusted",
+        1,
+        False,
+        "not_applicable",
+        "reject",
+        "consent-required",
+    ),
+    _FixtureCaseSpec(
+        "untrusted-partner",
+        "Verified partner integration is present but not trusted.",
+        "partner",
+        "verified",
+        "low",
+        900,
+        "fr",
+        "known",
+        0,
+        True,
+        "blocked",
+        "reject",
+        "partner-untrusted",
+    ),
+    _FixtureCaseSpec(
+        "pending-partner-review",
+        "Verified partner integration is awaiting trust review.",
+        "partner",
+        "verified",
+        "low",
+        950,
+        "fr",
+        "trusted",
+        1,
+        True,
+        "pending",
+        "reject",
+        "partner-untrusted",
+    ),
+    _FixtureCaseSpec(
+        "high-risk-restricted",
+        "Verified high-risk request also originates in a restricted jurisdiction.",
+        "web",
+        "verified",
+        "high",
+        275,
+        "restricted",
+        "known",
+        0,
+        True,
+        "not_applicable",
+        "reject",
+        "jurisdiction-blocked",
+    ),
+    _FixtureCaseSpec(
+        "unknown-device-high-risk",
+        "Verified mobile request combines an unknown device with elevated risk.",
+        "mobile",
+        "verified",
+        "high",
+        500,
+        "au",
+        "unknown",
+        1,
+        True,
+        "not_applicable",
+        "reject",
+        "elevated-risk",
+    ),
+)
+
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
     result = subprocess.run(
@@ -118,6 +645,86 @@ def _initial_contract(repo: Path, prompt_id: str) -> Path:
     return path
 
 
+def _fixture_input(spec: _FixtureCaseSpec, split: str) -> dict[str, dict[str, object]]:
+    """Render one catalog boundary as meaningful production input fields."""
+
+    split_history_offset = {
+        "dev": 0,
+        "validation": 7,
+        "acceptance": 14,
+        "external": 21,
+    }.get(split, 28)
+    return {
+        "variables": {
+            "split": split,
+            "boundary": spec.boundary,
+            "message": f"{split.title()} evidence: {spec.message}",
+            "channel": spec.channel,
+            "account_status": spec.account_status,
+            "risk_level": spec.risk_level,
+            "amount_cents": spec.amount_cents,
+            "jurisdiction": spec.jurisdiction,
+            "device_trust": spec.device_trust,
+            "velocity": spec.velocity,
+            "consent": spec.consent,
+            "partner_status": spec.partner_status,
+            # Customer history is a real routing signal.  The split offset
+            # gives each partition a distinct, deterministic population while
+            # the catalog still determines the business boundary.
+            "customer_history_days": (
+                30 + spec.amount_cents % 17 + split_history_offset
+            ),
+        },
+        "context": {
+            "split": split,
+            "boundary": spec.boundary,
+            "catalog": "routing-business-boundaries",
+        },
+    }
+
+
+def _fixture_decision(case_input: object) -> tuple[str, str]:
+    """Derive the fixture decision from business attributes, never the case ID."""
+
+    if not isinstance(case_input, Mapping):
+        raise AssertionError("fixture input must be a mapping")
+    variables = case_input.get("variables")
+    if not isinstance(variables, Mapping):
+        raise AssertionError("fixture input variables must be a mapping")
+
+    account_status = variables.get("account_status")
+    jurisdiction = variables.get("jurisdiction")
+    risk_level = variables.get("risk_level")
+    device_trust = variables.get("device_trust")
+    velocity = variables.get("velocity")
+    amount_cents = variables.get("amount_cents")
+    consent = variables.get("consent")
+    channel = variables.get("channel")
+    partner_status = variables.get("partner_status")
+
+    if account_status != "verified":
+        return "reject", "account-not-eligible"
+    if jurisdiction in {"sanctioned", "restricted"}:
+        return "reject", "jurisdiction-blocked"
+    if risk_level == "high":
+        return "reject", "elevated-risk"
+    if device_trust not in {"known", "trusted"}:
+        return "reject", "device-untrusted"
+    if isinstance(velocity, bool) or not isinstance(velocity, int):
+        raise AssertionError("fixture velocity must be an integer")
+    if velocity > 3:
+        return "reject", "velocity-limit"
+    if isinstance(amount_cents, bool) or not isinstance(amount_cents, int):
+        raise AssertionError("fixture amount_cents must be an integer")
+    if amount_cents > 100000:
+        return "reject", "amount-limit"
+    if consent is not True:
+        return "reject", "consent-required"
+    if channel == "partner" and partner_status != "trusted":
+        return "reject", "partner-untrusted"
+    return "accept", "verified-low-risk"
+
+
 def make_case(
     split: str,
     index: int,
@@ -125,47 +732,39 @@ def make_case(
     obligation: str = "classify-input",
     variant: str = "normal",
 ) -> dict[str, object]:
-    """Build one deterministic, substantively distinct integration case.
-
-    The index is part of the semantic family, input, expected object, and
-    coverage condition.  This keeps the fixture useful for duplicate and
-    cross-split leakage checks rather than padding the split with wording-only
-    copies.  Even indexes model the accepting partition and odd indexes model
-    the rejecting partition used by ``CountingTransport``.
-    """
+    """Build one deterministic case from the substantive routing catalog."""
 
     if not isinstance(split, str) or not split.strip():
         raise ValueError("split must be a non-empty string")
     if not isinstance(index, int) or index < 0:
         raise ValueError("index must be a non-negative integer")
+    try:
+        spec = _FIXTURE_CASE_CATALOG[index]
+    except IndexError as error:
+        raise ValueError(
+            f"fixture catalog index must be below {len(_FIXTURE_CASE_CATALOG)}"
+        ) from error
+
     case_id = f"{split}-{index:03d}"
-    family = f"routing-{split}-condition-{index:03d}"
-    condition_id = f"{split}-condition-{index:03d}"
-    action: Literal["accept", "reject"] = "accept" if index % 2 == 0 else "reject"
+    family = f"routing-{split}-{spec.boundary}"
+    condition_id = f"{split}-{spec.boundary}"
+    case_input = _fixture_input(spec, split)
+    action, reason = _fixture_decision(case_input)
+    expected = (spec.expected_action, spec.expected_reason)
+    if (action, reason) != expected:
+        raise AssertionError(
+            f"catalog decision disagrees with business rule for {spec.boundary}: "
+            f"{(action, reason)!r} != {expected!r}"
+        )
     return {
         "id": case_id,
         "semantic_family": family,
         "source": ["target_app/production.py"],
-        "input": {
-            "variables": {
-                "split": split,
-                "condition": condition_id,
-                "message": f"{split} evidenced condition {index:03d}",
-            },
-            "context": {"index": index, "family": family},
-        },
-        "expect": {
-            "output": {
-                "action": action,
-                "reason": f"fixture-{case_id}",
-            }
-        },
+        "input": case_input,
+        "expect": {"output": {"action": action, "reason": reason}},
         "priority": "normal",
-        "dimensions": ["routing", "deterministic-fixture", f"condition-{index:03d}"],
-        "rationale": (
-            f"the fixture contract fixes the {split} decision for "
-            f"evidenced condition {index:03d}"
-        ),
+        "dimensions": ["routing", spec.channel, spec.expected_reason],
+        "rationale": spec.message,
         "coverage": {
             "primary_obligation": obligation,
             "secondary_obligations": [],
@@ -354,14 +953,21 @@ def _prompt_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _parse_message(message: object) -> tuple[str, str]:
+def _parse_message(message: object) -> tuple[str, str, dict[str, object]]:
     content = getattr(message, "content", "")
     text = content if isinstance(content, str) else str(content)
     case_match = re.search(r"^case_id=([^\r\n]+)", text, re.MULTILINE)
     hash_match = re.search(r"^prompt_hash=([^\r\n]+)", text, re.MULTILINE)
-    if case_match is None or hash_match is None:
+    input_match = re.search(r"^input=([^\r\n]+)", text, re.MULTILINE)
+    if case_match is None or hash_match is None or input_match is None:
         raise AssertionError(f"production renderer metadata is missing: {text!r}")
-    return case_match.group(1), hash_match.group(1)
+    try:
+        case_input = json.loads(input_match.group(1))
+    except json.JSONDecodeError as error:
+        raise AssertionError(f"production renderer input is invalid: {text!r}") from error
+    if not isinstance(case_input, dict):
+        raise AssertionError("production renderer input must be a mapping")
+    return case_match.group(1), hash_match.group(1), case_input
 
 
 class CountingTransport:
@@ -388,6 +994,8 @@ class CountingTransport:
         self._resume_failed = False
         self.structured_output_kwargs: list[dict[str, object]] = []
         self.confirmed_hashes: tuple[str, str] | None = None
+        self.confirmed_confirmation: ConfirmationRecord | None = None
+        self.loader_events: list[tuple[str | None, tuple[str, ...]]] = []
         self.model_name = MODEL_NAME
         self.expected_by_case: dict[str, tuple[str, str]] = {}
         # This identity is deliberately test-only.  It must not be confused
@@ -399,6 +1007,15 @@ class CountingTransport:
         """Record test-only lifecycle evidence without changing production APIs."""
 
         self.lifecycle_events.append(event)
+
+    def record_case_loader(self, paths: object) -> None:
+        """Record the one complete-suite loader boundary during bootstrap."""
+
+        if not isinstance(paths, (tuple, list)):
+            raise AssertionError("case loader paths must be a sequence")
+        names = tuple(Path(path).name for path in paths)
+        stage = self.lifecycle_events[-1] if self.lifecycle_events else None
+        self.loader_events.append((stage, names))
 
     def bind_prompt_hashes(self, original_hash: str, candidate_hash: str) -> None:
         self.original_hash = original_hash
@@ -421,34 +1038,37 @@ class CountingTransport:
         return self
 
     @staticmethod
-    def _fallback_expected(case_id: str) -> tuple[str, str]:
-        match = re.search(r"-(\d+)$", case_id)
-        if match is not None:
-            action = "accept" if int(match.group(1)) % 2 == 0 else "reject"
-        else:
-            action = "reject" if case_id.endswith("reject") else "accept"
-        return action, f"fixture-{case_id}"
+    def _expected(case_input: object) -> tuple[str, str]:
+        return _fixture_decision(case_input)
 
-    def _expected(self, case_id: str) -> tuple[str, str]:
-        return self.expected_by_case.get(case_id, self._fallback_expected(case_id))
-
-    def _is_wrong(self, prompt_hash: str, case_id: str) -> bool:
+    def _is_wrong(
+        self, prompt_hash: str, case_input: object, expected: tuple[str, str]
+    ) -> bool:
         if self.scenario == "no-change":
             return False
-        match = re.search(r"-(\d+)$", case_id)
-        accepting_case = (
-            int(match.group(1)) % 2 == 0 if match is not None else case_id.endswith("accept")
-        )
+        variables = case_input.get("variables") if isinstance(case_input, Mapping) else None
+        if not isinstance(variables, Mapping):
+            raise AssertionError("fixture input variables must be a mapping")
+        split = variables.get("split")
+        boundary = variables.get("boundary")
         if (
             prompt_hash == self.original_hash
-            and case_id.startswith(("dev-", "validation-"))
-            and accepting_case
+            and split in {"dev", "validation"}
+            and expected[0] == "accept"
         ):
             return True
         if self.scenario == "regression":
-            return prompt_hash == self.candidate_hash and case_id == "validation-000"
+            return (
+                prompt_hash == self.candidate_hash
+                and split == "validation"
+                and boundary == "known-web-low-risk"
+            )
         if self.scenario == "acceptance-failure":
-            return prompt_hash == self.candidate_hash and case_id == "acceptance-000"
+            return (
+                prompt_hash == self.candidate_hash
+                and split == "acceptance"
+                and boundary == "known-web-low-risk"
+            )
         return False
 
     def invoke(self, messages: object) -> object:
@@ -456,7 +1076,7 @@ class CountingTransport:
             raise AssertionError("structured schema was not configured")
         if not isinstance(messages, (list, tuple)) or not messages:
             raise AssertionError("production call did not provide messages")
-        case_id, prompt_hash = _parse_message(messages[0])
+        case_id, prompt_hash, case_input = _parse_message(messages[0])
         index = self._per_case[(prompt_hash, case_id)]
         self._per_case[(prompt_hash, case_id)] += 1
         self.call_count += 1
@@ -466,13 +1086,20 @@ class CountingTransport:
             self.scenario == "resume"
             and not self._resume_failed
             and prompt_hash == self.original_hash
-            and case_id == "dev-001"
+            and isinstance(case_input.get("variables"), Mapping)
+            and case_input["variables"].get("boundary") == "closed-account"
         ):
             self._resume_failed = True
             raise ConnectionError("offline fixture transport interruption")
 
-        action, reason = self._expected(case_id)
-        if self._is_wrong(prompt_hash, case_id):
+        action, reason = self._expected(case_input)
+        declared = self.expected_by_case.get(case_id)
+        if declared is not None and declared != (action, reason):
+            raise AssertionError(
+                f"fixture transport decision disagrees with case {case_id}: "
+                f"{(action, reason)!r} != {declared!r}"
+            )
+        if self._is_wrong(prompt_hash, case_input, (action, reason)):
             action, reason = ("reject", "fixture-business-regression")
         payload = {"action": action, "reason": reason}
         raw_content = "fixture structured response"
@@ -502,9 +1129,11 @@ class TuneResult:
     coverage_obligations_hash: str | None = None
     case_suite_hash: str | None = None
     confirmation_hashes: tuple[str, str] | None = None
+    confirmation_record: ConfirmationRecord | None = None
     lifecycle_events: tuple[str, ...] = ()
     evidence_checked: tuple[str, ...] = ()
     saturation_statement: str | None = None
+    near_duplicate_review_status: str | None = None
     requires_user_review: bool = False
     slot_estimates: dict[str, int] = field(default_factory=dict)
     candidate_prompt: str | None = None
@@ -531,9 +1160,15 @@ class TuneResult:
             "coverage_obligations_hash": self.coverage_obligations_hash,
             "case_suite_hash": self.case_suite_hash,
             "confirmation_hashes": list(self.confirmation_hashes or ()),
+            "confirmation_record": (
+                self.confirmation_record.to_dict()
+                if self.confirmation_record is not None
+                else None
+            ),
             "lifecycle_events": list(self.lifecycle_events),
             "evidence_checked": list(self.evidence_checked),
             "saturation_statement": self.saturation_statement,
+            "near_duplicate_review_status": self.near_duplicate_review_status,
             "requires_user_review": self.requires_user_review,
             "slot_estimates": dict(self.slot_estimates),
             "candidate_prompt": self.candidate_prompt,
@@ -554,11 +1189,36 @@ class TuneResult:
             "raw_evidence": runner_module._redacted(self.raw_evidence),
         }
 
+    @property
+    def confirmation(self) -> ConfirmationRecord | None:
+        """Compatibility alias for callers that call the record confirmation."""
+
+        return self.confirmation_record
+
 
 def _report_evidence(transport: CountingTransport) -> object:
     """Keep harness results at the same redacted boundary as reports."""
 
     return runner_module._redacted(transport.raw_evidence)
+
+
+def _coerce_confirmation(value: object) -> ConfirmationRecord:
+    """Accept the immutable record or its serialized mapping form."""
+
+    if isinstance(value, ConfirmationRecord):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("confirmation must be a ConfirmationRecord or mapping")
+    evidence = value.get("evidence_checked")
+    if isinstance(evidence, list):
+        evidence = tuple(evidence)
+    return ConfirmationRecord(
+        coverage_obligations_hash=value["coverage_obligations_hash"],  # type: ignore[arg-type]
+        case_suite_hash=value["case_suite_hash"],  # type: ignore[arg-type]
+        evidence_checked=evidence,  # type: ignore[arg-type]
+        saturation_statement=value["saturation_statement"],  # type: ignore[arg-type]
+        near_duplicate_review_status=value["near_duplicate_review_status"],  # type: ignore[arg-type]
+    )
 
 
 def _eval_root(repo: Path) -> Path:
@@ -637,6 +1297,8 @@ def _slot_evidence(
 
 def _load_fixture_assets(
     repo: Path,
+    *,
+    loader_observer: Any | None = None,
 ) -> tuple[Path, Any, CaseSuite, type[Any]]:
     eval_root = _eval_root(repo)
     _purge_fixture_modules()
@@ -648,8 +1310,14 @@ def _load_fixture_assets(
     obligations = load_coverage_obligations(
         eval_root / "coverage-obligations.yaml", repo
     )
+    case_paths = tuple(
+        eval_root / f"{split}-cases.yaml"
+        for split in ("dev", "validation", "acceptance")
+    )
+    if loader_observer is not None:
+        loader_observer(case_paths)
     suite = load_case_suite(
-        tuple(eval_root / f"{split}-cases.yaml" for split in ("dev", "validation", "acceptance")),
+        case_paths,
         schema,
         obligations=obligations,
     )
@@ -697,7 +1365,7 @@ def _validate_fixture_assets(
             ) from error
         detail = payload.get("error") if isinstance(payload, dict) else None
         raise CaseSetupError(str(detail or "mechanical coverage validation failed"))
-    return _load_fixture_assets(repo)
+    return _load_fixture_assets(repo, loader_observer=transport.record_case_loader)
 
 
 def _run_phase(
@@ -853,10 +1521,11 @@ def run_tune_with_fake_transport(
     confirm_failure_delivery: bool = False,
     confirm_near_duplicate_review: bool = True,
     confirmation_hashes: tuple[str, str] | None = None,
-    saturation_statement: str = (
-        "Scanned the production Schema, renderer, business contract, and fixture "
-        "history; no additional evidence-backed boundaries remain."
-    ),
+    confirmation: ConfirmationRecord | Mapping[str, object] | None = None,
+    confirmation_record: ConfirmationRecord | Mapping[str, object] | None = None,
+    evidence_checked: tuple[str, ...] | list[str] = DEFAULT_EVIDENCE_CHECKED,
+    saturation_statement: str = DEFAULT_SATURATION_STATEMENT,
+    near_duplicate_review_status: str | None = None,
     transport: CountingTransport | None = None,
     project_transport_setting: str | None = None,
     sentinel: str | None = None,
@@ -876,12 +1545,14 @@ def run_tune_with_fake_transport(
     suite: CaseSuite | None = None
     slot_estimates: dict[str, int] = {}
     confirmed_hashes: tuple[str, str] | None = None
-    evidence_checked = (
-        "target_app/production.py",
-        "prompts/classify.md",
-        "references/business-contract.md",
-        "repository-tests",
+    confirmed_confirmation: ConfirmationRecord | None = None
+    current_evidence_checked = (
+        tuple(evidence_checked) if isinstance(evidence_checked, (tuple, list)) else ()
     )
+    current_saturation_statement = (
+        saturation_statement if isinstance(saturation_statement, str) else ""
+    )
+    current_near_duplicate_review_status = near_duplicate_review_status
 
     def _result(stop_reason: str, **values: object) -> TuneResult:
         defaults: dict[str, object] = {
@@ -890,9 +1561,11 @@ def run_tune_with_fake_transport(
             "coverage_obligations_hash": obligations_hash,
             "case_suite_hash": suite_hash,
             "confirmation_hashes": confirmed_hashes,
+            "confirmation_record": confirmed_confirmation,
             "lifecycle_events": tuple(fake.lifecycle_events),
-            "evidence_checked": evidence_checked,
-            "saturation_statement": saturation_statement,
+            "evidence_checked": current_evidence_checked,
+            "saturation_statement": current_saturation_statement,
+            "near_duplicate_review_status": current_near_duplicate_review_status,
             "requires_user_review": (
                 bool(suite.coverage_audit.near_duplicates) if suite is not None else False
             ),
@@ -968,7 +1641,59 @@ def run_tune_with_fake_transport(
     fake.mark("slot-estimates")
     fake.mark("evidence-checked")
     fake.mark("saturation-statement")
-    if not saturation_statement.strip():
+    if not current_evidence_checked or any(
+        not item.strip() for item in current_evidence_checked
+    ):
+        return _result(
+            "setup_error",
+            transport_calls=fake.call_count,
+            raw_evidence=_report_evidence(fake),
+        )
+    if not current_saturation_statement.strip():
+        return _result(
+            "setup_error",
+            transport_calls=fake.call_count,
+            raw_evidence=_report_evidence(fake),
+        )
+
+    has_near_duplicates = bool(suite.coverage_audit.near_duplicates)
+    derived_review_status = (
+        NEAR_DUPLICATE_REVIEW_CONFIRMED
+        if has_near_duplicates and confirm_near_duplicate_review
+        else NEAR_DUPLICATE_REVIEW_REJECTED
+        if has_near_duplicates
+        else NEAR_DUPLICATE_REVIEW_NOT_REQUIRED
+    )
+    if near_duplicate_review_status is None:
+        current_near_duplicate_review_status = derived_review_status
+    else:
+        current_near_duplicate_review_status = near_duplicate_review_status
+    if current_near_duplicate_review_status not in {
+        NEAR_DUPLICATE_REVIEW_NOT_REQUIRED,
+        NEAR_DUPLICATE_REVIEW_CONFIRMED,
+        NEAR_DUPLICATE_REVIEW_REJECTED,
+    }:
+        return _result(
+            "setup_error",
+            transport_calls=fake.call_count,
+            raw_evidence=_report_evidence(fake),
+        )
+    if (
+        has_near_duplicates
+        and (
+            not confirm_near_duplicate_review
+            or current_near_duplicate_review_status != NEAR_DUPLICATE_REVIEW_CONFIRMED
+        )
+    ):
+        fake.mark("near-duplicate-review-rejected")
+        return _result(
+            "setup_error",
+            transport_calls=fake.call_count,
+            raw_evidence=_report_evidence(fake),
+        )
+    if not has_near_duplicates and (
+        current_near_duplicate_review_status != NEAR_DUPLICATE_REVIEW_NOT_REQUIRED
+    ):
         return _result(
             "setup_error",
             transport_calls=fake.call_count,
@@ -976,18 +1701,48 @@ def run_tune_with_fake_transport(
         )
 
     current_hashes = (obligations_hash, suite_hash)
-    supplied_hashes = confirmation_hashes
-    if supplied_hashes is None:
-        supplied_hashes = fake.confirmed_hashes
-    if supplied_hashes is not None and tuple(supplied_hashes) != current_hashes:
-        fake.mark("confirmation-invalidated")
+    current_confirmation = ConfirmationRecord(
+        coverage_obligations_hash=obligations_hash,
+        case_suite_hash=suite_hash,
+        evidence_checked=current_evidence_checked,
+        saturation_statement=current_saturation_statement,
+        near_duplicate_review_status=current_near_duplicate_review_status,
+    )
+    supplied_confirmation: ConfirmationRecord | None = None
+    try:
+        if confirmation is not None and confirmation_record is not None:
+            raise TypeError("pass only one confirmation object")
+        if confirmation is not None:
+            supplied_confirmation = _coerce_confirmation(confirmation)
+        elif confirmation_record is not None:
+            supplied_confirmation = _coerce_confirmation(confirmation_record)
+        elif confirmation_hashes is not None:
+            hashes = tuple(confirmation_hashes)
+            if len(hashes) != 2:
+                raise TypeError("confirmation_hashes must contain two hashes")
+            previous = fake.confirmed_confirmation or ConfirmationRecord(
+                coverage_obligations_hash=hashes[0],
+                case_suite_hash=hashes[1],
+                evidence_checked=DEFAULT_EVIDENCE_CHECKED,
+                saturation_statement=DEFAULT_SATURATION_STATEMENT,
+                near_duplicate_review_status=NEAR_DUPLICATE_REVIEW_NOT_REQUIRED,
+            )
+            supplied_confirmation = replace(
+                previous,
+                coverage_obligations_hash=hashes[0],
+                case_suite_hash=hashes[1],
+            )
+        elif fake.confirmed_confirmation is not None:
+            supplied_confirmation = fake.confirmed_confirmation
+    except (KeyError, TypeError, ValueError):
         return _result(
             "setup_error",
             transport_calls=fake.call_count,
             raw_evidence=_report_evidence(fake),
         )
-    if suite.coverage_audit.near_duplicates and not confirm_near_duplicate_review:
-        fake.mark("near-duplicate-review-rejected")
+
+    if supplied_confirmation is not None and supplied_confirmation != current_confirmation:
+        fake.mark("confirmation-invalidated")
         return _result(
             "setup_error",
             transport_calls=fake.call_count,
@@ -996,6 +1751,8 @@ def run_tune_with_fake_transport(
     fake.mark("confirmation")
     fake.confirmed_hashes = current_hashes
     confirmed_hashes = current_hashes
+    fake.confirmed_confirmation = current_confirmation
+    confirmed_confirmation = current_confirmation
     try:
         fake.mark("probe")
         probe_model(fake)
@@ -1520,6 +2277,8 @@ def run_verify(
 
 __all__ = [
     "CliChainEvidence",
+    "ConfirmationRecord",
+    "CoverageConfirmation",
     "CountingTransport",
     "TuneResult",
     "assert_delivered_files_unstaged_or_untracked",

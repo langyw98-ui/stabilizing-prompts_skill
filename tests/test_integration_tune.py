@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import yaml
 
+from tests import integration_support as support_module
 from tests.integration_support import (
     CountingTransport,
     TuneResult,
@@ -52,7 +54,7 @@ def test_tune_stops_before_transport_when_mechanical_coverage_fails(
 
 
 def test_actual_case_counts_drive_fixed_repeat_slots(target_repo: Path) -> None:
-    result = run_tune_with_fake_transport(target_repo, scenario="no-change")
+    result = run_tune_with_fake_transport(target_repo)
 
     assert result.baseline_dev is not None
     assert result.baseline_validation is not None
@@ -72,8 +74,16 @@ def test_actual_case_counts_drive_fixed_repeat_slots(target_repo: Path) -> None:
     validation_payload = yaml.safe_load(
         (runtime / "baseline-validation.json").read_text(encoding="utf-8")
     )
+    acceptance_baseline_payload = yaml.safe_load(
+        (runtime / "acceptance-baseline.json").read_text(encoding="utf-8")
+    )
+    acceptance_candidate_payload = yaml.safe_load(
+        (runtime / "acceptance-candidate.json").read_text(encoding="utf-8")
+    )
     assert len(baseline_payload["slots"]) == 30 * 5
     assert len(validation_payload["slots"]) == 30 * 5
+    assert len(acceptance_baseline_payload["slots"]) == 30 * 10
+    assert len(acceptance_candidate_payload["slots"]) == 30 * 10
 
 
 def test_changed_coverage_hash_invalidates_confirmation_and_baseline(
@@ -120,6 +130,190 @@ def test_changed_coverage_hash_invalidates_confirmation_and_baseline(
     assert renewed.transport_calls > 0
 
 
+def test_reused_confirmation_rejects_changed_saturation_before_probe(
+    tmp_path: Path,
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo", complete_assets=True)
+    transport = CountingTransport(scenario="no-change")
+
+    initial = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        transport=transport,
+        saturation_statement="saturation statement A",
+    )
+    assert initial.stop_reason == "no_change_needed"
+    calls_before_change = len(transport.calls)
+
+    stale = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        transport=transport,
+        saturation_statement="saturation statement B",
+    )
+
+    assert stale.stop_reason == "setup_error"
+    assert stale.baseline_dev is None
+    assert transport.calls[calls_before_change:] == []
+
+
+def test_confirmation_binds_every_coverage_evidence_field_before_probe(
+    tmp_path: Path,
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo", complete_assets=True)
+    initial = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        saturation_statement="saturation statement A",
+    )
+    confirmation = getattr(initial, "confirmation_record", None)
+    assert confirmation is not None
+
+    mutations = {
+        "coverage_obligations_hash": confirmation.coverage_obligations_hash + "-changed",
+        "case_suite_hash": confirmation.case_suite_hash + "-changed",
+        "evidence_checked": confirmation.evidence_checked + ("new-boundary.md",),
+        "saturation_statement": "saturation statement B",
+        "near_duplicate_review_status": "confirmed",
+    }
+    for field, value in mutations.items():
+        stale_transport = CountingTransport(scenario="no-change")
+        stale = run_tune_with_fake_transport(
+            target_repo,
+            scenario="no-change",
+            transport=stale_transport,
+            saturation_statement="saturation statement A",
+            confirmation=replace(confirmation, **{field: value}),
+        )
+
+        assert stale.stop_reason == "setup_error", field
+        assert stale.baseline_dev is None, field
+        assert stale_transport.calls == [], field
+
+
+def test_changed_case_suite_hash_invalidates_confirmation_and_baseline(
+    tmp_path: Path,
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo", complete_assets=True)
+    initial = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        saturation_statement="saturation statement A",
+    )
+    confirmation = getattr(initial, "confirmation_record", None)
+    assert confirmation is not None
+
+    dev_path = _coverage_root(target_repo) / "dev-cases.yaml"
+    cases = yaml.safe_load(dev_path.read_text(encoding="utf-8"))
+    cases[0]["input"]["variables"]["message"] += " with an audited alias"
+    dev_path.write_text(yaml.safe_dump(cases, sort_keys=False), encoding="utf-8")
+
+    stale_transport = CountingTransport(scenario="no-change")
+    stale = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        transport=stale_transport,
+        saturation_statement="saturation statement A",
+        confirmation=confirmation,
+    )
+
+    assert stale.stop_reason == "setup_error"
+    assert stale.baseline_dev is None
+    assert stale_transport.calls == []
+
+
+def test_fixture_catalog_uses_distinct_business_boundaries_not_index_variants() -> None:
+    cases = [make_case("dev", index) for index in range(30)]
+    variables = [case["input"]["variables"] for case in cases]
+
+    assert len({case["semantic_family"] for case in cases}) == 30
+    assert len({case["coverage"]["condition_id"] for case in cases}) == 30
+    assert {
+        "boundary",
+        "channel",
+        "account_status",
+        "risk_level",
+        "amount_cents",
+        "jurisdiction",
+        "device_trust",
+        "velocity",
+        "consent",
+    } <= set(variables[0])
+    assert len({tuple(sorted(item.items())) for item in variables}) == 30
+    assert {case["expect"]["output"]["action"] for case in cases} == {
+        "accept",
+        "reject",
+    }
+
+
+def test_counting_transport_derives_decision_from_business_input() -> None:
+    case = make_case("dev", 0)
+    transport = CountingTransport(scenario="no-change")
+    expected = case["expect"]["output"]
+
+    assert transport._expected(case["input"]) == (
+        expected["action"],
+        expected["reason"],
+    )
+
+    blocked = copy.deepcopy(case["input"])
+    blocked["variables"]["account_status"] = "suspended"
+    assert transport._expected(blocked) == ("reject", "account-not-eligible")
+
+
+def test_acceptance_case_loader_is_bootstrap_only(
+    target_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport = CountingTransport(scenario="no-change")
+    original_loader = support_module.load_case_suite
+    observed: list[tuple[str | None, tuple[str, ...]]] = []
+    file_access: list[tuple[str | None, Path]] = []
+
+    original_read_text = Path.read_text
+
+    def traced_read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path.name == "acceptance-cases.yaml":
+            file_access.append(
+                (
+                    transport.lifecycle_events[-1]
+                    if transport.lifecycle_events
+                    else None,
+                    path,
+                )
+            )
+        return original_read_text(path, *args, **kwargs)
+
+    def traced_loader(paths: object, *args: object, **kwargs: object) -> object:
+        path_names = tuple(Path(path).name for path in paths)  # type: ignore[arg-type]
+        if "acceptance-cases.yaml" in path_names:
+            observed.append(
+                (
+                    transport.lifecycle_events[-1]
+                    if transport.lifecycle_events
+                    else None,
+                    path_names,
+                )
+            )
+        return original_loader(paths, *args, **kwargs)
+
+    monkeypatch.setattr(support_module, "load_case_suite", traced_loader)
+    monkeypatch.setattr(Path, "read_text", traced_read_text)
+    result = run_tune_with_fake_transport(
+        target_repo, scenario="no-change", transport=transport
+    )
+
+    assert result.stop_reason == "no_change_needed"
+    assert observed
+    assert all(stage == "mechanical-validation" for stage, _ in observed)
+    assert file_access
+    assert all(stage == "mechanical-validation" for stage, _ in file_access)
+    assert not any(
+        stage.startswith("phase:")
+        for stage, _ in observed
+        if stage is not None
+    )
+
+
 def test_explained_near_duplicate_requires_confirmation_before_probe(
     tmp_path: Path,
 ) -> None:
@@ -160,6 +354,7 @@ def test_explained_near_duplicate_requires_confirmation_before_probe(
 
     assert unreviewed.stop_reason == "setup_error"
     assert transport.calls == []
+    assert "probe" not in transport.lifecycle_events
 
     reviewed = run_tune_with_fake_transport(
         target_repo,
