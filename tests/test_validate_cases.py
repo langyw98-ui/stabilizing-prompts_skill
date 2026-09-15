@@ -1511,6 +1511,124 @@ def test_case_validation_cli_reports_structured_input_and_scenario_conflicts(
     assert payload["conflicts"]["scenario"]
 
 
+def test_case_validation_cli_redacts_structured_conflict_fingerprints(
+    tmp_path: Path,
+) -> None:
+    eval_root = tmp_path / "eval"
+    paths = write_case_sets(eval_root)
+    write_obligations(eval_root, complete_obligations_payload())
+
+    secret_values = (
+        "password-value-that-must-not-leak",
+        "nested-api-token-that-must-not-leak",
+        "secret-value-that-must-not-leak",
+        "access-token-value-that-must-not-leak",
+    )
+    secret_input = {
+        "variables": {
+            "password": secret_values[0],
+            "nested": {
+                "api_token": secret_values[1],
+                "secret": secret_values[2],
+            },
+        },
+        "context": {"credentials": {"access_token": secret_values[3]}},
+    }
+    cases = read_cases(paths[0])
+    cases[0]["input"] = copy.deepcopy(secret_input)
+    cases[1]["input"] = copy.deepcopy(secret_input)
+    write_cases(paths[0], cases)
+    output = tmp_path / "suite-error.json"
+
+    assert (
+        main(
+            [
+                "--eval-root",
+                str(eval_root),
+                "--schema",
+                "tests.test_validate_cases:Decision",
+                "--output",
+                str(output),
+            ],
+            repo_root=eval_root,
+        )
+        == 2
+    )
+
+    output_text = output.read_text(encoding="utf-8")
+    assert all(secret not in output_text for secret in secret_values)
+    payload = json.loads(output_text)
+    conflict = payload["duplicates"]["hard"][0]
+    fingerprint = conflict["fingerprint"]
+    assert len(fingerprint) == 64
+    assert all(character in "0123456789abcdef" for character in fingerprint)
+    assert conflict["kind"] == "input_fingerprint"
+    assert conflict["left"] == {"split": "dev", "id": "dev-1"}
+    assert conflict["right"] == {"split": "dev", "id": "dev-2"}
+
+
+def test_production_expected_normalization_preserves_pydantic_json_scalars() -> None:
+    code = (
+        "import json\n"
+        "from datetime import date, datetime, time, timezone\n"
+        "from decimal import Decimal\n"
+        "from enum import Enum\n"
+        "from pathlib import Path\n"
+        "from uuid import UUID\n"
+        "from pydantic import BaseModel\n"
+        "from scripts.validate_cases import _canonical_expected\n"
+        "class Kind(str, Enum):\n"
+        "    alpha = 'alpha'\n"
+        "class Output(BaseModel):\n"
+        "    labels: set[str]\n"
+        "    frozen: frozenset[int]\n"
+        "    amount: Decimal\n"
+        "    identifier: UUID\n"
+        "    payload: bytes\n"
+        "    happened: datetime\n"
+        "    day: date\n"
+        "    at: time\n"
+        "    kind: Kind\n"
+        "    location: Path\n"
+        "value = Output(\n"
+        "    labels={'beta', 'alpha'}, frozen=frozenset({3, 1, 2}),\n"
+        "    amount=Decimal('1.20'),\n"
+        "    identifier=UUID('12345678-1234-5678-1234-567812345678'),\n"
+        "    payload=b'hello',\n"
+        "    happened=datetime(2024, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc),\n"
+        "    day=date(2024, 1, 2), at=time(3, 4, 5, 678901),\n"
+        "    kind=Kind.alpha, location=Path('fixtures/case.yaml'),\n"
+        ")\n"
+        "raw = value.model_dump(mode='json')\n"
+        "raw['labels'] = sorted(raw['labels'])\n"
+        "raw['frozen'] = sorted(raw['frozen'])\n"
+        "print(_canonical_expected(value))\n"
+        "print(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(',', ':')))\n"
+    )
+    canonical_outputs = []
+    expected_outputs = []
+    for seed in ("21", "22", "23"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = result.stdout.splitlines()
+        assert len(lines) == 2
+        canonical_outputs.append(lines[0])
+        expected_outputs.append(lines[1])
+
+    assert canonical_outputs[0] == canonical_outputs[1] == canonical_outputs[2]
+    canonical = json.loads(canonical_outputs[0])
+    expected = json.loads(expected_outputs[0])
+    assert canonical == expected
+
+
 def test_case_validation_cli_validates_obligations_before_schema_import(
     tmp_path: Path,
 ) -> None:

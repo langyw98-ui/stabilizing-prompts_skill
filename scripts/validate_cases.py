@@ -11,8 +11,6 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass
-from datetime import date, datetime, time
-from enum import Enum
 import hashlib
 import importlib
 import json
@@ -25,6 +23,7 @@ import unicodedata
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_core import to_jsonable_python
 
 
 class CaseSetupError(ValueError):
@@ -749,6 +748,64 @@ def _canonical_sort_key(value: object) -> str:
     )
 
 
+def _canonicalize_with_json_hint(raw: object, encoded: object) -> object:
+    """Canonicalize a Python-mode value while retaining its JSON-mode value.
+
+    Pydantic's JSON mode knows how to encode values such as ``Decimal``,
+    ``UUID``, ``bytes``, paths, and temporal values, but it also turns sets
+    into lists before callers can impose a stable order.  Pairing the two
+    representations lets us keep Pydantic's scalar encodings while retaining
+    the raw container kind needed for deterministic set/frozenset handling.
+    """
+
+    if isinstance(raw, Mapping):
+        if not isinstance(encoded, Mapping):
+            return _canonicalize_json(encoded)
+
+        encoded_by_key = {
+            _canonical_sort_key(_canonicalize_json(key)): (key, item)
+            for key, item in encoded.items()
+        }
+        items: list[tuple[object, object]] = []
+        for raw_key, raw_item in raw.items():
+            encoded_key = _canonicalize_json(raw_key)
+            encoded_pair = encoded_by_key.get(_canonical_sort_key(encoded_key))
+            if encoded_pair is None:
+                # A serializer may transform mapping keys in a way that is not
+                # recoverable from the Python-mode value.  The JSON-mode
+                # representation remains the authoritative safe fallback.
+                return _canonicalize_json(encoded)
+            encoded_key_value, encoded_item = encoded_pair
+            items.append(
+                (
+                    _canonicalize_json(encoded_key_value),
+                    _canonicalize_with_json_hint(raw_item, encoded_item),
+                )
+            )
+        items.sort(key=lambda item: _canonical_sort_key(item[0]))
+        return {key: item for key, item in items}
+
+    if isinstance(raw, (set, frozenset)):
+        # The encoded list's iteration order is hash-seed dependent.  Each raw
+        # member is encoded independently and sorted by its canonical JSON
+        # representation instead.
+        items = [_canonicalize_json(item) for item in raw]
+        items.sort(key=_canonical_sort_key)
+        return items
+
+    if isinstance(raw, (list, tuple)):
+        if not isinstance(encoded, (list, tuple)) or len(raw) != len(encoded):
+            return _canonicalize_json(encoded)
+        return [
+            _canonicalize_with_json_hint(raw_item, encoded_item)
+            for raw_item, encoded_item in zip(raw, encoded, strict=True)
+        ]
+
+    # For scalar leaves, JSON mode is the source of truth.  It has already
+    # applied field serializers and all Pydantic-supported JSON encodings.
+    return _canonicalize_json(encoded)
+
+
 def _canonicalize_json(value: object) -> object:
     """Recursively produce deterministic, JSON-compatible data.
 
@@ -759,14 +816,12 @@ def _canonicalize_json(value: object) -> object:
     """
 
     if isinstance(value, BaseModel):
-        # ``mode='python'`` preserves set/frozenset fields.  Converting to
-        # JSON mode first would lose the distinction and retain hash-seed
-        # dependent iteration order in the resulting list.
-        return _canonicalize_json(value.model_dump(mode="python"))
-    if isinstance(value, Enum):
-        return _canonicalize_json(value.value)
-    if isinstance(value, (datetime, date, time)):
-        return value.isoformat()
+        # Keep the Python-mode tree so unordered containers remain visible,
+        # while pairing it with JSON mode so scalar/model serializers retain
+        # Pydantic's production JSON representation.
+        return _canonicalize_with_json_hint(
+            value.model_dump(mode="python"), value.model_dump(mode="json")
+        )
     if isinstance(value, Mapping):
         items = [
             (key, _canonicalize_json(item)) for key, item in value.items()
@@ -779,7 +834,17 @@ def _canonicalize_json(value: object) -> object:
         return items
     if isinstance(value, (list, tuple)):
         return [_canonicalize_json(item) for item in value]
-    return value
+    try:
+        # This is Pydantic's same core conversion used by JSON serialization,
+        # including Decimal, UUID, bytes, date/time, Path, timedelta, and
+        # other supported scalar encodings.  Recurse in case a custom scalar
+        # serializer returns a container that itself needs canonicalization.
+        encoded = to_jsonable_python(value)
+    except (TypeError, ValueError, OverflowError):
+        return value
+    if encoded is value:
+        return value
+    return _canonicalize_json(encoded)
 
 
 def _canonical_json(value: object, *, label: str) -> str:
@@ -1503,6 +1568,12 @@ def _conflict_reference(split: str, case_id: str) -> dict[str, str]:
     return {"split": split, "id": case_id}
 
 
+def _conflict_fingerprint(canonical_input: str) -> str:
+    """Return a non-reversible identifier for a canonical input fingerprint."""
+
+    return hashlib.sha256(canonical_input.encode("utf-8")).hexdigest()
+
+
 def _hard_conflict_error(
     hard_duplicates: Sequence[Mapping[str, object]],
     *,
@@ -1619,7 +1690,6 @@ def load_case_suite(
                         "key": family,
                         "left": _conflict_reference(previous[0], previous[1]),
                         "right": _conflict_reference(split, case.id),
-                        "value": case.semantic_family,
                     }
                 )
             else:
@@ -1636,7 +1706,7 @@ def load_case_suite(
             if previous_input is not None:
                 conflict = {
                     "kind": "input_fingerprint",
-                    "fingerprint": input_fingerprint,
+                    "fingerprint": _conflict_fingerprint(input_fingerprint),
                     "left": _conflict_reference(previous_input[0], previous_input[1]),
                     "right": _conflict_reference(split, case.id),
                 }
@@ -1653,7 +1723,9 @@ def load_case_suite(
             ):
                 conflict = {
                     "kind": "normalized_input_fingerprint",
-                    "fingerprint": normalized_input_fingerprint,
+                    "fingerprint": _conflict_fingerprint(
+                        normalized_input_fingerprint
+                    ),
                     "left": _conflict_reference(
                         previous_normalized_input[0], previous_normalized_input[1]
                     ),
@@ -1716,7 +1788,9 @@ def _canonical_case(validated: ValidatedCase) -> dict[str, Any]:
     # The production model is the authoritative serialization for the expected
     # output, preventing equivalent Pydantic inputs from producing two hashes.
     data["expect"] = dict(data["expect"])
-    data["expect"]["output"] = validated.expected.model_dump(mode="python")
+    # Keep the live model here so _canonicalize_json can pair its Python-mode
+    # containers with Pydantic's JSON-mode scalar/field serialization.
+    data["expect"]["output"] = validated.expected
     canonical = json.loads(_canonical_json(data, label="case"))
     if not isinstance(canonical, dict):
         raise CaseSetupError("case must serialize to a JSON object")
@@ -1841,6 +1915,10 @@ def _redact_cli_value(value: object) -> object:
         return [_redact_cli_value(item) for item in value]
     if isinstance(value, tuple):
         return [_redact_cli_value(item) for item in value]
+    if isinstance(value, Set):
+        redacted = [_redact_cli_value(item) for item in value]
+        redacted.sort(key=lambda item: _canonical_sort_key(_canonicalize_json(item)))
+        return redacted
     if isinstance(value, str):
         text = re.sub(
             r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;\"']+",
