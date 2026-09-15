@@ -1753,6 +1753,129 @@ def test_production_expected_normalization_uses_paired_json_set_values() -> None
     assert canonical["path_values"] == ["a", "a"]
 
 
+def test_production_expected_normalization_sorts_nested_unordered_sets() -> None:
+    code = (
+        "import json\n"
+        "from pydantic import BaseModel\n"
+        "from scripts.validate_cases import _canonical_expected\n"
+        "class Output(BaseModel):\n"
+        "    values: set[frozenset[str]]\n"
+        "    deep: set[frozenset[frozenset[str]]]\n"
+        "value = Output(\n"
+        "    values={frozenset({'beta', 'alpha'}), frozenset({'delta', 'gamma'})},\n"
+        "    deep={\n"
+        "        frozenset({frozenset({'one', 'two'}), frozenset({'three', 'four'})}),\n"
+        "        frozenset({frozenset({'five', 'six'}), frozenset({'seven', 'eight'})}),\n"
+        "    },\n"
+        ")\n"
+        "raw = value.model_dump(mode='json')\n"
+        "raw['values'] = sorted(sorted(item) for item in raw['values'])\n"
+        "raw['deep'] = sorted(\n"
+        "    sorted(sorted(inner) for inner in outer) for outer in raw['deep']\n"
+        ")\n"
+        "print(_canonical_expected(value))\n"
+        "print(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(',', ':')))\n"
+    )
+    canonical_outputs = []
+    expected_outputs = []
+    for seed in ("41", "42", "43"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = result.stdout.splitlines()
+        assert len(lines) == 2
+        canonical_outputs.append(lines[0])
+        expected_outputs.append(lines[1])
+
+    assert canonical_outputs[0] == canonical_outputs[1] == canonical_outputs[2]
+    assert json.loads(canonical_outputs[0]) == json.loads(expected_outputs[0])
+
+
+def test_nested_unordered_sets_preserve_configured_and_custom_json_serializers() -> None:
+    code = (
+        "import json\n"
+        "from pydantic import BaseModel, ConfigDict, field_serializer\n"
+        "from scripts.validate_cases import _canonical_expected\n"
+        "class Output(BaseModel):\n"
+        "    model_config = ConfigDict(ser_json_bytes='base64')\n"
+        "    values: set[frozenset[bytes]]\n"
+        "    deep: set[frozenset[frozenset[bytes]]]\n"
+        "    custom: set[frozenset[str]]\n"
+        "    @field_serializer('custom', when_used='json')\n"
+        "    def serialize_custom(self, values: set[frozenset[str]]) -> list[list[str]]:\n"
+        "        return [[f'json:{item}' for item in inner] for inner in values]\n"
+        "value = Output(\n"
+        "    values={frozenset({b'b', b'a'}), frozenset({b'd', b'c'})},\n"
+        "    deep={\n"
+        "        frozenset({frozenset({b'a', b'b'}), frozenset({b'c', b'd'})}),\n"
+        "        frozenset({frozenset({b'e', b'f'}), frozenset({b'g', b'h'})}),\n"
+        "    },\n"
+        "    custom={frozenset({'beta', 'alpha'}), frozenset({'delta', 'gamma'})},\n"
+        ")\n"
+        "raw = value.model_dump(mode='json')\n"
+        "def normalize(value):\n"
+        "    if isinstance(value, dict):\n"
+        "        return {key: normalize(item) for key, item in value.items()}\n"
+        "    if isinstance(value, list):\n"
+        "        return sorted((normalize(item) for item in value), key=lambda item: json.dumps(item, sort_keys=True))\n"
+        "    return value\n"
+        "print(_canonical_expected(value))\n"
+        "print(json.dumps(normalize(raw), ensure_ascii=False, sort_keys=True, separators=(',', ':')))\n"
+    )
+    outputs = []
+    expected_outputs = []
+    for seed in ("61", "62", "63"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = result.stdout.splitlines()
+        assert len(lines) == 2
+        outputs.append(lines[0])
+        expected_outputs.append(lines[1])
+
+    assert outputs[0] == outputs[1] == outputs[2]
+    assert json.loads(outputs[0]) == json.loads(expected_outputs[0])
+
+
+def test_text_signature_sorts_heterogeneous_unordered_inputs_across_hash_seeds() -> None:
+    code = (
+            "from pathlib import Path\n"
+            "from scripts.validate_cases import _text_signature\n"
+            "value = {'variables': {'items': {b'a', 'a', Path('a'), 'b'}}, 'context': {}}\n"
+            "signature = _text_signature(value)\n"
+            "print(repr((signature[0], tuple(sorted(signature[1])))))\n"
+        )
+    outputs = []
+    for seed in ("51", "52", "53"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        outputs.append(result.stdout.strip())
+
+    assert outputs[0] == outputs[1] == outputs[2]
+
+
 def test_case_validation_cli_redacts_semantic_family_conflicts(
     tmp_path: Path,
 ) -> None:

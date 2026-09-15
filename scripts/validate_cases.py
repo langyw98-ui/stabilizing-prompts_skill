@@ -756,39 +756,215 @@ def _canonical_type_key(value: object) -> tuple[str, str]:
     return value_type.__module__, value_type.__qualname__
 
 
+def _canonical_tagged(value: object) -> object:
+    """Return a deterministic, recursively typed representation of ``value``.
+
+    JSON serialization intentionally erases distinctions such as ``bytes`` vs
+    ``str`` and ``Path`` vs ``str``.  The tag is used only for deterministic
+    ordering/tie-breaking; the JSON-compatible value remains authoritative in
+    the emitted canonical representation.
+    """
+
+    type_module, type_name = _canonical_type_key(value)
+    if isinstance(value, Mapping):
+        members = [
+            (_canonical_tagged(key), _canonical_tagged(item))
+            for key, item in value.items()
+        ]
+        members.sort(
+            key=lambda pair: (
+                _canonical_sort_key(pair[0]),
+                _canonical_sort_key(pair[1]),
+            )
+        )
+        body: object = {
+            "kind": "mapping",
+            "items": [[key, item] for key, item in members],
+        }
+    elif isinstance(value, (set, frozenset)):
+        members = sorted(
+            (_canonical_tagged(item) for item in value),
+            key=_canonical_sort_key,
+        )
+        body = {"kind": "unordered", "items": members}
+    elif isinstance(value, (list, tuple)):
+        body = {
+            "kind": "ordered",
+            "items": [_canonical_tagged(item) for item in value],
+        }
+    else:
+        body = {"kind": "scalar", "value": _canonicalize_json(value)}
+    return {"type": [type_module, type_name], "value": body}
+
+
+def _canonical_tagged_sort_key(value: object) -> str:
+    """Return a total deterministic sort key retaining raw type/shape tags."""
+
+    return _canonical_sort_key(_canonical_tagged(value))
+
+
 def _canonicalize_unordered(
-    raw: object, encoded: object | None = None
+    raw: object,
+    encoded: object | None = None,
+    *,
+    paired_items: Sequence[tuple[object, object]] | None = None,
 ) -> object:
-    """Canonicalize an unordered container using its paired JSON values."""
+    """Canonicalize an unordered container without losing raw/JSON pairing.
+
+    A Pydantic JSON dump turns sets into lists and may independently iterate
+    those sets.  When the model context can provide singleton serializations,
+    ``paired_items`` carries an explicit raw-element to JSON-element mapping.
+    Otherwise we match equivalent canonical shapes and use a deterministic raw
+    shape template for nested unordered values.  No independently unordered
+    raw/JSON lists are zipped together.
+    """
 
     raw_items = tuple(raw)  # type: ignore[arg-type]
+
+    if paired_items is not None and len(paired_items) == len(raw_items):
+        decorated = [
+            (
+                _canonicalize_with_json_hint(raw_item, encoded_item),
+                _canonical_tagged(raw_item),
+            )
+            for raw_item, encoded_item in paired_items
+        ]
+        decorated.sort(
+            key=lambda item: (
+                _canonical_sort_key(item[0]),
+                _canonical_sort_key(item[1]),
+            )
+        )
+        return [item for item, _raw_tag in decorated]
+
     if encoded is None:
-        encoded_items = [_canonicalize_json(item) for item in raw_items]
-    elif isinstance(encoded, (list, tuple)):
-        # The paired JSON values are authoritative.  In particular, do not
-        # re-encode bytes or JSON-only serializer results from raw_items.
-        encoded_items = [_canonicalize_json(item) for item in encoded]
-    else:
+        decorated = [
+            (_canonicalize_json(item), _canonical_tagged(item))
+            for item in raw_items
+        ]
+        decorated.sort(
+            key=lambda item: (
+                _canonical_sort_key(item[0]),
+                _canonical_sort_key(item[1]),
+            )
+        )
+        return [item for item, _raw_tag in decorated]
+
+    if not isinstance(encoded, (list, tuple)):
         # A field serializer may intentionally replace the set with another
         # JSON value.  Preserve that value rather than manufacturing a list.
         return _canonicalize_json(encoded)
 
-    decorated = [
-        (
-            item,
-            _canonical_type_key(raw_items[index])
-            if index < len(raw_items)
-            else ("", ""),
+    encoded_items = list(encoded)
+
+    # First recover associations from the canonical raw shape.  The candidate
+    # is recursively normalized with the actual JSON value, so nested sets are
+    # handled before the match is compared.
+    if len(raw_items) == len(encoded_items):
+        remaining = list(range(len(encoded_items)))
+        matched: list[tuple[object, object]] = []
+        for raw_item in sorted(raw_items, key=_canonical_tagged_sort_key):
+            raw_shape = _canonicalize_json(raw_item)
+            candidates = [
+                (
+                    index,
+                    _canonicalize_with_json_hint(raw_item, encoded_items[index]),
+                )
+                for index in remaining
+            ]
+            equivalent = [
+                (index, candidate)
+                for index, candidate in candidates
+                if _canonical_sort_key(candidate) == _canonical_sort_key(raw_shape)
+            ]
+            if not equivalent:
+                matched = []
+                break
+            # Equal candidates have equal emitted values; choosing by the
+            # candidate key keeps the association independent of set order.
+            index, candidate = min(
+                equivalent, key=lambda item: _canonical_sort_key(item[1])
+            )
+            remaining.remove(index)
+            matched.append((candidate, _canonical_tagged(raw_item)))
+        if len(matched) == len(raw_items) and not remaining:
+            matched.sort(
+                key=lambda item: (
+                    _canonical_sort_key(item[0]),
+                    _canonical_sort_key(item[1]),
+                )
+            )
+            return [item for item, _raw_tag in matched]
+
+    # Scalar serializers can make a raw value's standalone JSON form differ
+    # from the model's configured form (for example base64 bytes).  In that
+    # case the encoded values are authoritative.  Apply one deterministic raw
+    # shape template to each encoded member so nested set/frozenset structure
+    # is still normalized, then sort by the resulting JSON value and tag.
+    templates = sorted(raw_items, key=_canonical_tagged_sort_key)
+    if not templates:
+        canonical_encoded = [(_canonicalize_json(item), None) for item in encoded_items]
+    else:
+        template = templates[0]
+        canonical_encoded = [
+            (
+                _canonicalize_with_json_hint(template, item),
+                _canonical_tagged(template),
+            )
+            for item in encoded_items
+        ]
+    canonical_encoded.sort(
+        key=lambda item: (
+            _canonical_sort_key(item[0]),
+            _canonical_sort_key(item[1]) if item[1] is not None else "",
         )
-        for index, item in enumerate(encoded_items)
-    ]
-    # Type metadata only breaks equal JSON-value ties.  It is deliberately not
-    # derived from hash/repr/order, so collisions remain cross-process stable.
-    decorated.sort(key=lambda item: (_canonical_sort_key(item[0]), item[1]))
-    return [item for item, _type_key in decorated]
+    )
+    return [item for item, _raw_tag in canonical_encoded]
 
 
-def _canonicalize_with_json_hint(raw: object, encoded: object) -> object:
+_MISSING = object()
+
+
+def _singleton_json_elements(
+    model: BaseModel,
+    field_name: str,
+    raw: object,
+    encoded: object,
+) -> list[tuple[object, object]] | None:
+    """Serialize one unordered member at a time using the production model."""
+
+    if not isinstance(raw, (set, frozenset)):
+        return None
+    if not isinstance(encoded, (list, tuple)):
+        return None
+
+    pairs: list[tuple[object, object]] = []
+    for raw_item in sorted(raw, key=_canonical_tagged_sort_key):
+        singleton = (
+            frozenset((raw_item,))
+            if isinstance(raw, frozenset)
+            else {raw_item}
+        )
+        try:
+            probe = model.model_copy(update={field_name: singleton})
+            probe_dump = probe.model_dump(mode="json")
+        except Exception:
+            return None
+        if not isinstance(probe_dump, Mapping):
+            return None
+        probe_value = probe_dump.get(field_name, _MISSING)
+        if not isinstance(probe_value, (list, tuple)) or len(probe_value) != 1:
+            return None
+        pairs.append((raw_item, probe_value[0]))
+    return pairs
+
+
+def _canonicalize_with_json_hint(
+    raw: object,
+    encoded: object,
+    *,
+    paired_items: Sequence[tuple[object, object]] | None = None,
+) -> object:
     """Canonicalize a Python-mode value while retaining its JSON-mode value.
 
     Pydantic's JSON mode knows how to encode values such as ``Decimal``,
@@ -797,6 +973,9 @@ def _canonicalize_with_json_hint(raw: object, encoded: object) -> object:
     representations lets us keep Pydantic's scalar encodings while retaining
     the raw container kind needed for deterministic set/frozenset handling.
     """
+
+    if isinstance(raw, BaseModel):
+        return _canonicalize_model(raw, encoded_hint=encoded)
 
     if isinstance(raw, Mapping):
         if not isinstance(encoded, Mapping):
@@ -830,7 +1009,7 @@ def _canonicalize_with_json_hint(raw: object, encoded: object) -> object:
         return {key: item for key, item in items}
 
     if isinstance(raw, (set, frozenset)):
-        return _canonicalize_unordered(raw, encoded)
+        return _canonicalize_unordered(raw, encoded, paired_items=paired_items)
 
     if isinstance(raw, (list, tuple)):
         if not isinstance(encoded, (list, tuple)) or len(raw) != len(encoded):
@@ -843,6 +1022,53 @@ def _canonicalize_with_json_hint(raw: object, encoded: object) -> object:
     # For scalar leaves, JSON mode is the source of truth.  It has already
     # applied field serializers and all Pydantic-supported JSON encodings.
     return _canonicalize_json(encoded)
+
+
+def _canonicalize_model(
+    model: BaseModel, *, encoded_hint: object = _MISSING
+) -> object:
+    """Canonicalize a model while retaining field-level JSON serializers."""
+
+    raw_dump = model.model_dump(mode="python")
+    encoded_dump = (
+        model.model_dump(mode="json")
+        if encoded_hint is _MISSING
+        else encoded_hint
+    )
+    if not isinstance(raw_dump, Mapping) or not isinstance(encoded_dump, Mapping):
+        return _canonicalize_json(encoded_dump)
+
+    items: list[tuple[object, object]] = []
+    model_fields = type(model).model_fields
+    for key, raw_dump_item in raw_dump.items():
+        encoded_item = encoded_dump.get(key, _MISSING)
+        if encoded_item is _MISSING:
+            canonical_item = _canonicalize_json(raw_dump_item)
+        else:
+            raw_item = (
+                getattr(model, key, raw_dump_item)
+                if key in model_fields
+                else raw_dump_item
+            )
+            paired_items = _singleton_json_elements(
+                model, key, raw_item, encoded_item
+            )
+            canonical_item = _canonicalize_with_json_hint(
+                raw_item,
+                encoded_item,
+                paired_items=paired_items,
+            )
+        items.append((_canonicalize_json(key), canonical_item))
+
+    # A custom model serializer may add JSON keys which do not appear in the
+    # Python-mode dump.  Preserve those JSON-authoritative values as well.
+    raw_keys = set(raw_dump)
+    for key, encoded_item in encoded_dump.items():
+        if key not in raw_keys:
+            items.append((_canonicalize_json(key), _canonicalize_json(encoded_item)))
+
+    items.sort(key=lambda item: _canonical_sort_key(item[0]))
+    return {key: item for key, item in items}
 
 
 def _canonicalize_json(value: object) -> object:
@@ -858,9 +1084,7 @@ def _canonicalize_json(value: object) -> object:
         # Keep the Python-mode tree so unordered containers remain visible,
         # while pairing it with JSON mode so scalar/model serializers retain
         # Pydantic's production JSON representation.
-        return _canonicalize_with_json_hint(
-            value.model_dump(mode="python"), value.model_dump(mode="json")
-        )
+        return _canonicalize_model(value)
     if isinstance(value, Mapping):
         items = [
             (key, _canonicalize_json(item)) for key, item in value.items()
@@ -1018,7 +1242,7 @@ def _flatten_input(
     if isinstance(value, (set, frozenset)):
         ordered = sorted(
             value,
-            key=lambda item: _canonical_sort_key(_canonicalize_json(item)),
+            key=_canonical_tagged_sort_key,
         )
         for index, item in enumerate(ordered):
             _flatten_input(
@@ -1966,7 +2190,7 @@ def _redact_cli_value(value: object) -> object:
         return [_redact_cli_value(item) for item in value]
     if isinstance(value, Set):
         redacted = [_redact_cli_value(item) for item in value]
-        redacted.sort(key=lambda item: _canonical_sort_key(_canonicalize_json(item)))
+        redacted.sort(key=_canonical_tagged_sort_key)
         return redacted
     if isinstance(value, str):
         text = re.sub(
