@@ -3,6 +3,14 @@
 日期：2026-09-16  
 状态：已批准，待实现
 
+## 文档历史
+
+| 修订 | 日期 | 变更内容 |
+| --- | --- | --- |
+| 3 | 2026-09-16 | 新增文档内历史变更记录。 |
+| 2 | 2026-09-16 | 收紧 worktree 清理范围，明确双 commit、单一状态文件及确定性 cleanliness 合同。 |
+| 1 | 2026-09-16 | 整合 local-exclude 初始化与 finalization/delivery/cleanup 设计，形成独立最终态规范。 |
+
 ## 1. 背景与起始状态
 
 `stabilizing-prompts` 的 `tune` 在目标 Python Git 仓库中为单个 Markdown
