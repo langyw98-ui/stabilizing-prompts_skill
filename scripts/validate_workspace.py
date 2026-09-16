@@ -361,10 +361,10 @@ def validate_workspace(
     _validate_recorded_contract(requested_root, prompt_relative, prompt_id)
     if mode not in {"tune", "verify"}:
         raise WorkspaceError("workspace validation mode must be tune or verify")
-    # A bare repository with no evaluation directory is still useful to the
-    # existing snapshot API.  Once verify has a concrete evaluation root,
-    # enforce the runtime ignore gate before its output path can be written.
-    if mode == "verify" and (requested_root / ".prompt-evals").is_dir():
+    # Verify must prove both runtime paths are ignored before any caller can
+    # write output or proceed to model work, even when the evaluation root is
+    # not present yet.
+    if mode == "verify":
         validate_runtime_ignores(requested_root, prompt_id)
     prompt_hash = hashlib.sha256(prompt_resolved.read_bytes()).hexdigest()
 

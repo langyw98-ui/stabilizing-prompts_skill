@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -156,6 +157,41 @@ def test_verify_missing_runtime_ignores_is_read_only_before_output_or_model(
         + "\n",
         encoding="utf-8",
     )
+    output = tmp_path / "workspace.json"
+    transport = CountingTransport()
+    monkeypatch.setattr(workspace_module, "_ensure_kds_environment", lambda: None)
+
+    code = workspace_module.main(
+        [
+            "--repo",
+            str(target_repo),
+            "--prompt",
+            "prompts/classify.md",
+            "--mode",
+            "verify",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert code == 2
+    assert "runtime path" in capsys.readouterr().out
+    assert exclude.read_bytes() == before
+    assert not output.exists()
+    assert transport.call_count == 0
+
+
+def test_verify_checks_runtime_ignores_without_eval_root_before_output_or_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo")
+    shutil.rmtree(target_repo / ".prompt-evals")
+    project_ignore = target_repo / ".gitignore"
+    project_ignore.write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
+    exclude = target_repo / ".git" / "info" / "exclude"
+    before = exclude.read_bytes()
     output = tmp_path / "workspace.json"
     transport = CountingTransport()
     monkeypatch.setattr(workspace_module, "_ensure_kds_environment", lambda: None)

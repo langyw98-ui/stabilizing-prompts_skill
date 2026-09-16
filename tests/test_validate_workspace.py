@@ -271,6 +271,10 @@ def test_workspace_cli_writes_machine_readable_snapshot(
 ) -> None:
     repo, prompt = repo_with_prompt
     monkeypatch.setattr("scripts.validate_workspace._ensure_kds_environment", lambda: None)
+    (repo / ".gitignore").write_text(
+        ".prompt-evals/**/reports/\n.prompt-evals/**/.runtime/\n",
+        encoding="utf-8",
+    )
     output = tmp_path / "workspace.json"
 
     assert (

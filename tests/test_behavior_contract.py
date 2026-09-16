@@ -5,10 +5,16 @@ from pathlib import Path
 
 import pytest
 
+from scripts import manage_worktree
 from scripts.local_model_client import safe_client_config
-from scripts.manage_worktree import initialize_local_excludes
+from scripts.manage_worktree import (
+    WorktreeError,
+    initialize_local_excludes,
+    load_cycle,
+)
 from scripts.validate_workspace import prompt_id_for_path
 from scripts.run_prompt_eval import _redacted, _safe_serialize
+from tests import integration_support as support_module
 from tests.integration_support import (
     CountingTransport,
     build_target_repo,
@@ -73,6 +79,43 @@ def test_tune_initializes_repository_local_excludes_before_model_call(
     assert "/.worktrees/stabilizing-prompts/" in exclude.read_text(
         encoding="utf-8"
     )
+
+
+def test_tune_retains_runtime_gate_failure_state_outside_managed_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo")
+    transport = CountingTransport()
+    observed: dict[str, object] = {}
+    real_create_cycle = support_module.create_cycle
+
+    def observe_create_cycle(*args: object, **kwargs: object) -> object:
+        observed["state_path"] = kwargs.get("state_path")
+        return real_create_cycle(*args, **kwargs)
+
+    monkeypatch.setattr(support_module, "create_cycle", observe_create_cycle)
+
+    def fail_runtime(_cycle: object) -> tuple[str, str]:
+        raise WorktreeError("runtime path is not ignored")
+
+    monkeypatch.setattr(manage_worktree, "verify_runtime_ignores", fail_runtime)
+
+    with pytest.raises(WorktreeError, match="runtime path is not ignored"):
+        run_tune_with_fake_transport(
+            target_repo,
+            scenario="no-change",
+            transport=transport,
+        )
+
+    state_value = observed.get("state_path")
+    assert isinstance(state_value, Path)
+    managed_root = target_repo / ".worktrees" / "stabilizing-prompts"
+    assert not state_value.resolve().is_relative_to(managed_root.resolve())
+    retained = load_cycle(state_value, require_current=True)
+    assert retained.worktree.is_dir()
+    assert retained.runtime_ignores_verified is False
+    assert transport.call_count == 0
 
 
 def test_tune_creates_project_local_worktree_before_model_call(tmp_path: Path) -> None:

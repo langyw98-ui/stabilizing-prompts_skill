@@ -1679,10 +1679,12 @@ def run_tune_with_fake_transport(
         )
 
     fake.mark("worktree")
+    state_path = repo.parent / f".{repo.name}-{prompt_id}.cycle.json"
     cycle = create_cycle(
         repo,
         prompt_id,
         prompt_path=snapshot.prompt_path,
+        state_path=state_path,
     )
     eval_root = _prepare_fixture_assets(repo, cycle.worktree, prompt_id)
     if project_transport_setting is not None:
