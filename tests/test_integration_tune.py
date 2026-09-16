@@ -48,9 +48,32 @@ def test_tune_stops_before_transport_when_mechanical_coverage_fails(
     validation_path.write_text(
         yaml.safe_dump(cases, sort_keys=False), encoding="utf-8"
     )
-    renewed = run_tune_with_fake_transport(target_repo, transport=transport)
+    renewed = run_tune_with_fake_transport(
+        target_repo,
+        transport=transport,
+        confirm_delivery=True,
+    )
     assert renewed.stop_reason == "delivered"
     assert transport.calls
+
+
+def test_complete_assets_tune_success_delivers_after_external_fixture_conditional(
+    tmp_path: Path,
+) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo", complete_assets=True)
+
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="happy",
+        confirm_delivery=True,
+    )
+
+    assert result.stop_reason == "delivered"
+    assert result.formal_result is not None
+    assert result.formal_result.kind == "acceptance_passed"
+    assert result.cleanup_status == "complete"
+    assert "external-cases.yaml" not in result.delivered_paths
+    assert not (target_repo / ".worktrees" / "stabilizing-prompts").exists()
 
 
 def test_actual_case_counts_drive_fixed_repeat_slots(target_repo: Path) -> None:
@@ -456,6 +479,24 @@ def test_ambiguous_delivery_confirmation_retains_prepared_cycle(
     assert workspace_snapshot(target_repo) == before
 
 
+def test_omitted_delivery_confirmation_never_implicitly_delivers_success(
+    target_repo: Path,
+) -> None:
+    before = workspace_snapshot(target_repo)
+
+    result = run_tune_with_fake_transport(target_repo, scenario="happy")
+
+    assert result.stop_reason == "acceptance_passed"
+    assert result.formal_result is not None
+    assert result.formal_result.kind == "acceptance_passed"
+    assert result.prepared_commit is not None
+    assert result.delivery_commit is None
+    assert result.cleanup_status == "retained"
+    assert result.delivered_paths == ()
+    assert workspace_snapshot(target_repo) == before
+    assert (target_repo / ".worktrees" / "stabilizing-prompts").is_dir()
+
+
 @pytest.mark.parametrize(
     ("scenario", "kind", "acceptance_count", "profile", "prompt_changes"),
     [
@@ -589,7 +630,11 @@ def test_validation_regression_rejects_candidate_before_acceptance(target_repo: 
 
 
 def test_equal_perfect_acceptance_is_allowed_and_delivers(target_repo: Path) -> None:
-    result = run_tune_with_fake_transport(target_repo, scenario="equal-perfect")
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="equal-perfect",
+        confirm_delivery=True,
+    )
 
     assert result.stop_reason == "delivered"
     assert result.acceptance_activities == 1
@@ -642,7 +687,11 @@ def test_original_workspace_conflict_stops_without_overwriting_user_edit(
     target_repo: Path,
 ) -> None:
     before = workspace_snapshot(target_repo)
-    result = run_tune_with_fake_transport(target_repo, scenario="conflict")
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="conflict",
+        confirm_delivery=True,
+    )
 
     assert result.stop_reason == "delivery_conflict"
     assert result.delivered_prompt_hash is None
@@ -654,7 +703,11 @@ def test_original_workspace_conflict_stops_without_overwriting_user_edit(
 
 
 def test_interrupted_slot_resumes_same_identity_without_extra_slot(target_repo: Path) -> None:
-    result = run_tune_with_fake_transport(target_repo, scenario="resume")
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="resume",
+        confirm_delivery=True,
+    )
 
     assert result.stop_reason == "delivered"
     assert result.resumed_slot_key is not None
@@ -693,6 +746,7 @@ def test_fake_transport_is_test_injected_and_not_project_selectable(target_repo:
         target_repo,
         transport=transport,
         project_transport_setting="fake",
+        confirm_delivery=True,
     )
 
     assert result.stop_reason == "delivered"

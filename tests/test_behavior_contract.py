@@ -64,7 +64,11 @@ def test_delivery_artifacts_require_the_exact_cycle_runtime(tmp_path: Path) -> N
 
 def test_delivery_rollback_restores_exact_targets_after_post_apply_failure(tmp_path: Path) -> None:
     target_repo = build_target_repo(tmp_path / "target-repo")
-    result = run_tune_with_fake_transport(target_repo, scenario="rollback")
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="rollback",
+        confirm_delivery=True,
+    )
 
     assert result.stop_reason == "delivery_rollback"
     assert (target_repo / "prompts" / "classify.md").read_text(encoding="utf-8") == result.original_prompt
@@ -77,6 +81,9 @@ def test_post_confirmation_ignore_drift_invalidates_confirmation_without_finaliz
     target_repo = build_target_repo(tmp_path / "target-repo")
     transport = CountingTransport(scenario="ignore-drift")
     before = workspace_snapshot(target_repo)
+    project_ignore_before = (target_repo / ".gitignore").read_bytes()
+    exclude_path = target_repo / ".git" / "info" / "exclude"
+    exclude_before = exclude_path.read_bytes()
 
     result = run_tune_with_fake_transport(
         target_repo,
@@ -92,9 +99,12 @@ def test_post_confirmation_ignore_drift_invalidates_confirmation_without_finaliz
     assert result.raw_evidence == []
     assert "confirmation-invalidated" in result.lifecycle_events
     assert workspace_snapshot(target_repo) == before
+    assert (target_repo / ".gitignore").read_bytes() == project_ignore_before
+    assert exclude_path.read_bytes() == exclude_before
     worktree_root = target_repo / ".worktrees" / "stabilizing-prompts"
     assert worktree_root.is_dir()
     worktree = next(worktree_root.iterdir())
+    assert (worktree / ".gitignore").read_bytes() == project_ignore_before
     assert not tuple((worktree / ".prompt-evals").glob("*/evaluation-summaries/*.md"))
 
 
@@ -125,6 +135,29 @@ def test_delivery_state_failure_rolls_back_workspace_and_retains_cycle(
     assert cycle.finalization.delivery_applied is False
     assert cycle.finalization.delivery_verified is False
     assert cycle.finalization.cleanup.authorized is True
+    assert (target_repo / ".worktrees" / "stabilizing-prompts").is_dir()
+
+
+def test_failure_confirmation_cannot_deliver_success_prompt(tmp_path: Path) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo")
+    before = workspace_snapshot(target_repo)
+
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="happy",
+        confirm_delivery=False,
+        confirm_failure_delivery=True,
+    )
+
+    assert result.stop_reason == "delivery_not_confirmed"
+    assert result.formal_result is not None
+    assert result.formal_result.kind == "acceptance_passed"
+    assert result.delivery_profile == "success"
+    assert result.prepared_commit is not None
+    assert result.delivery_commit is None
+    assert result.delivered_paths == ()
+    assert result.cleanup_status == "retained"
+    assert workspace_snapshot(target_repo) == before
     assert (target_repo / ".worktrees" / "stabilizing-prompts").is_dir()
 
 
@@ -273,7 +306,10 @@ def test_delivery_contains_coverage_obligations_for_both_results(
 ) -> None:
     target_repo = build_target_repo(tmp_path / "target-repo")
     if result_kind == "success":
-        result = run_tune_with_fake_transport(target_repo)
+        result = run_tune_with_fake_transport(
+            target_repo,
+            confirm_delivery=True,
+        )
     else:
         result = run_tune_with_fake_transport(
             target_repo,

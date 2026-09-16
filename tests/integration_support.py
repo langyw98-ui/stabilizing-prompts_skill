@@ -88,9 +88,6 @@ DEFAULT_SATURATION_STATEMENT = (
 NEAR_DUPLICATE_REVIEW_NOT_REQUIRED = "not_required"
 NEAR_DUPLICATE_REVIEW_CONFIRMED = "confirmed"
 NEAR_DUPLICATE_REVIEW_REJECTED = "rejected"
-_UNSET_CONFIRMATION = object()
-
-
 @dataclass(frozen=True, slots=True)
 class ConfirmationRecord:
     """All user-confirmed evidence that gates the first model call."""
@@ -1744,7 +1741,6 @@ def _finalize_scored_result(
     candidate_hash: str | None = None,
     confirm_delivery: bool | None,
     confirm_failure_delivery: bool,
-    legacy_implicit_delivery: bool,
     scenario: str,
 ) -> dict[str, object]:
     """Finalize one scored result through prepare, delivery, and cleanup."""
@@ -1807,18 +1803,12 @@ def _finalize_scored_result(
     fake.mark(f"displayed-result:{kind}")
     fake.mark(f"displayed-delivery-profile:{formal.delivery_profile}")
 
-    affirmative = confirm_delivery is True or confirm_failure_delivery is True
-    legacy_delivery = (
-        legacy_implicit_delivery
-        and affirmative
-        and not confirm_failure_delivery
+    failure_confirmation = (
+        confirm_failure_delivery
+        and kind == "acceptance_failed"
+        and formal.delivery_profile == "assets"
     )
-    if legacy_implicit_delivery and not confirm_failure_delivery:
-        # Preserve the old test helper's implicit behavior: only the original
-        # acceptance-pass path auto-delivered before explicit confirmation was
-        # added to the lifecycle contract.
-        affirmative = kind == "acceptance_passed"
-        legacy_delivery = affirmative
+    affirmative = confirm_delivery is True or failure_confirmation
     fake.mark("delivery-confirmation")
     if not affirmative:
         finalize_module.resolve_delivery_commit(state_path, confirmed=False)
@@ -1931,11 +1921,9 @@ def _finalize_scored_result(
         if formal.delivery_profile == "success"
         else None
     )
-    cleanup_status = "retained"
-    if not legacy_delivery:
-        cleanup_cycle(state_path)
-        cleanup_status = "complete"
-        fake.mark("cleanup")
+    cleanup_cycle(state_path)
+    cleanup_status = "complete"
+    fake.mark("cleanup")
     return {
         "formal_result": formal,
         "summary_path": finalization.summary_path,
@@ -1946,9 +1934,7 @@ def _finalize_scored_result(
         "delivered_paths": delivered_paths,
         "delivered_prompt_hash": delivered_prompt_hash,
         "reported_stop_reason": (
-            "delivered"
-            if stop_reason == "acceptance_passed" and legacy_delivery
-            else stop_reason
+            "delivered" if stop_reason == "acceptance_passed" else stop_reason
         ),
     }
 
@@ -1958,7 +1944,7 @@ def run_tune_with_fake_transport(
     *,
     scenario: str = "happy",
     confirm_contract: bool = True,
-    confirm_delivery: bool | None | object = _UNSET_CONFIRMATION,
+    confirm_delivery: bool | None = None,
     confirm_failure_delivery: bool = False,
     confirm_near_duplicate_review: bool = True,
     confirmation_hashes: tuple[str, str] | None = None,
@@ -1994,9 +1980,6 @@ def run_tune_with_fake_transport(
         saturation_statement if isinstance(saturation_statement, str) else ""
     )
     current_near_duplicate_review_status = near_duplicate_review_status
-    legacy_implicit_delivery = confirm_delivery is _UNSET_CONFIRMATION
-    delivery_confirmation = None if legacy_implicit_delivery else confirm_delivery
-
     def _result(stop_reason: str, **values: object) -> TuneResult:
         defaults: dict[str, object] = {
             "baseline_dev": baseline_dev,
@@ -2217,41 +2200,45 @@ def run_tune_with_fake_transport(
         exclude = manage_module._repository_local_exclude(repo)
         project_ignore = cycle.worktree / ".gitignore"
         original_project_ignore = project_ignore.read_bytes()
-        project_ignore.write_bytes(
-            "\n".join(
-                line
-                for line in original_project_ignore.decode("utf-8").splitlines()
-                if line not in {
-                    ".prompt-evals/**/reports/",
-                    ".prompt-evals/**/.runtime/",
-                }
-            ).encode("utf-8")
-            + b"\n"
-        )
-        exclude.write_text(
-            "\n".join(
-                line
-                for line in exclude.read_text(encoding="utf-8").splitlines()
-                if line not in {
-                    "/.prompt-evals/*/reports/",
-                    "/.prompt-evals/*/.runtime/",
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        fake.mark("post-confirmation-ignore-drift")
+        original_exclude = exclude.read_bytes()
         try:
-            verify_runtime_ignores(cycle)
-        except WorktreeError:
-            project_ignore.write_bytes(original_project_ignore)
-            fake.mark("confirmation-invalidated")
-            return _result(
-                "setup_error",
-                transport_calls=fake.call_count,
-                raw_evidence=_report_evidence(fake),
+            project_ignore.write_bytes(
+                "\n".join(
+                    line
+                    for line in original_project_ignore.decode("utf-8").splitlines()
+                    if line not in {
+                        ".prompt-evals/**/reports/",
+                        ".prompt-evals/**/.runtime/",
+                    }
+                ).encode("utf-8")
+                + b"\n"
             )
-        raise AssertionError("post-confirmation ignore drift unexpectedly passed")
+            exclude.write_text(
+                "\n".join(
+                    line
+                    for line in original_exclude.decode("utf-8").splitlines()
+                    if line not in {
+                        "/.prompt-evals/*/reports/",
+                        "/.prompt-evals/*/.runtime/",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake.mark("post-confirmation-ignore-drift")
+            try:
+                verify_runtime_ignores(cycle)
+            except WorktreeError:
+                fake.mark("confirmation-invalidated")
+                return _result(
+                    "setup_error",
+                    transport_calls=fake.call_count,
+                    raw_evidence=_report_evidence(fake),
+                )
+            raise AssertionError("post-confirmation ignore drift unexpectedly passed")
+        finally:
+            project_ignore.write_bytes(original_project_ignore)
+            exclude.write_bytes(original_exclude)
     try:
         fake.mark("probe")
         probe_model(fake)
@@ -2337,9 +2324,8 @@ def run_tune_with_fake_transport(
             comparisons=comparisons,
             acceptance_status="not_run",
             near_duplicate_review_status=current_near_duplicate_review_status,
-            confirm_delivery=delivery_confirmation,
+            confirm_delivery=confirm_delivery,
             confirm_failure_delivery=confirm_failure_delivery,
-            legacy_implicit_delivery=legacy_implicit_delivery,
             scenario=scenario,
         )
         reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
@@ -2396,9 +2382,8 @@ def run_tune_with_fake_transport(
             comparisons={"dev": dev_comparison, "validation": validation_comparison},
             acceptance_status="not_run",
             near_duplicate_review_status=current_near_duplicate_review_status,
-            confirm_delivery=delivery_confirmation,
+            confirm_delivery=confirm_delivery,
             confirm_failure_delivery=confirm_failure_delivery,
-            legacy_implicit_delivery=legacy_implicit_delivery,
             scenario=scenario,
         )
         reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
@@ -2456,9 +2441,8 @@ def run_tune_with_fake_transport(
             comparisons={"dev": dev_comparison, "validation": validation_comparison},
             acceptance_status="not_run",
             near_duplicate_review_status=current_near_duplicate_review_status,
-            confirm_delivery=delivery_confirmation,
+            confirm_delivery=confirm_delivery,
             confirm_failure_delivery=confirm_failure_delivery,
-            legacy_implicit_delivery=legacy_implicit_delivery,
             scenario=scenario,
         )
         reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
@@ -2499,9 +2483,8 @@ def run_tune_with_fake_transport(
             comparisons={"dev": dev_comparison, "validation": validation_comparison},
             acceptance_status="not_run",
             near_duplicate_review_status=current_near_duplicate_review_status,
-            confirm_delivery=delivery_confirmation,
+            confirm_delivery=confirm_delivery,
             confirm_failure_delivery=confirm_failure_delivery,
-            legacy_implicit_delivery=legacy_implicit_delivery,
             scenario=scenario,
         )
         reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
@@ -2576,9 +2559,8 @@ def run_tune_with_fake_transport(
             },
             acceptance_status="failed",
             near_duplicate_review_status=current_near_duplicate_review_status,
-            confirm_delivery=delivery_confirmation,
+            confirm_delivery=confirm_delivery,
             confirm_failure_delivery=confirm_failure_delivery,
-            legacy_implicit_delivery=legacy_implicit_delivery,
             scenario=scenario,
         )
         reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
@@ -2619,9 +2601,8 @@ def run_tune_with_fake_transport(
         near_duplicate_review_status=current_near_duplicate_review_status,
         candidate_path=candidate_path,
         candidate_hash=candidate_hash,
-        confirm_delivery=delivery_confirmation,
+        confirm_delivery=confirm_delivery,
         confirm_failure_delivery=confirm_failure_delivery,
-        legacy_implicit_delivery=legacy_implicit_delivery,
         scenario=scenario,
     )
     reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
