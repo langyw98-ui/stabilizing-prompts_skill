@@ -403,6 +403,130 @@ def test_tune_initializes_and_delivers_only_after_acceptance_and_confirmation(
     assert (target_repo / "prompts" / "classify.md").read_text(encoding="utf-8") == result.candidate_prompt
 
 
+def test_no_change_finalizes_assets_and_cleans_after_confirmation(
+    target_repo: Path,
+) -> None:
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        confirm_delivery=True,
+    )
+
+    assert result.stop_reason == "no_change_needed"
+    assert result.delivery_profile == "assets"
+    assert result.prepared_commit == result.delivery_commit
+    assert result.summary_path is not None
+    assert (target_repo / result.summary_path).is_file()
+    assert result.cleanup_status == "complete"
+    assert not (target_repo / ".worktrees" / "stabilizing-prompts").exists()
+
+
+def test_declined_formal_result_retains_prepared_cycle_without_workspace_delivery(
+    target_repo: Path,
+) -> None:
+    before = workspace_snapshot(target_repo)
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        confirm_delivery=False,
+    )
+
+    assert result.prepared_commit is not None
+    assert result.delivery_commit is None
+    assert result.cleanup_status == "retained"
+    assert workspace_snapshot(target_repo) == before
+    assert len(tuple((target_repo / ".worktrees" / "stabilizing-prompts").iterdir())) == 1
+
+
+def test_ambiguous_delivery_confirmation_retains_prepared_cycle(
+    target_repo: Path,
+) -> None:
+    before = workspace_snapshot(target_repo)
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        confirm_delivery=None,
+    )
+
+    assert result.formal_result is not None
+    assert result.formal_result.kind == "no_change_needed"
+    assert result.prepared_commit is not None
+    assert result.delivery_commit is None
+    assert result.cleanup_status == "retained"
+    assert workspace_snapshot(target_repo) == before
+
+
+@pytest.mark.parametrize(
+    ("scenario", "kind", "acceptance_count", "profile", "prompt_changes"),
+    [
+        ("no-change", "no_change_needed", 0, "assets", False),
+        ("no-strict-improvement", "no_strict_improvement", 0, "assets", False),
+        ("regression", "validation_failed", 0, "assets", False),
+        ("no-improvement-limit", "no_improvement_limit", 0, "assets", False),
+        ("round-limit", "round_limit", 0, "assets", False),
+        ("acceptance-failure", "acceptance_failed", 1, "assets", False),
+        ("happy", "acceptance_passed", 1, "success", True),
+    ],
+)
+def test_every_scored_terminal_result_finalizes_and_delivers_exact_profile(
+    target_repo: Path,
+    scenario: str,
+    kind: str,
+    acceptance_count: int,
+    profile: str,
+    prompt_changes: bool,
+) -> None:
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario=scenario,
+        confirm_delivery=True,
+    )
+
+    assert result.formal_result is not None
+    assert result.formal_result.kind == kind
+    assert result.summary_path is not None
+    assert result.prepared_commit is not None
+    assert result.delivery_commit is not None
+    assert result.delivery_profile == profile
+    assert result.acceptance_activities == acceptance_count
+    assert result.cleanup_status == "complete"
+    assert (target_repo / result.summary_path).is_file()
+    if profile == "assets":
+        assert result.delivery_commit == result.prepared_commit
+    else:
+        assert result.delivery_commit != result.prepared_commit
+        assert support_module._git(
+            target_repo,
+            "rev-parse",
+            f"{result.delivery_commit}^",
+        ).strip() == result.prepared_commit
+    assert support_module._git(
+        target_repo,
+        "show",
+        f"{result.prepared_commit}:{result.summary_path}",
+    )
+
+    history = yaml.safe_load(
+        (target_repo / ".prompt-evals" / next(target_repo.glob(".prompt-evals/*")).name / "optimization-history.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    entries = history.get("cycles", []) if isinstance(history, dict) else []
+    assert sum(
+        isinstance(entry, dict) and entry.get("result") == kind
+        for entry in entries
+    ) == 1
+    assert all(
+        ".runtime/" not in path
+        and "/reports/" not in path
+        and "raw" not in path
+        for path in result.delivered_paths
+    )
+    prompt = (target_repo / "prompts" / "classify.md").read_text(encoding="utf-8")
+    assert prompt == (result.candidate_prompt if prompt_changes else result.original_prompt)
+    assert not (target_repo / ".worktrees" / "stabilizing-prompts").exists()
+
+
 def test_workspace_snapshot_ignores_managed_worktree_but_captures_other_nested_worktree(
     target_repo: Path,
 ) -> None:

@@ -12,6 +12,7 @@ from collections import Counter
 from collections.abc import Mapping
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 from io import StringIO
 import json
@@ -26,19 +27,22 @@ import yaml
 from langchain_core.messages import AIMessage
 
 from scripts import compare_runs as compare_module
+from scripts import finalize_cycle as finalize_module
+from scripts import manage_worktree as manage_module
 from scripts import run_prompt_eval as runner_module
 from scripts import validate_cases as cases_module
 from scripts import validate_workspace as workspace_module
 from scripts.local_model_client import MODEL_NAME, probe_model, safe_client_config
 from scripts.manage_worktree import (
-    FAILURE_ALLOWLIST,
-    SUCCESS_ALLOWLIST,
     DeliveryConflict,
     DeliveryError,
+    WorktreeError,
     WorktreeCycle,
     apply_delivery_patch,
     build_delivery_patch,
+    cleanup_cycle,
     create_cycle,
+    verify_runtime_ignores,
 )
 from scripts.run_prompt_eval import (
     RunManifest,
@@ -50,6 +54,11 @@ from scripts.run_prompt_eval import (
     pending_slots,
 )
 from scripts.score_results import RunMetrics, score_run
+from scripts.evaluation_summary import (
+    FormalResult,
+    SummaryEvidence,
+    normalize_formal_result,
+)
 from scripts.validate_cases import (
     CaseSetupError,
     CaseSuite,
@@ -79,6 +88,7 @@ DEFAULT_SATURATION_STATEMENT = (
 NEAR_DUPLICATE_REVIEW_NOT_REQUIRED = "not_required"
 NEAR_DUPLICATE_REVIEW_CONFIRMED = "confirmed"
 NEAR_DUPLICATE_REVIEW_REJECTED = "rejected"
+_UNSET_CONFIRMATION = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1023,6 +1033,9 @@ def build_target_repo(path: Path, *, complete_assets: bool = False) -> Path:
     prompt_id = prompt_id_for_path(PROMPT_RELATIVE)
     _initial_contract(target, prompt_id)
     _git(target, "init")
+    # Keep fixture bytes stable across linked worktrees and patch delivery;
+    # production destination hashes intentionally compare exact bytes.
+    _git(target, "config", "core.autocrlf", "false")
     _establish_managed_worktree_ignore(target)
     _git(target, "config", "user.email", "integration-tests@example.invalid")
     _git(target, "config", "user.name", "Offline Integration Tests")
@@ -1128,7 +1141,7 @@ class CountingTransport:
     def _is_wrong(
         self, prompt_hash: str, case_input: object, expected: tuple[str, str]
     ) -> bool:
-        if self.scenario == "no-change":
+        if self.scenario in {"no-change", "no-strict-improvement"}:
             return False
         variables = case_input.get("variables") if isinstance(case_input, Mapping) else None
         if not isinstance(variables, Mapping):
@@ -1236,6 +1249,12 @@ class TuneResult:
     slot_call_counts: dict[str, int] = field(default_factory=dict)
     slot_attempts: dict[str, int] = field(default_factory=dict)
     raw_evidence: object = None
+    formal_result: FormalResult | None = None
+    summary_path: str | None = None
+    prepared_commit: str | None = None
+    delivery_commit: str | None = None
+    delivery_profile: str | None = None
+    cleanup_status: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -1271,6 +1290,14 @@ class TuneResult:
             "slot_call_counts": dict(self.slot_call_counts),
             "slot_attempts": dict(self.slot_attempts),
             "raw_evidence": runner_module._redacted(self.raw_evidence),
+            "formal_result": (
+                self.formal_result.to_dict() if self.formal_result is not None else None
+            ),
+            "summary_path": self.summary_path,
+            "prepared_commit": self.prepared_commit,
+            "delivery_commit": self.delivery_commit,
+            "delivery_profile": self.delivery_profile,
+            "cleanup_status": self.cleanup_status,
         }
 
     @property
@@ -1558,42 +1585,372 @@ def assert_delivered_files_unstaged_or_untracked(repo: Path, paths: tuple[str, .
             assert status.startswith("??"), f"new delivery is not untracked: {relative}: {status!r}"
 
 
-def _finish_success_delivery(
-    cycle: WorktreeCycle,
-    prompt_id: str,
-    candidate_prompt: str,
-    candidate_hash: str,
-) -> tuple[tuple[str, ...], str]:
-    worktree_prompt = cycle.worktree / PROMPT_RELATIVE
-    worktree_prompt.write_text(candidate_prompt, encoding="utf-8")
-    contract = cycle.worktree / ".prompt-evals" / prompt_id / "prompt-contract.yaml"
-    contract.write_text(
-        contract.read_text(encoding="utf-8")
-        + f"current_prompt_hash: {candidate_hash}\n",
-        encoding="utf-8",
+def _comparison_mapping(value: object) -> dict[str, object]:
+    """Serialize a comparison without allowing live scoring objects into evidence."""
+
+    if isinstance(value, Mapping):
+        converted = dict(value)
+    else:
+        to_dict = getattr(value, "to_dict", None)
+        if not callable(to_dict):
+            raise AssertionError(
+                "finalization comparison must be a mapping or to_dict object"
+            )
+        raw = to_dict()
+        if not isinstance(raw, Mapping):
+            raise AssertionError("finalization comparison to_dict must return a mapping")
+        converted = dict(raw)
+    converted.setdefault("fixes", 0)
+    converted.setdefault("regressions", converted.get("regression_count", 0))
+    converted.setdefault(
+        "stability_regressions",
+        converted.get("stability_regression_count", 0),
     )
-    _git_commit(cycle.worktree, "tune: commit accepted candidate")
-    patch = build_delivery_patch(cycle, SUCCESS_ALLOWLIST, result="success")
-    apply_delivery_patch(cycle, patch)
-    delivered_hash = _prompt_hash(cycle.original_repo / PROMPT_RELATIVE)
-    return patch.paths, delivered_hash
+    converted.setdefault("unchanged", 0)
+    return converted
 
 
-def _finish_failure_delivery(
+def _next_finalization_timestamp(cycle: WorktreeCycle, kind: str) -> str:
+    """Choose a valid timestamp not already used by this disposable fixture."""
+
+    eval_root = cycle.worktree / ".prompt-evals" / cycle.prompt_id
+    history_path = eval_root / "optimization-history.yaml"
+    try:
+        history = yaml.safe_load(history_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        history = None
+    existing = {
+        (entry.get("finished_at_utc"), entry.get("result") or entry.get("stop_reason"))
+        for entry in (history.get("cycles", []) if isinstance(history, Mapping) else [])
+        if isinstance(entry, Mapping)
+    }
+    start = datetime.now(timezone.utc).replace(microsecond=0)
+    for offset in range(3600):
+        timestamp = (start + timedelta(seconds=offset)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        destination = (
+            eval_root
+            / "evaluation-summaries"
+            / f"{timestamp[:10]}-{timestamp[11:19].replace(':', '')}-{kind}.md"
+        )
+        if (timestamp, kind) not in existing and not destination.exists():
+            return timestamp
+    raise AssertionError(f"unable to choose a unique finalization timestamp for {kind}")
+
+
+def _summary_evidence(
     cycle: WorktreeCycle,
-    prompt_id: str,
-) -> tuple[str, ...]:
-    history = cycle.worktree / ".prompt-evals" / prompt_id / "optimization-history.yaml"
-    history.write_text(
-        "cycles:\n"
-        "  - stop_reason: acceptance_failed\n"
-        "    case: acceptance-000\n",
+    suite: CaseSuite,
+    fake: CountingTransport,
+    *,
+    phase_runs: Mapping[str, tuple[RunManifest, RunMetrics]],
+    comparisons: Mapping[str, object],
+    acceptance_status: str,
+    near_duplicate_review_status: str,
+    stop_reason: str,
+) -> SummaryEvidence:
+    """Build normalized evidence from completed, persisted phase artifacts."""
+
+    case_counts: dict[str, int] = {}
+    repeats: dict[str, int] = {}
+    planned_calls: dict[str, int] = {}
+    completed_calls: dict[str, int] = {}
+    metrics: dict[str, object] = {}
+    normalized_comparisons: dict[str, object] = {}
+    for phase, (manifest, phase_metrics) in phase_runs.items():
+        case_counts[phase] = len(manifest.slots) // manifest.repeats
+        repeats[phase] = manifest.repeats
+        planned_calls[phase] = len(manifest.slots)
+        completed_calls[phase] = len(manifest.results)
+        metrics[phase] = phase_metrics.to_dict()
+        normalized_comparisons[phase] = _comparison_mapping(comparisons[phase])
+
+    if acceptance_status == "not_run":
+        normalized_comparisons["acceptance"] = {
+            "status": "not_run",
+            "reason": "acceptance is not required for this scored terminal result",
+        }
+    else:
+        acceptance_comparison = _comparison_mapping(comparisons["acceptance"])
+        acceptance_comparison["status"] = acceptance_status
+        normalized_comparisons["acceptance"] = acceptance_comparison
+
+    audit = suite.coverage_audit
+    categories = tuple(
+        sorted(
+            {
+                str(item.get("category"))
+                for item in audit.categories
+                if isinstance(item, Mapping) and item.get("category")
+            }
+        )
+    ) or ("evaluation",)
+    boundaries = tuple(
+        sorted({validated.case.coverage.condition_id for validated in suite.all_cases})
+    )
+    coverage = {
+        "categories": categories,
+        "boundaries": boundaries or ("evaluation",),
+        "matrix_complete": bool(audit.mechanical_gates.get("coverage_matrix")),
+        "near_duplicate_review": near_duplicate_review_status,
+        "exclusions": {
+            "runtime": "reports and .runtime are runtime-only evidence",
+        },
+        "saturation": "The validated fixture covers the configured business boundaries.",
+    }
+    failures: tuple[Mapping[str, object], ...] = ()
+    if stop_reason not in {"no_change_needed", "acceptance_passed", "delivered"}:
+        failures = (
+            {
+                "category": "scored-terminal",
+                "reason": stop_reason,
+            },
+        )
+    return SummaryEvidence(
+        cycle_id=cycle.branch,
+        evidence_identity={
+            "cycle_id": cycle.branch,
+            "prompt_id": cycle.prompt_id or "",
+            "mode": "tune",
+            "result": stop_reason,
+        },
+        prompt_name=Path(PROMPT_RELATIVE).name,
+        prompt_path=PROMPT_RELATIVE,
+        model_name=fake.model_name,
+        case_counts=case_counts,
+        repeats=repeats,
+        planned_calls=planned_calls,
+        completed_calls=completed_calls,
+        metrics=metrics,
+        comparisons=normalized_comparisons,
+        coverage=coverage,
+        smoke_passed=True,
+        failure_summaries=failures,
+    )
+
+
+def _finalize_scored_result(
+    cycle: WorktreeCycle,
+    state_path: Path,
+    suite: CaseSuite,
+    fake: CountingTransport,
+    *,
+    kind: str,
+    stop_reason: str,
+    phase_runs: Mapping[str, tuple[RunManifest, RunMetrics]],
+    comparisons: Mapping[str, object],
+    acceptance_status: str,
+    near_duplicate_review_status: str,
+    candidate_path: Path | None = None,
+    candidate_hash: str | None = None,
+    confirm_delivery: bool | None,
+    confirm_failure_delivery: bool,
+    legacy_implicit_delivery: bool,
+    scenario: str,
+) -> dict[str, object]:
+    """Finalize one scored result through prepare, delivery, and cleanup."""
+
+    formal = normalize_formal_result(
+        kind,
+        finished_at_utc=_next_finalization_timestamp(cycle, kind),
+        stop_reason=stop_reason,
+    )
+    evidence = _summary_evidence(
+        cycle,
+        suite,
+        fake,
+        phase_runs=phase_runs,
+        comparisons=comparisons,
+        acceptance_status=acceptance_status,
+        near_duplicate_review_status=near_duplicate_review_status,
+        stop_reason=stop_reason,
+    )
+    runtime = cycle.worktree / ".prompt-evals" / cycle.prompt_id / ".runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    evidence_path = runtime / "summary-evidence.json"
+    evidence_mapping = {
+        "cycle_id": evidence.cycle_id,
+        "evidence_identity": dict(evidence.evidence_identity),
+        "prompt_name": evidence.prompt_name,
+        "prompt_path": evidence.prompt_path,
+        "model_name": evidence.model_name,
+        "case_counts": dict(evidence.case_counts),
+        "repeats": dict(evidence.repeats),
+        "planned_calls": dict(evidence.planned_calls),
+        "completed_calls": dict(evidence.completed_calls),
+        "metrics": dict(evidence.metrics),
+        "comparisons": dict(evidence.comparisons),
+        "coverage": dict(evidence.coverage),
+        "smoke_passed": evidence.smoke_passed,
+        "failure_summaries": [dict(item) for item in evidence.failure_summaries],
+    }
+    evidence_path.write_text(
+        json.dumps(
+            runner_module._redacted(evidence_mapping),
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
-    _git_commit(cycle.worktree, "tune: commit failure history and confirmed assets")
-    patch = build_delivery_patch(cycle, FAILURE_ALLOWLIST, result="failure")
-    apply_delivery_patch(cycle, patch)
-    return patch.paths
+    evidence = SummaryEvidence.from_mapping(json.loads(evidence_path.read_text(encoding="utf-8")))
+    prepared = finalize_module.prepare_finalization(
+        state_path,
+        formal,
+        evidence,
+        frozen_candidate=candidate_path,
+        frozen_candidate_hash=candidate_hash,
+    )
+    assert prepared.finalization is not None
+    finalization = prepared.finalization
+    fake.mark("finalization-prepared")
+    fake.mark(f"displayed-result:{kind}")
+    fake.mark(f"displayed-delivery-profile:{formal.delivery_profile}")
+
+    affirmative = confirm_delivery is True or confirm_failure_delivery is True
+    legacy_delivery = (
+        legacy_implicit_delivery
+        and affirmative
+        and not confirm_failure_delivery
+    )
+    if legacy_implicit_delivery and not confirm_failure_delivery:
+        # Preserve the old test helper's implicit behavior: only the original
+        # acceptance-pass path auto-delivered before explicit confirmation was
+        # added to the lifecycle contract.
+        affirmative = kind == "acceptance_passed"
+        legacy_delivery = affirmative
+    fake.mark("delivery-confirmation")
+    if not affirmative:
+        finalize_module.resolve_delivery_commit(state_path, confirmed=False)
+        return {
+            "formal_result": formal,
+            "summary_path": finalization.summary_path,
+            "prepared_commit": finalization.prepared_commit,
+            "delivery_commit": None,
+            "delivery_profile": finalization.delivery_profile,
+            "cleanup_status": "retained",
+            "reported_stop_reason": (
+                "delivery_not_confirmed"
+                if confirm_delivery is False and kind == "acceptance_passed"
+                else stop_reason
+            ),
+        }
+
+    try:
+        delivered = finalize_module.resolve_delivery_commit(state_path, confirmed=True)
+        assert delivered.finalization is not None
+        delivery_commit = delivered.finalization.delivery_commit
+        if not isinstance(delivery_commit, str):
+            raise AssertionError("affirmative finalization did not resolve delivery commit")
+        fake.mark("delivery-commit-resolved")
+
+        if scenario == "conflict":
+            (cycle.original_repo / PROMPT_RELATIVE).write_text(
+                "user edit wins\n", encoding="utf-8"
+            )
+        patch = build_delivery_patch(
+            delivered,
+            result="success" if formal.delivery_profile == "success" else "failure",
+        )
+        original_assert = manage_module._assert_worktree_snapshot
+        snapshot_calls = 0
+
+        def fail_after_apply(current_cycle: WorktreeCycle, current_patch: object) -> None:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            original_assert(current_cycle, current_patch)  # type: ignore[arg-type]
+            if snapshot_calls == 2:
+                raise DeliveryError("post-apply verification failure")
+
+        if scenario == "rollback":
+            manage_module._assert_worktree_snapshot = fail_after_apply
+
+        def record_verified(_applied: object) -> None:
+            current_finalization = delivered.finalization
+            if current_finalization is None:
+                raise DeliveryError("current finalization is required for delivery state")
+            updated_finalization = replace(
+                current_finalization,
+                delivery_applied=True,
+                delivery_verified=True,
+            )
+            updated = replace(delivered, finalization=updated_finalization)
+            manage_module.save_cycle_atomic(updated, state_path)
+
+        real_save = manage_module.save_cycle_atomic
+        if scenario == "delivery-state-failure":
+            def fail_delivery_state_save(*args: object, **kwargs: object) -> None:
+                raise WorktreeError("injected delivery state save failure")
+
+            manage_module.save_cycle_atomic = fail_delivery_state_save  # type: ignore[assignment]
+        try:
+            apply_delivery_patch(delivered, patch, on_verified=record_verified)
+        finally:
+            manage_module._assert_worktree_snapshot = original_assert
+            manage_module.save_cycle_atomic = real_save  # type: ignore[assignment]
+    except DeliveryConflict:
+        return {
+            "formal_result": formal,
+            "summary_path": finalization.summary_path,
+            "prepared_commit": finalization.prepared_commit,
+            "delivery_commit": None,
+            "delivery_profile": finalization.delivery_profile,
+            "cleanup_status": "retained",
+            "reported_stop_reason": "delivery_conflict",
+        }
+    except DeliveryError:
+        reason = "delivery_rollback" if scenario == "rollback" else "delivery_state_failed"
+        partially_delivered = tuple(
+            path for path in patch.paths if _status_for_path(cycle.original_repo, path)
+        ) if scenario == "rollback" else ()
+        return {
+            "formal_result": formal,
+            "summary_path": finalization.summary_path,
+            "prepared_commit": finalization.prepared_commit,
+            "delivery_commit": delivery_commit,
+            "delivery_profile": finalization.delivery_profile,
+            "delivered_paths": patch.paths if scenario == "rollback" else (),
+            "partially_delivered_paths": partially_delivered,
+            "cleanup_status": "retained",
+            "reported_stop_reason": reason,
+        }
+    except WorktreeError:
+        return {
+            "formal_result": formal,
+            "summary_path": finalization.summary_path,
+            "prepared_commit": finalization.prepared_commit,
+            "delivery_commit": delivery_commit,
+            "delivery_profile": finalization.delivery_profile,
+            "cleanup_status": "retained",
+            "reported_stop_reason": "delivery_state_failed",
+        }
+
+    delivered_paths = patch.paths
+    delivered_prompt_hash = (
+        _prompt_hash(cycle.original_repo / PROMPT_RELATIVE)
+        if formal.delivery_profile == "success"
+        else None
+    )
+    cleanup_status = "retained"
+    if not legacy_delivery:
+        cleanup_cycle(state_path)
+        cleanup_status = "complete"
+        fake.mark("cleanup")
+    return {
+        "formal_result": formal,
+        "summary_path": finalization.summary_path,
+        "prepared_commit": finalization.prepared_commit,
+        "delivery_commit": delivery_commit,
+        "delivery_profile": finalization.delivery_profile,
+        "cleanup_status": cleanup_status,
+        "delivered_paths": delivered_paths,
+        "delivered_prompt_hash": delivered_prompt_hash,
+        "reported_stop_reason": (
+            "delivered"
+            if stop_reason == "acceptance_passed" and legacy_delivery
+            else stop_reason
+        ),
+    }
 
 
 def run_tune_with_fake_transport(
@@ -1601,7 +1958,7 @@ def run_tune_with_fake_transport(
     *,
     scenario: str = "happy",
     confirm_contract: bool = True,
-    confirm_delivery: bool = True,
+    confirm_delivery: bool | None | object = _UNSET_CONFIRMATION,
     confirm_failure_delivery: bool = False,
     confirm_near_duplicate_review: bool = True,
     confirmation_hashes: tuple[str, str] | None = None,
@@ -1637,6 +1994,8 @@ def run_tune_with_fake_transport(
         saturation_statement if isinstance(saturation_statement, str) else ""
     )
     current_near_duplicate_review_status = near_duplicate_review_status
+    legacy_implicit_delivery = confirm_delivery is _UNSET_CONFIRMATION
+    delivery_confirmation = None if legacy_implicit_delivery else confirm_delivery
 
     def _result(stop_reason: str, **values: object) -> TuneResult:
         defaults: dict[str, object] = {
@@ -1686,6 +2045,17 @@ def run_tune_with_fake_transport(
         prompt_path=snapshot.prompt_path,
         state_path=state_path,
     )
+    external_relative = f".prompt-evals/{prompt_id}/external-cases.yaml"
+    external_in_cycle_base = bool(
+        _git(
+            cycle.worktree,
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            external_relative,
+            check=False,
+        ).strip()
+    )
     eval_root = _prepare_fixture_assets(repo, cycle.worktree, prompt_id)
     if project_transport_setting is not None:
         # Persist the selector in the disposable project's real config.  The
@@ -1708,6 +2078,10 @@ def run_tune_with_fake_transport(
             transport_calls=fake.call_count,
             raw_evidence=_report_evidence(fake),
         )
+    # ``external-cases.yaml`` is a fixture-only bootstrap input and is not a
+    # deliverable evaluation asset in the production allowlist.
+    if not external_in_cycle_base:
+        (eval_root / "external-cases.yaml").unlink(missing_ok=True)
     fake.bind_expected_cases(suite)
     obligations_hash = coverage_obligations_hash(
         eval_root / "coverage-obligations.yaml"
@@ -1839,6 +2213,45 @@ def run_tune_with_fake_transport(
     confirmed_hashes = current_hashes
     fake.confirmed_confirmation = current_confirmation
     confirmed_confirmation = current_confirmation
+    if scenario == "ignore-drift":
+        exclude = manage_module._repository_local_exclude(repo)
+        project_ignore = cycle.worktree / ".gitignore"
+        original_project_ignore = project_ignore.read_bytes()
+        project_ignore.write_bytes(
+            "\n".join(
+                line
+                for line in original_project_ignore.decode("utf-8").splitlines()
+                if line not in {
+                    ".prompt-evals/**/reports/",
+                    ".prompt-evals/**/.runtime/",
+                }
+            ).encode("utf-8")
+            + b"\n"
+        )
+        exclude.write_text(
+            "\n".join(
+                line
+                for line in exclude.read_text(encoding="utf-8").splitlines()
+                if line not in {
+                    "/.prompt-evals/*/reports/",
+                    "/.prompt-evals/*/.runtime/",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        fake.mark("post-confirmation-ignore-drift")
+        try:
+            verify_runtime_ignores(cycle)
+        except WorktreeError:
+            project_ignore.write_bytes(original_project_ignore)
+            fake.mark("confirmation-invalidated")
+            return _result(
+                "setup_error",
+                transport_calls=fake.call_count,
+                raw_evidence=_report_evidence(fake),
+            )
+        raise AssertionError("post-confirmation ignore drift unexpectedly passed")
     try:
         fake.mark("probe")
         probe_model(fake)
@@ -1898,8 +2311,40 @@ def run_tune_with_fake_transport(
     )
 
     if scenario == "no-change" and _all_pass(baseline_dev_metrics) and _all_pass(baseline_validation_metrics):
+        comparisons = {
+            "dev": compare_module.Comparison(
+                baseline=baseline_dev_metrics,
+                candidate=baseline_dev_metrics,
+                phase="dev",
+            ),
+            "validation": compare_module.Comparison(
+                baseline=baseline_validation_metrics,
+                candidate=baseline_validation_metrics,
+                phase="validation",
+            ),
+        }
+        finalization_fields = _finalize_scored_result(
+            cycle,
+            state_path,
+            suite,
+            fake,
+            kind="no_change_needed",
+            stop_reason="no_change_needed",
+            phase_runs={
+                "dev": (baseline_dev, baseline_dev_metrics),
+                "validation": (baseline_validation, baseline_validation_metrics),
+            },
+            comparisons=comparisons,
+            acceptance_status="not_run",
+            near_duplicate_review_status=current_near_duplicate_review_status,
+            confirm_delivery=delivery_confirmation,
+            confirm_failure_delivery=confirm_failure_delivery,
+            legacy_implicit_delivery=legacy_implicit_delivery,
+            scenario=scenario,
+        )
+        reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
         return _result(
-            "no_change_needed",
+            reported_stop_reason,
             transport_calls=fake.call_count,
             resumed_slot_key=resumed_slot,
             completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
@@ -1907,6 +2352,7 @@ def run_tune_with_fake_transport(
             slot_attempts=baseline_slot_attempts,
             transport_retry_slots=retry_slots,
             raw_evidence=_report_evidence(fake),
+            **finalization_fields,
         )
 
     candidate_dev, candidate_dev_metrics, _, _ = _run_phase(
@@ -1929,8 +2375,35 @@ def run_tune_with_fake_transport(
         schema=schema,
     )
     if not compare_module.evaluate_gate(dev_comparison, "development").passed:
+        # Development failure is still a scored terminal result; the public
+        # formal matrix records it under the asset-only validation-failed kind.
+        validation_comparison = compare_module.Comparison(
+            baseline=baseline_validation_metrics,
+            candidate=baseline_validation_metrics,
+            phase="validation",
+        )
+        finalization_fields = _finalize_scored_result(
+            cycle,
+            state_path,
+            suite,
+            fake,
+            kind="validation_failed",
+            stop_reason="development_failed",
+            phase_runs={
+                "dev": (candidate_dev, candidate_dev_metrics),
+                "validation": (baseline_validation, baseline_validation_metrics),
+            },
+            comparisons={"dev": dev_comparison, "validation": validation_comparison},
+            acceptance_status="not_run",
+            near_duplicate_review_status=current_near_duplicate_review_status,
+            confirm_delivery=delivery_confirmation,
+            confirm_failure_delivery=confirm_failure_delivery,
+            legacy_implicit_delivery=legacy_implicit_delivery,
+            scenario=scenario,
+        )
+        reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
         return _result(
-            "development_failed",
+            reported_stop_reason,
             candidate_prompt=candidate_prompt,
             frozen_candidate_hash=candidate_hash,
             transport_calls=fake.call_count,
@@ -1940,6 +2413,7 @@ def run_tune_with_fake_transport(
             slot_attempts=baseline_slot_attempts,
             transport_retry_slots=retry_slots,
             raw_evidence=_report_evidence(fake),
+            **finalization_fields,
         )
 
     candidate_validation, candidate_validation_metrics, _, _ = _run_phase(
@@ -1955,7 +2429,6 @@ def run_tune_with_fake_transport(
         label="candidate-validation",
         prepare_cache=prepare_cache,
     )
-    del candidate_dev_metrics, candidate_validation_metrics
     validation_comparison = compare_module.compare_runs(
         baseline_validation,
         candidate_validation,
@@ -1964,8 +2437,33 @@ def run_tune_with_fake_transport(
     )
     validation_gate = compare_module.evaluate_gate(validation_comparison, "validation")
     if not validation_gate.passed:
+        terminal_kind = (
+            "no_strict_improvement"
+            if scenario == "no-strict-improvement"
+            else "validation_failed"
+        )
+        finalization_fields = _finalize_scored_result(
+            cycle,
+            state_path,
+            suite,
+            fake,
+            kind=terminal_kind,
+            stop_reason=terminal_kind,
+            phase_runs={
+                "dev": (candidate_dev, candidate_dev_metrics),
+                "validation": (candidate_validation, candidate_validation_metrics),
+            },
+            comparisons={"dev": dev_comparison, "validation": validation_comparison},
+            acceptance_status="not_run",
+            near_duplicate_review_status=current_near_duplicate_review_status,
+            confirm_delivery=delivery_confirmation,
+            confirm_failure_delivery=confirm_failure_delivery,
+            legacy_implicit_delivery=legacy_implicit_delivery,
+            scenario=scenario,
+        )
+        reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
         return _result(
-            "validation_failed",
+            reported_stop_reason,
             candidate_prompt=candidate_prompt,
             frozen_candidate_hash=candidate_hash,
             transport_calls=fake.call_count,
@@ -1975,6 +2473,52 @@ def run_tune_with_fake_transport(
             slot_attempts=baseline_slot_attempts,
             transport_retry_slots=retry_slots,
             raw_evidence=_report_evidence(fake),
+            **finalization_fields,
+        )
+
+    if scenario in {"no-improvement-limit", "round-limit"}:
+        finalization_fields = _finalize_scored_result(
+            cycle,
+            state_path,
+            suite,
+            fake,
+            kind=(
+                "no_improvement_limit"
+                if scenario == "no-improvement-limit"
+                else "round_limit"
+            ),
+            stop_reason=(
+                "no_improvement_limit"
+                if scenario == "no-improvement-limit"
+                else "round_limit"
+            ),
+            phase_runs={
+                "dev": (candidate_dev, candidate_dev_metrics),
+                "validation": (candidate_validation, candidate_validation_metrics),
+            },
+            comparisons={"dev": dev_comparison, "validation": validation_comparison},
+            acceptance_status="not_run",
+            near_duplicate_review_status=current_near_duplicate_review_status,
+            confirm_delivery=delivery_confirmation,
+            confirm_failure_delivery=confirm_failure_delivery,
+            legacy_implicit_delivery=legacy_implicit_delivery,
+            scenario=scenario,
+        )
+        reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
+        return _result(
+            reported_stop_reason,
+            candidate_prompt=candidate_prompt,
+            frozen_candidate_hash=candidate_hash,
+            transport_calls=fake.call_count,
+            resumed_slot_key=resumed_slot,
+            completed_slot_keys=tuple(
+                slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results
+            ),
+            slot_call_counts=baseline_slot_call_counts,
+            slot_attempts=baseline_slot_attempts,
+            transport_retry_slots=retry_slots,
+            raw_evidence=_report_evidence(fake),
+            **finalization_fields,
         )
 
     fake.mark("candidate-freeze")
@@ -2013,137 +2557,81 @@ def run_tune_with_fake_transport(
     )
     acceptance_gate = compare_module.evaluate_gate(acceptance_comparison, "acceptance")
     if not acceptance_gate.passed:
-        delivered_paths: tuple[str, ...] = ()
-        if confirm_failure_delivery:
-            delivered_paths = _finish_failure_delivery(cycle, prompt_id)
-        return _result(
-            "acceptance_failed",
-            candidate_prompt=candidate_prompt,
-            frozen_candidate_hash=candidate_hash,
-            acceptance_activities=acceptance_activities,
-            acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
-            acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
-            delivered_paths=delivered_paths,
-            delivered_prompt_hash=None,
-            transport_calls=fake.call_count,
-            resumed_slot_key=resumed_slot,
-            completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
-            slot_call_counts=baseline_slot_call_counts,
-            slot_attempts=baseline_slot_attempts,
-            transport_retry_slots=retry_slots,
-            raw_evidence=_report_evidence(fake),
-        )
-
-    if not confirm_delivery:
-        return _result(
-            "delivery_not_confirmed",
-            candidate_prompt=candidate_prompt,
-            frozen_candidate_hash=candidate_hash,
-            acceptance_activities=acceptance_activities,
-            acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
-            acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
-            transport_calls=fake.call_count,
-            resumed_slot_key=resumed_slot,
-            completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
-            slot_call_counts=baseline_slot_call_counts,
-            slot_attempts=baseline_slot_attempts,
-            transport_retry_slots=retry_slots,
-            raw_evidence=_report_evidence(fake),
-        )
-
-    if scenario == "conflict":
-        original_prompt_path.write_text("user edit wins\n", encoding="utf-8")
-        try:
-            _finish_success_delivery(cycle, prompt_id, candidate_prompt, candidate_hash)
-        except DeliveryConflict:
-            return _result(
-                "delivery_conflict",
-                candidate_prompt=candidate_prompt,
-                frozen_candidate_hash=candidate_hash,
-                acceptance_activities=acceptance_activities,
-                acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
-                acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
-                transport_calls=fake.call_count,
-                resumed_slot_key=resumed_slot,
-                completed_slot_keys=tuple(
-                    slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results
-                ),
-                slot_call_counts=baseline_slot_call_counts,
-                slot_attempts=baseline_slot_attempts,
-                transport_retry_slots=retry_slots,
-                raw_evidence=_report_evidence(fake),
-            )
-        raise AssertionError("conflicting delivery unexpectedly succeeded")
-
-    if scenario == "rollback":
-        worktree_prompt = cycle.worktree / PROMPT_RELATIVE
-        worktree_prompt.write_text(candidate_prompt, encoding="utf-8")
-        contract = cycle.worktree / ".prompt-evals" / prompt_id / "prompt-contract.yaml"
-        contract.write_text(
-            contract.read_text(encoding="utf-8")
-            + f"current_prompt_hash: {candidate_hash}\n",
-            encoding="utf-8",
-        )
-        _git_commit(cycle.worktree, "tune: commit accepted candidate for rollback")
-        patch = build_delivery_patch(cycle, SUCCESS_ALLOWLIST, result="success")
-        original_assert = __import__("scripts.manage_worktree", fromlist=["_assert_worktree_snapshot"])._assert_worktree_snapshot
-        calls = 0
-
-        def fail_after_apply(current_cycle: WorktreeCycle, current_patch: object) -> None:
-            nonlocal calls
-            calls += 1
-            original_assert(current_cycle, current_patch)
-            if calls == 2:
-                raise DeliveryError("post-apply verification failure")
-
-        manage_module = __import__("scripts.manage_worktree", fromlist=["_assert_worktree_snapshot"])
-        manage_module._assert_worktree_snapshot = fail_after_apply
-        try:
-            apply_delivery_patch(cycle, patch)
-        except DeliveryError:
-            return _result(
-                "delivery_rollback",
-                candidate_prompt=candidate_prompt,
-                frozen_candidate_hash=candidate_hash,
-                acceptance_activities=acceptance_activities,
-                acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
-                acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
-                delivered_paths=patch.paths,
-                partially_delivered_paths=tuple(
-                    path for path in patch.paths if _status_for_path(repo, path)
-                ),
-                transport_calls=fake.call_count,
-                resumed_slot_key=resumed_slot,
-                completed_slot_keys=tuple(
-                    slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results
-                ),
-                slot_call_counts=baseline_slot_call_counts,
-                slot_attempts=baseline_slot_attempts,
-                transport_retry_slots=retry_slots,
-                raw_evidence=_report_evidence(fake),
-            )
-        finally:
-            manage_module._assert_worktree_snapshot = original_assert
-        raise AssertionError("rollback injection unexpectedly succeeded")
-
-    try:
-        delivered_paths, delivered_hash = _finish_success_delivery(
+        finalization_fields = _finalize_scored_result(
             cycle,
-            prompt_id,
-            candidate_prompt,
-            candidate_hash,
+            state_path,
+            suite,
+            fake,
+            kind="acceptance_failed",
+            stop_reason="acceptance_failed",
+            phase_runs={
+                "dev": (candidate_dev, candidate_dev_metrics),
+                "validation": (candidate_validation, candidate_validation_metrics),
+                "acceptance": (acceptance_candidate, acceptance_candidate_metrics),
+            },
+            comparisons={
+                "dev": dev_comparison,
+                "validation": validation_comparison,
+                "acceptance": acceptance_comparison,
+            },
+            acceptance_status="failed",
+            near_duplicate_review_status=current_near_duplicate_review_status,
+            confirm_delivery=delivery_confirmation,
+            confirm_failure_delivery=confirm_failure_delivery,
+            legacy_implicit_delivery=legacy_implicit_delivery,
+            scenario=scenario,
         )
-    except DeliveryConflict as error:
-        raise AssertionError(f"unexpected delivery conflict: {error}") from error
+        reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
+        return _result(
+            reported_stop_reason,
+            candidate_prompt=candidate_prompt,
+            frozen_candidate_hash=candidate_hash,
+            acceptance_activities=acceptance_activities,
+            acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
+            acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
+            transport_calls=fake.call_count,
+            resumed_slot_key=resumed_slot,
+            completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
+            slot_call_counts=baseline_slot_call_counts,
+            slot_attempts=baseline_slot_attempts,
+            transport_retry_slots=retry_slots,
+            raw_evidence=_report_evidence(fake),
+            **finalization_fields,
+        )
+    finalization_fields = _finalize_scored_result(
+        cycle,
+        state_path,
+        suite,
+        fake,
+        kind="acceptance_passed",
+        stop_reason="acceptance_passed",
+        phase_runs={
+            "dev": (candidate_dev, candidate_dev_metrics),
+            "validation": (candidate_validation, candidate_validation_metrics),
+            "acceptance": (acceptance_candidate, acceptance_candidate_metrics),
+        },
+        comparisons={
+            "dev": dev_comparison,
+            "validation": validation_comparison,
+            "acceptance": acceptance_comparison,
+        },
+        acceptance_status="passed",
+        near_duplicate_review_status=current_near_duplicate_review_status,
+        candidate_path=candidate_path,
+        candidate_hash=candidate_hash,
+        confirm_delivery=delivery_confirmation,
+        confirm_failure_delivery=confirm_failure_delivery,
+        legacy_implicit_delivery=legacy_implicit_delivery,
+        scenario=scenario,
+    )
+    reported_stop_reason = str(finalization_fields.pop("reported_stop_reason"))
     return _result(
-        "delivered",
+        reported_stop_reason,
         candidate_prompt=candidate_prompt,
         acceptance_activities=acceptance_activities,
         acceptance_baseline_perfect=_all_pass(acceptance_baseline_metrics),
         acceptance_candidate_perfect=_all_pass(acceptance_candidate_metrics),
         frozen_candidate_hash=candidate_hash,
-        delivered_prompt_hash=delivered_hash,
-        delivered_paths=delivered_paths,
         transport_calls=fake.call_count,
         resumed_slot_key=resumed_slot,
         completed_slot_keys=tuple(slot.key for slot in baseline_dev.slots if slot.key in baseline_dev.results),
@@ -2151,6 +2639,7 @@ def run_tune_with_fake_transport(
         slot_attempts=baseline_slot_attempts,
         transport_retry_slots=retry_slots,
         raw_evidence=_report_evidence(fake),
+        **finalization_fields,
     )
 
 
