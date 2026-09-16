@@ -1034,6 +1034,98 @@ def test_build_cli_rejects_output_outside_exact_runtime_output(
     assert code == 2
 
 
+def test_build_rejects_original_head_drift_before_writing_runtime_outputs(
+    finalized_state: Path,
+) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    original = cycle.original_repo
+    (original / "head-drift.txt").write_text("user commit\n", encoding="utf-8")
+    git(original, "add", "head-drift.txt")
+    git(original, "commit", "-m", "move original repository HEAD")
+    runtime = cycle.worktree / ".prompt-evals" / cycle.prompt_id / ".runtime"
+    patch_path = runtime / "head-drift.patch"
+    manifest_path = runtime / "head-drift-manifest.json"
+
+    with pytest.raises(DeliveryConflict, match="HEAD|cycle base"):
+        build_delivery_patch(cycle)
+
+    assert not patch_path.exists()
+    assert not manifest_path.exists()
+    assert (
+        main(
+            [
+                "build-patch",
+                "--state",
+                str(finalized_state),
+                "--out",
+                str(patch_path),
+                "--out-manifest",
+                str(manifest_path),
+            ]
+        )
+        == 2
+    )
+    assert not patch_path.exists()
+    assert not manifest_path.exists()
+
+
+def test_current_cli_requires_finalization_before_build_or_apply(
+    repo: tuple[Path, str],
+    tmp_path: Path,
+) -> None:
+    original, prompt_id = repo
+    state_path = tmp_path / "cycle-state.json"
+    cycle = create_cycle(original, prompt_id, state_path=state_path)
+    runtime = cycle.worktree / ".prompt-evals" / prompt_id / ".runtime"
+    runtime.mkdir(parents=True)
+    (cycle.worktree / "prompts" / "classify.md").write_text(
+        "candidate prompt\n", encoding="utf-8"
+    )
+    git(cycle.worktree, "add", "prompts/classify.md")
+    git(cycle.worktree, "commit", "-m", "candidate before finalization")
+
+    legacy_patch = build_delivery_patch(cycle)
+    legacy_patch_path = runtime / "legacy.patch"
+    legacy_manifest_path = runtime / "legacy-manifest.json"
+    save_patch(legacy_patch, legacy_patch_path, legacy_manifest_path)
+    output_path = runtime / "delivery.patch"
+    output_manifest_path = runtime / "delivery-manifest.json"
+    before = snapshot_filesystem(original)
+
+    assert (
+        main(
+            [
+                "build-patch",
+                "--state",
+                str(state_path),
+                "--out",
+                str(output_path),
+                "--out-manifest",
+                str(output_manifest_path),
+            ]
+        )
+        == 2
+    )
+    assert not output_path.exists()
+    assert not output_manifest_path.exists()
+
+    assert (
+        main(
+            [
+                "apply-patch",
+                "--state",
+                str(state_path),
+                "--patch",
+                str(legacy_patch_path),
+                "--patch-manifest",
+                str(legacy_manifest_path),
+            ]
+        )
+        == 2
+    )
+    assert snapshot_filesystem(original) == before
+
+
 def test_apply_cli_records_verified_delivery_and_retains_cleanup_authorization(
     finalized_state: Path,
 ) -> None:
@@ -1169,6 +1261,40 @@ def test_build_rejects_nonignored_untracked_worktree_dirt(
     )
 
     with pytest.raises(DeliveryError, match="untracked|dirty|worktree"):
+        build_delivery_patch(cycle)
+
+
+def test_build_rejects_dirty_submodule_even_when_repo_config_ignores_it(
+    tmp_path: Path,
+) -> None:
+    original, prompt_id = make_repo(tmp_path / "repo")
+    submodule, _ = make_repo(tmp_path / "submodule")
+    git(
+        original,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(submodule),
+        "vendor",
+    )
+    git(original, "add", ".gitmodules", "vendor")
+    git(original, "commit", "-m", "add local submodule")
+    cycle = create_cycle(original, prompt_id)
+    git(
+        cycle.worktree,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+    git(cycle.worktree, "config", "submodule.vendor.ignore", "all")
+    nested_prompt = cycle.worktree / "vendor" / "prompts" / "classify.md"
+    nested_prompt.write_text("dirty submodule\n", encoding="utf-8")
+
+    with pytest.raises(DeliveryConflict, match="submodule|dirty|worktree"):
         build_delivery_patch(cycle)
 
 

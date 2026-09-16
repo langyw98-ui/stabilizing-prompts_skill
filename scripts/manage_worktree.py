@@ -1582,12 +1582,23 @@ def _current_worktree_head(cycle: WorktreeCycle) -> str:
     return _final_commit(cycle, head)
 
 
+def _require_current_delivery_state(cycle: WorktreeCycle) -> None:
+    """Require a confirmed, state-derived delivery for the current CLI."""
+
+    if cycle.finalization is None:
+        raise DeliveryError(
+            "current lifecycle state has no finalized delivery result"
+        )
+    _assert_cycle_base(cycle)
+    _finalization_delivery_metadata(cycle)
+
+
 def _assert_worktree_clean(cycle: WorktreeCycle, final: str) -> None:
     """Reject tracked worktree edits relative to its current committed HEAD."""
 
     for arguments in (
-        ("diff", "--quiet", final, "--"),
-        ("diff", "--cached", "--quiet", final, "--"),
+        ("diff", "--quiet", "--ignore-submodules=none", final, "--"),
+        ("diff", "--cached", "--quiet", "--ignore-submodules=none", final, "--"),
     ):
         result = _git(cycle.worktree, *arguments, check=False)
         if result.returncode == 1:
@@ -1599,9 +1610,9 @@ def _assert_worktree_clean(cycle: WorktreeCycle, final: str) -> None:
         cycle.worktree,
         "status",
         "--porcelain=v1",
-        "--untracked-files=all",
-        "--ignored=no",
         "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
         "--",
         check=False,
     )
@@ -1713,6 +1724,10 @@ def build_delivery_patch(
     if not isinstance(cycle, WorktreeCycle):
         raise TypeError("build_delivery_patch expects a WorktreeCycle")
     _validate_managed_cycle(cycle)
+    # The original repository is the immutable delivery base.  Check it
+    # before resolving finalization metadata or constructing any patch data so
+    # callers cannot persist artifacts from a stale cycle.
+    _assert_cycle_base(cycle)
     if cycle.finalization is not None:
         result, final, canonical, summary, _prepared = _finalization_delivery_metadata(
             cycle,
@@ -2404,6 +2419,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         cycle = load_cycle(args.state, require_current=True)
+        _require_current_delivery_state(cycle)
         if args.command == "build-patch":
             patch_path = _require_runtime_output(cycle, args.out, "patch output")
             manifest_path = _require_runtime_output(
