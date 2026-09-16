@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -60,6 +61,7 @@ _EVAL_ASSET_NAMES = frozenset(
 )
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _CURRENT_HASH_RE = re.compile(r"^([ \t]*)current_prompt_hash[ \t]*:")
+_UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 def _git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
@@ -228,6 +230,32 @@ def _history_path(cycle: WorktreeCycle) -> Path:
     return _evaluation_root(cycle) / "optimization-history.yaml"
 
 
+def _normalize_history_timestamp(value: object, *, index: int) -> str:
+    """Normalize PyYAML timestamps to the strict UTC form used by results."""
+
+    if isinstance(value, str):
+        if not _UTC_TIMESTAMP_RE.fullmatch(value):
+            raise FinalizationError(
+                f"optimization-history.yaml cycle {index} has an invalid finished_at_utc"
+            )
+        try:
+            datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError as error:
+            raise FinalizationError(
+                f"optimization-history.yaml cycle {index} has an invalid finished_at_utc"
+            ) from error
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None or value.microsecond:
+            raise FinalizationError(
+                f"optimization-history.yaml cycle {index} has an invalid finished_at_utc"
+            )
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    raise FinalizationError(
+        f"optimization-history.yaml cycle {index} has an invalid finished_at_utc"
+    )
+
+
 def _load_history(path: Path) -> dict[str, object]:
     if yaml is None:
         raise FinalizationError("PyYAML is required for optimization history")
@@ -246,10 +274,35 @@ def _load_history(path: Path) -> dict[str, object]:
         raise FinalizationError("optimization-history.yaml cycles must be a list")
     if any(not isinstance(entry, Mapping) for entry in cycles):
         raise FinalizationError("optimization-history.yaml cycles must contain mappings")
-    # Copy into a plain mapping so the dump is deterministic and does not
-    # retain PyYAML's mutable loader objects.
+    # Copy into plain mappings and normalize timestamps so PyYAML's implicit
+    # datetime constructor cannot make duplicate detection representation-
+    # dependent or re-serialize an entry in a different timestamp form.
+    normalized_cycles: list[dict[str, object]] = []
+    for index, entry in enumerate(cycles):
+        normalized = dict(entry)
+        if "finished_at_utc" in normalized:
+            normalized["finished_at_utc"] = _normalize_history_timestamp(
+                normalized["finished_at_utc"], index=index
+            )
+        normalized_cycles.append(normalized)
+    seen_entries: set[tuple[str, str]] = set()
+    for index, entry in enumerate(normalized_cycles):
+        timestamp = entry.get("finished_at_utc")
+        identity = entry.get("result") or entry.get("stop_reason")
+        if timestamp is None or identity is None:
+            continue
+        if not isinstance(identity, str):
+            raise FinalizationError(
+                f"optimization-history.yaml cycle {index} has an invalid result identity"
+            )
+        key = (timestamp, identity)
+        if key in seen_entries:
+            raise FinalizationError(
+                "optimization-history.yaml contains a duplicate cycle entry"
+            )
+        seen_entries.add(key)
     result: dict[str, object] = dict(value)
-    result["cycles"] = [dict(entry) for entry in cycles]
+    result["cycles"] = normalized_cycles
     return result
 
 
@@ -308,6 +361,28 @@ def _append_history(path: Path, result: FormalResult, evidence: SummaryEvidence)
 def _summary_destination(cycle: WorktreeCycle, result: FormalResult) -> Path:
     timestamp = result.finished_at_utc[:10] + "-" + result.finished_at_utc[11:19].replace(":", "")
     return _evaluation_root(cycle) / "evaluation-summaries" / f"{timestamp}-{result.kind}.md"
+
+
+def _validate_summary_destination(cycle: WorktreeCycle, summary: Path) -> None:
+    """Validate the summary parent before following or creating any component."""
+
+    eval_root = _evaluation_root(cycle)
+    if not _path_is_within(summary.parent, eval_root):
+        raise FinalizationError("evaluation summary parent escapes the cycle evaluation root")
+    _reject_links(summary.parent, cycle.worktree)
+    _reject_links(summary, cycle.worktree)
+    resolved_root = eval_root.resolve(strict=False)
+    resolved_worktree = cycle.worktree.resolve(strict=False)
+    resolved_parent = summary.parent.resolve(strict=False)
+    resolved_summary = summary.resolve(strict=False)
+    if not resolved_parent.is_relative_to(resolved_worktree):
+        raise FinalizationError("evaluation summary parent escapes the cycle worktree")
+    if not resolved_summary.is_relative_to(resolved_worktree):
+        raise FinalizationError("evaluation summary escapes the cycle worktree")
+    if not resolved_parent.is_relative_to(resolved_root):
+        raise FinalizationError("evaluation summary parent escapes the cycle evaluation root")
+    if not resolved_summary.is_relative_to(resolved_root):
+        raise FinalizationError("evaluation summary escapes the cycle evaluation root")
 
 
 def _staged_paths(cycle: WorktreeCycle) -> tuple[str, ...]:
@@ -372,8 +447,138 @@ def _worktree_clean(cycle: WorktreeCycle) -> None:
         raise FinalizationError("cycle worktree contains uncommitted changes")
 
 
+@dataclass(frozen=True, slots=True)
+class _FileSnapshot:
+    path: Path
+    existed: bool
+    content: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class _OperationSnapshot:
+    head: str
+    index: _FileSnapshot
+    files: tuple[_FileSnapshot, ...]
+    state: _FileSnapshot
+
+
+def _snapshot_file(path: Path, *, label: str) -> _FileSnapshot:
+    if path.is_symlink():
+        raise FinalizationError(f"{label} must not be a symlink")
+    try:
+        if not path.exists():
+            return _FileSnapshot(path=path, existed=False, content=None)
+        if not path.is_file():
+            raise FinalizationError(f"{label} must be a regular file")
+        return _FileSnapshot(path=path, existed=True, content=path.read_bytes())
+    except OSError as error:
+        raise FinalizationError(f"unable to snapshot {label}: {error}") from error
+
+
+def _snapshot_operation(
+    cycle: WorktreeCycle, state_path: Path, controlled_paths: Sequence[Path]
+) -> _OperationSnapshot:
+    head = _git(cycle.worktree, "rev-parse", "HEAD").stdout.decode("utf-8", "replace").strip()
+    if not head:
+        raise FinalizationError("unable to snapshot cycle HEAD")
+    index_text = _git(cycle.worktree, "rev-parse", "--git-path", "index").stdout.decode(
+        "utf-8", "replace"
+    ).strip()
+    index_path = Path(index_text)
+    if not index_path.is_absolute():
+        index_path = cycle.worktree / index_path
+    index = _snapshot_file(index_path, label="Git index")
+    unique_paths = tuple(dict.fromkeys(Path(path) for path in controlled_paths))
+    files = tuple(
+        _snapshot_file(path, label=f"controlled file {path}") for path in unique_paths
+    )
+    state = _snapshot_file(Path(state_path), label="cycle state")
+    return _OperationSnapshot(head=head, index=index, files=files, state=state)
+
+
+def _restore_controlled_file(snapshot: _FileSnapshot, cycle: WorktreeCycle) -> None:
+    path = snapshot.path
+    _reject_links(path.parent, cycle.worktree)
+    try:
+        if path.is_symlink():
+            path.unlink()
+        elif path.exists():
+            if path.is_dir():
+                raise OSError(f"controlled path is now a directory: {path}")
+            path.unlink()
+        if snapshot.existed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(snapshot.content or b"")
+    except OSError as error:
+        raise FinalizationError(f"unable to restore controlled file {path}: {error}") from error
+
+
+def _restore_state_file(snapshot: _FileSnapshot) -> None:
+    path = snapshot.path
+    try:
+        if path.is_symlink():
+            path.unlink()
+        elif path.exists() and path.is_dir():
+            raise OSError(f"cycle state path is now a directory: {path}")
+        elif path.exists():
+            path.unlink()
+        if snapshot.existed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(snapshot.content or b"")
+    except OSError as error:
+        raise FinalizationError(f"unable to restore cycle state: {error}") from error
+
+
+def _restore_index_file(snapshot: _FileSnapshot) -> None:
+    path = snapshot.path
+    try:
+        if path.is_symlink():
+            path.unlink()
+        elif path.exists() and path.is_dir():
+            raise OSError(f"Git index path is now a directory: {path}")
+        elif path.exists():
+            path.unlink()
+        if snapshot.existed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(snapshot.content or b"")
+    except OSError as error:
+        raise FinalizationError(f"unable to restore Git index: {error}") from error
+
+
+def _restore_operation(snapshot: _OperationSnapshot, cycle: WorktreeCycle) -> None:
+    failures: list[str] = []
+    try:
+        _git(cycle.worktree, "reset", "--mixed", snapshot.head)
+    except BaseException as error:
+        failures.append(f"HEAD/index reset: {error}")
+    for file_snapshot in snapshot.files:
+        try:
+            _restore_controlled_file(file_snapshot, cycle)
+        except BaseException as error:
+            failures.append(str(error))
+    try:
+        _restore_state_file(snapshot.state)
+    except BaseException as error:
+        failures.append(str(error))
+    try:
+        _restore_index_file(snapshot.index)
+    except BaseException as error:
+        failures.append(str(error))
+    if failures:
+        raise FinalizationError("; ".join(failures))
+
+
+def _reraise_after_rollback(
+    error: BaseException, snapshot: _OperationSnapshot, cycle: WorktreeCycle
+) -> None:
+    try:
+        _restore_operation(snapshot, cycle)
+    except BaseException as rollback_error:
+        raise FinalizationError(f"{error}; rollback failed: {rollback_error}") from error
+    raise error
+
+
 def _prepared_state(
-    state_path: Path,
     cycle: WorktreeCycle,
     result: FormalResult,
     summary: Path,
@@ -396,10 +601,6 @@ def _prepared_state(
         final_worktree_commit=prepared_commit,
         finalization=finalization,
     )
-    try:
-        save_cycle_atomic(updated, Path(state_path))
-    except (WorktreeError, OSError) as error:
-        raise FinalizationError(f"unable to persist prepared finalization: {error}") from error
     return updated
 
 
@@ -468,25 +669,30 @@ def prepare_finalization(
     except SummaryError as error:
         raise FinalizationError(str(error)) from error
     summary = _summary_destination(cycle, result)
+    _validate_summary_destination(cycle, summary)
     if summary.exists():
         raise FinalizationError(f"summary destination already exists: {summary}")
 
     history = _history_path(cycle)
     # Validate duplicate/history shape before touching either output file.
     _load_history(history)
-    # Create the summary exclusively; the preflight above gives callers a
-    # deterministic collision error before history is changed.
+    eval_root = _evaluation_root(cycle)
+    snapshot = _snapshot_operation(
+        cycle,
+        Path(state_path),
+        [*(eval_root / name for name in _EVAL_ASSET_NAMES), summary],
+    )
     try:
-        summary.parent.mkdir(parents=True, exist_ok=True)
-        with summary.open("x", encoding="utf-8", newline="\n") as handle:
-            handle.write(summary_text)
-    except FileExistsError:
-        raise FinalizationError(f"summary destination already exists: {summary}") from None
-    except OSError as error:
-        raise FinalizationError(f"unable to write evaluation summary: {error}") from error
-
-    history_before = history.read_bytes() if history.exists() else None
-    try:
+        try:
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            _validate_summary_destination(cycle, summary)
+            with summary.open("x", encoding="utf-8", newline="\n") as handle:
+                handle.write(summary_text)
+            _validate_summary_destination(cycle, summary)
+        except FileExistsError:
+            raise FinalizationError(f"summary destination already exists: {summary}") from None
+        except OSError as error:
+            raise FinalizationError(f"unable to write evaluation summary: {error}") from error
         _append_history(history, result, evidence)
         _stage_prepared_assets(cycle, summary)
         _assert_allowed_staged(
@@ -507,38 +713,26 @@ def prepare_finalization(
             detail = (commit_result.stderr or commit_result.stdout).decode("utf-8", "replace").strip()
             raise FinalizationError(f"unable to create prepared commit: {detail}")
         prepared_commit = _git_text(cycle.worktree, "rev-parse", "HEAD")
-    except BaseException:
-        # The ignored runtime remains untouched.  Restore only the files this
-        # operation owns if no commit was created; this keeps a failed prepare
-        # inspectable without leaving a half-written summary/history pair.
-        if history_before is None:
-            try:
-                history.unlink(missing_ok=True)
-            except OSError:
-                pass
-        else:
-            try:
-                history.write_bytes(history_before)
-            except OSError:
-                pass
+        updated = _prepared_state(
+            cycle,
+            result,
+            summary,
+            prepared_commit,
+            candidate_path,
+            candidate_hash,
+        )
         try:
-            summary.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-
-    return _prepared_state(
-        Path(state_path),
-        cycle,
-        result,
-        summary,
-        prepared_commit,
-        candidate_path,
-        candidate_hash,
-    )
+            save_cycle_atomic(updated, Path(state_path))
+        except (WorktreeError, OSError) as error:
+            raise FinalizationError(f"unable to persist prepared finalization: {error}") from error
+    except BaseException as error:
+        _reraise_after_rollback(error, snapshot, cycle)
+    return updated
 
 
-def _validate_recorded_candidate(cycle: WorktreeCycle, finalization: FinalizationState) -> Path:
+def _validate_recorded_candidate(
+    cycle: WorktreeCycle, finalization: FinalizationState
+) -> tuple[Path, bytes]:
     if not finalization.frozen_candidate_path or not finalization.frozen_candidate_hash:
         raise FinalizationError("acceptance-pass finalization is missing frozen candidate identity")
     candidate, relative = _runtime_file(
@@ -549,12 +743,13 @@ def _validate_recorded_candidate(cycle: WorktreeCycle, finalization: Finalizatio
     if relative != finalization.frozen_candidate_path:
         raise FinalizationError("frozen candidate identity changed")
     expected = _validate_hash(finalization.frozen_candidate_hash, label="candidate hash")
-    actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    candidate_bytes = candidate.read_bytes()
+    actual = hashlib.sha256(candidate_bytes).hexdigest()
     if actual != expected:
         raise FinalizationError(
             f"frozen candidate hash mismatch: expected {expected}, got {actual}"
         )
-    return candidate
+    return candidate, candidate_bytes
 
 
 def _safe_worktree_file(cycle: WorktreeCycle, relative: str, *, label: str) -> Path:
@@ -592,7 +787,7 @@ def _update_contract_hash(contract: Path, candidate_hash: str) -> bytes:
 def _acceptance_delivery(cycle: WorktreeCycle, finalization: FinalizationState) -> str:
     _require_cycle_head(cycle, finalization.prepared_commit)
     _worktree_clean(cycle)
-    candidate = _validate_recorded_candidate(cycle, finalization)
+    _, candidate_bytes = _validate_recorded_candidate(cycle, finalization)
     prompt_path = _canonical_prompt_path(cycle)
     try:
         manage_worktree.assert_prompt_contract_identity(cycle, finalization.prepared_commit)
@@ -600,49 +795,35 @@ def _acceptance_delivery(cycle: WorktreeCycle, finalization: FinalizationState) 
         raise FinalizationError(str(error)) from error
     contract = _validate_current_contract(cycle, prompt_path)
     prompt = _safe_worktree_file(cycle, prompt_path, label="canonical Prompt path")
-    candidate_bytes = candidate.read_bytes()
-    contract_before = contract.read_bytes()
-    prompt_before = prompt.read_bytes() if prompt.exists() else None
-    try:
-        prompt.parent.mkdir(parents=True, exist_ok=True)
-        prompt.write_bytes(candidate_bytes)
-        contract.write_bytes(_update_contract_hash(contract, finalization.frozen_candidate_hash or ""))
-        _assert_allowed_staged(
-            cycle,
-            {
-                f".prompt-evals/{cycle.prompt_id}/{name}" for name in _EVAL_ASSET_NAMES
-            }
-            | {prompt_path},
-        )
-        _git(cycle.worktree, "add", "--", prompt_path, contract.relative_to(cycle.worktree).as_posix())
-        _assert_allowed_staged(
-            cycle,
-            {
-                f".prompt-evals/{cycle.prompt_id}/{name}" for name in _EVAL_ASSET_NAMES
-            }
-            | {prompt_path},
-        )
-        commit_result = _git(
-            cycle.worktree,
-            "commit",
-            "--allow-empty",
-            "-m",
-            "tune: deliver accepted prompt",
-            check=False,
-        )
-        if commit_result.returncode != 0:
-            detail = (commit_result.stderr or commit_result.stdout).decode("utf-8", "replace").strip()
-            raise FinalizationError(f"unable to create delivery commit: {detail}")
-    except BaseException:
-        try:
-            if prompt_before is None:
-                prompt.unlink(missing_ok=True)
-            else:
-                prompt.write_bytes(prompt_before)
-            contract.write_bytes(contract_before)
-        except OSError:
-            pass
-        raise
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_bytes(candidate_bytes)
+    contract.write_bytes(_update_contract_hash(contract, finalization.frozen_candidate_hash or ""))
+    _assert_allowed_staged(
+        cycle,
+        {
+            f".prompt-evals/{cycle.prompt_id}/{name}" for name in _EVAL_ASSET_NAMES
+        }
+        | {prompt_path},
+    )
+    _git(cycle.worktree, "add", "--", prompt_path, contract.relative_to(cycle.worktree).as_posix())
+    _assert_allowed_staged(
+        cycle,
+        {
+            f".prompt-evals/{cycle.prompt_id}/{name}" for name in _EVAL_ASSET_NAMES
+        }
+        | {prompt_path},
+    )
+    commit_result = _git(
+        cycle.worktree,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "tune: deliver accepted prompt",
+        check=False,
+    )
+    if commit_result.returncode != 0:
+        detail = (commit_result.stderr or commit_result.stdout).decode("utf-8", "replace").strip()
+        raise FinalizationError(f"unable to create delivery commit: {detail}")
     delivery_commit = _git_text(cycle.worktree, "rev-parse", "HEAD")
     if _git_text(cycle.worktree, "rev-parse", f"{delivery_commit}^") != finalization.prepared_commit:
         raise FinalizationError("delivery commit is not a child of prepared commit")
@@ -670,28 +851,38 @@ def resolve_delivery_commit(state_path: Path, *, confirmed: bool) -> WorktreeCyc
     if finalization.delivery_commit is not None:
         raise FinalizationError("cycle delivery state contains an unconfirmed commit")
     if finalization.delivery_profile == "assets":
-        _require_cycle_head(cycle, finalization.prepared_commit)
-        _worktree_clean(cycle)
-        delivery_commit = finalization.prepared_commit
+        snapshot = _snapshot_operation(cycle, Path(state_path), ())
     elif finalization.delivery_profile == "success":
-        delivery_commit = _acceptance_delivery(cycle, finalization)
+        prompt_path = _canonical_prompt_path(cycle)
+        contract = _validate_current_contract(cycle, prompt_path)
+        prompt = _safe_worktree_file(cycle, prompt_path, label="canonical Prompt path")
+        snapshot = _snapshot_operation(cycle, Path(state_path), (prompt, contract))
     else:
         raise FinalizationError("unknown delivery profile in prepared finalization")
-    updated_finalization = replace(
-        finalization,
-        delivery_commit=delivery_commit,
-        delivery_confirmed=True,
-        cleanup=replace(finalization.cleanup, authorized=True),
-    )
-    updated = replace(
-        cycle,
-        final_worktree_commit=delivery_commit,
-        finalization=updated_finalization,
-    )
     try:
-        save_cycle_atomic(updated, Path(state_path))
-    except (WorktreeError, OSError) as error:
-        raise FinalizationError(f"unable to persist delivery confirmation: {error}") from error
+        if finalization.delivery_profile == "assets":
+            _require_cycle_head(cycle, finalization.prepared_commit)
+            _worktree_clean(cycle)
+            delivery_commit = finalization.prepared_commit
+        else:
+            delivery_commit = _acceptance_delivery(cycle, finalization)
+        updated_finalization = replace(
+            finalization,
+            delivery_commit=delivery_commit,
+            delivery_confirmed=True,
+            cleanup=replace(finalization.cleanup, authorized=True),
+        )
+        updated = replace(
+            cycle,
+            final_worktree_commit=delivery_commit,
+            finalization=updated_finalization,
+        )
+        try:
+            save_cycle_atomic(updated, Path(state_path))
+        except (WorktreeError, OSError) as error:
+            raise FinalizationError(f"unable to persist delivery confirmation: {error}") from error
+    except BaseException as error:
+        _reraise_after_rollback(error, snapshot, cycle)
     return updated
 
 
