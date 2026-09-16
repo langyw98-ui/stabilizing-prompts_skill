@@ -51,7 +51,7 @@ def test_tune_states_are_explicit_and_ordered(skill_text):
         "preflight",
         "repository-local exclude initialization",
         "pre-create managed-worktree ignore verification",
-        "worktree",
+        "create and persist dedicated worktree",
         "contract/cases/adapter",
         "user confirmation",
         "model probe/smoke",
@@ -194,6 +194,8 @@ def test_tune_documents_project_local_worktree_gate(skill_text):
 
 def test_tune_documents_automatic_local_excludes_and_unified_finalization(skill_text):
     tune = skill_text.split("## verify", 1)[0]
+    worktree = _section(tune, "### 2. worktree", "### 3. contract/cases/adapter")
+    asset_commit = _section(tune, "### 6. asset commit", "### 7. dev/validation baseline")
     assert "repository-local exclude" in tune
     assert "before invoking `tune`" not in tune
     assert "prepared_commit" in tune
@@ -201,6 +203,12 @@ def test_tune_documents_automatic_local_excludes_and_unified_finalization(skill_
     assert "evaluation-summaries" in tune
     assert "cleanup --state STATE_PATH" in tune
     assert "does not auto-delete the worktree" not in tune
+    assert "does not edit, stage, or commit" in worktree
+    assert "`.gitignore`" in worktree
+    assert "Do not edit, stage, or commit the target repository's `.gitignore`" in asset_commit
+    assert "evaluation outputs must" in asset_commit
+    assert "remain under already-ignored" in asset_commit
+    assert "any required evaluation ignore rules" not in asset_commit
 
 
 def test_tune_separates_delivery_stale_state_guard_from_setup_gate(skill_text):

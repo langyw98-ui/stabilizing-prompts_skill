@@ -35,3 +35,26 @@ lifecycle. No production scripts were changed.
 The final bounded patch changes only Markdown and documentation assertions;
 the full suite was run before that wording-only refinement, and the focused
 suite was rerun afterward. No known lifecycle behavior risk was introduced.
+
+## Fix round 1
+
+Addressed all four review findings:
+
+- Setup, protocol, and asset interruptions are explicitly retained for
+  diagnosis/manual handling and excluded from the verified-cleanup CLI until a
+  scored result has verified delivery.
+- The compact history contract now documents exactly `finished_at_utc`,
+  `result`, `stop_reason`, and sorted `failure_categories`.
+- Documentation tests again anchor `.gitignore` non-modification and runtime
+  asset exclusions to their worktree and asset-commit sections.
+- The lifecycle-order test uses the exact `create and persist dedicated
+  worktree` state token instead of the substring-prone `worktree` token.
+
+Fix-round verification:
+
+- `tests/test_skill_instructions.py tests/test_skill_structure.py`: `22 passed`
+  (final rerun; the initial assertion attempt failed on a wrapped phrase and
+  was corrected without changing the contract).
+- `rtk git diff --check`: passed with no output.
+- No full-suite rerun; the prior single full run remains `494 passed, 2
+  skipped`.

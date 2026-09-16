@@ -54,9 +54,12 @@ The Skill never edits, stages, or commits the target repository `.gitignore`.
 Any primary-workspace, detached-HEAD, path, ignore-gate, `git worktree add`, or
 WorktreeCycle state-persistence failure stops this cycle with a setup error
 before the first model call. Legacy or externally located cycle state is
-rejected rather than migrated. The retained worktree and branch are only
-removed by the verified cleanup contract after an affirmative combined
-delivery/cleanup confirmation.
+rejected rather than migrated. Non-scored setup, protocol, and asset
+interruptions retain their exact worktree, branch, and state for diagnosis and
+manual handling; without finalization and verified-delivery state, they are not
+eligible for the `manage_worktree.py cleanup` CLI. Only a scored result with an
+affirmative combined delivery/cleanup confirmation and verified delivery can
+enter the cleanup contract.
 
 完整流程：
 
@@ -233,7 +236,9 @@ delivery confirmation 之前与可交付评测资产一起提交为 `prepared_co
 - 最终停止原因和尚未解决的问题；
 - 经用户确认、应在下一周期转入开发集的真实故障。
 
-`optimization-history.yaml` 不保存中间候选全文、原始响应或 Token。新周期必须读取历史记录以避免重复无效策略，但当前已确认的契约和案例始终是业务真值来源。基础设施故障只进入运行报告，不作为 Prompt 优化经验。只有 `acceptance_passed` 的确认路径会在 `prepared_commit` 上创建包含冻结 Prompt 的 child `delivery_commit`；其他正式结果复用 `prepared_commit`，不创建空提交。
+`optimization-history.yaml` 的每条 compact entry 严格只包含以下四个字段：
+`finished_at_utc`、`result`、`stop_reason` 和按字典序排序的
+`failure_categories`。它不保存中间候选全文、原始响应或 Token。新周期必须读取历史记录以避免重复无效策略，但当前已确认的契约和案例始终是业务真值来源。基础设施故障只进入运行报告，不作为 Prompt 优化经验。只有 `acceptance_passed` 的确认路径会在 `prepared_commit` 上创建包含冻结 Prompt 的 child `delivery_commit`；其他正式结果复用 `prepared_commit`，不创建空提交。
 
 ## 15. 错误处理
 
