@@ -46,4 +46,8 @@ def test_workflow_documents_only_fixed_runtime_inputs():
     skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
     assert ".local/model-credentials.json" in skill
     assert "temperature=0.0" in skill
-    assert "does not auto-delete the worktree" in skill
+    assert "repository-local exclude" in skill
+    assert "evaluation-summaries" in skill
+    assert "verify-ignores --state STATE_PATH" in skill
+    assert "cleanup --state STATE_PATH" in skill
+    assert "verified cleanup" in skill

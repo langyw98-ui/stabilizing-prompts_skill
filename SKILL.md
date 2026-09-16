@@ -32,12 +32,23 @@ baseline. Bootstrap is not a separately callable user mode and may not be
 paused and resumed in another worktree. The original workspace is never used
 for candidate experiments.
 
-There are two independent user gates. The contract confirmation gate confirms
-the contract, cases, adapter, frozen split, fixed environment, repetition
-counts, thresholds, and stop rules before any model call. The delivery
-confirmation gate is required for both success delivery and failure-asset-only
-delivery. A user cancellation at either gate stops with no model call or no
-synchronization, respectively.
+`tune` automatically initializes the repository-local exclude for this cycle
+before creating the managed worktree. It verifies the final managed-worktree
+target before creation and the concrete `reports/` and `.runtime/` paths after
+creation; both ignore gates complete before evaluation assets, confirmation, or
+any model call. Initialization is idempotent, preserves existing exclude bytes,
+and never edits the project `.gitignore`, Git config, or global excludes.
+
+There are two user gates. The contract confirmation gate confirms the contract,
+cases, adapter, coverage obligations, frozen split, fixed environment,
+repetition counts, thresholds, and stop rules before any model call. The
+contract, cases, adapter, and coverage obligations are frozen together by the
+first gate. The delivery confirmation gate is one combined
+delivery-and-cleanup confirmation for every formal scored result; it authorizes
+only that result's allowlisted synchronization and, after delivery verification,
+cleanup. A declined or ambiguous answer leaves the original workspace unchanged
+and retains the prepared evidence, worktree, branch, and state. A user
+cancellation at the contract gate stops before any model call.
 
 Coverage has two deliberately separate layers, and they run in this order:
 
@@ -71,7 +82,7 @@ be audited and confirmed again before another model call.
 
 The state machine is:
 
-`preflight → worktree → contract/cases/adapter → user confirmation → model probe/smoke → asset commit → dev/validation baseline → no-change exit or candidate loop → candidate freeze → single acceptance activity → failure exit or delivery confirmation → worktree commit → allowlisted synchronization`
+`preflight → repository-local exclude initialization → pre-create managed-worktree ignore verification → create and persist dedicated worktree → post-create reports/runtime ignore verification → contract/cases/adapter → user confirmation (contract confirmation gate) → model probe/smoke → asset commit → dev/validation baseline → no-change conclusion or candidate loop → optional candidate freeze → optional single acceptance activity → scored terminal outcome → normalize final result and render summary → append compact history and commit summary/deliverable evaluation assets as prepared_commit → show result, summary path, and delivery set → delivery-and-cleanup confirmation → resolve delivery_commit → allowlisted synchronization → verified cleanup`
 
 Each state below names its inputs, command/API, output, next state, and stop
 behavior. Paths are placeholders; `PATH` is resolved inside the appropriate
@@ -101,33 +112,49 @@ repository or worktree and is never taken from model output.
   resolve primary checkout identity
   -> reject linked worktree or detached HEAD
   -> derive .worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/
-  -> verify that directory is ignored with git check-ignore
+  -> repository-local exclude initialization
+  -> pre-create managed-worktree ignore verification
   -> create branch and worktree with git worktree add
   -> persist WorktreeCycle
+  -> post-create reports/runtime ignore verification
   ```
 
-- Preflight: resolve the primary workspace identity, then reject a linked
-  worktree or detached `HEAD`. Derive the fixed target
+- Identity/path: resolve the primary workspace identity, reject a linked
+  worktree or detached `HEAD`, and derive the fixed target
   `.worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/` inside the target
   repository; never accept a caller-selected worktree path.
-- Ignore gate: run `git check-ignore --no-index --quiet` for the final target
-  directory before creating its parent, branch, or worktree. The target
-  directory must already be covered by an ignore rule. Do not edit, stage, or commit the target repository's `.gitignore`. Before invoking `tune`, the user must establish an ignore rule that
-  covers `.worktrees/` (in the project rules, `.git/info/exclude`, or a global
-  excludes file); if the rule is missing, stop with `setup_error`.
+- Repository-local exclude initialization: automatically ask Git for the
+  repository-local exclude path, preserve its existing bytes and comments, and
+  add only the needed anchored rules when the concrete paths are not ignored.
+  The operation is idempotent and atomic; it does not edit, stage, or commit
+  `.gitignore`, `.git/config`, global Git configuration, or global excludes. It
+  runs before creating any cycle asset, asking for confirmation, or calling the
+  model.
+- Pre-create managed-worktree ignore verification: run
+  `git check-ignore --no-index --quiet -- .worktrees/stabilizing-prompts/<prompt-slug>-<cycle-id>/`
+  for the final derived directory before creating its parent, branch, or
+  worktree. If the actual Git query fails, stop with `setup_error` and do not
+  write cycle state or evaluation assets.
 - Command: `manage_worktree.py create --repo PATH --prompt-id ID --state PATH [--branch BRANCH]`.
 - Output: a persisted `WorktreeCycle` state with the dedicated project-local
   worktree, internal or explicitly validated branch, original workspace
-  identity, and immutable `cycle_base_commit`.
+  identity, immutable `cycle_base_commit`, and completed pre-create ignore
+  gate. The create operation performs the automatic initialization and
+  pre-create check before `git worktree add`.
+- Post-create reports/runtime ignore verification: from the linked worktree,
+  run `manage_worktree.py verify-ignores --state STATE_PATH` and require Git to
+  ignore `.prompt-evals/<prompt-id>/reports/` and
+  `.prompt-evals/<prompt-id>/.runtime/`. This is a second, concrete Git gate;
+  do not build assets, ask for confirmation, or call the model until it passes.
 - Next: `contract/cases/adapter`, in this same worktree and cycle. Never make a
-  second worktree for bootstrap or for candidate rounds. The worktree and
-  branch are not automatically deleted.
+  second worktree for bootstrap or candidate rounds. A non-scoring setup
+  interruption retains the exact cycle for diagnosis; successful delivery may
+  proceed to verified cleanup after the combined confirmation.
 - Setup stop: reject a repository-root mismatch, linked worktree, detached
-  `HEAD`, missing ignore coverage, invalid branch, `git worktree add` failure,
-  or WorktreeCycle state-persistence failure before the first model call. Fail
-  closed: never fall back to tuning in the original checkout. Preserve the
-  original workspace and report the precise reason; retained worktrees and
-  branches require manual inspection or cleanup.
+  `HEAD`, failed exclude initialization or ignore coverage, invalid branch,
+  `git worktree add` failure, or WorktreeCycle state-persistence failure before the first model call. Fail closed: never fall back to tuning in the original
+  checkout. Preserve the original workspace and report the precise phase,
+  paths, and safe Git diagnostic.
 
 ### 3. contract/cases/adapter
 
@@ -219,6 +246,8 @@ repository or worktree and is never taken from model output.
   `.prompt-evals/<prompt-id>/coverage-obligations.yaml`, adapter, and the
   confirmed evaluation assets in the dedicated worktree. Do not edit, stage, or commit the target repository's `.gitignore`; evaluation outputs must
   remain under already-ignored `reports/`/`.runtime/` paths.
+  The confirmed `coverage-obligations.yaml` is part of this immutable asset
+  set and remains eligible for the result-specific delivery profile.
 - Output: an asset commit recorded in the cycle state and the immutable
   committed input hashes used by manifests.
 - Next: `dev/validation baseline`.
@@ -243,19 +272,22 @@ repository or worktree and is never taken from model output.
 - Output: immutable manifests, deterministic score reports, failure clusters,
   and development/validation baseline gates. `acceptance-cases.yaml` is not
   loaded or run in this state.
-- Next: `no-change exit or candidate loop`. Do not calculate a gate while a
+- Next: `no-change conclusion or candidate loop`. Do not calculate a gate while a
   planned slot is incomplete; resume the same manifest slot if the fixed
   client permits it, without replacing it with an extra successful call.
 - Stop: setup/protocol failures, exhausted transport slots, incompatible
   manifests, or a newly discovered contract/adapter mismatch pause the cycle;
   record the non-scoring reason and do not generate a candidate.
 
-### 8. no-change exit or candidate loop
+### 8. no-change conclusion or candidate loop
 
 If every planned development and validation call is `pass` and both baseline
-gates pass, stop with `no_change_needed`: this does not generate a candidate
-and does not run acceptance. If the baseline reproduces an evidenced failure, use one
-failure cluster per round and make the smallest prompt-only change in
+gates pass, conclude the formal result `no_change_needed`: do not generate a
+candidate or run acceptance, then route that scored conclusion through result
+normalization, summary, prepared commit, and the delivery-and-cleanup
+confirmation. A no-change result still has an assets delivery profile. If the
+baseline reproduces an evidenced failure, use one failure cluster per round and
+make the smallest prompt-only change in
 `.runtime/`; never change the Schema, contract, assertions, datasets, adapter,
 or fixed client. Read `optimization-history.yaml` to avoid repeating rejected
 strategies, but do not treat it as business truth.
@@ -279,7 +311,11 @@ Stop the loop after five candidate rounds (`five candidate rounds`) or after
 for a `contract conflict`, adapter distortion, model unavailability,
 incomplete/non-scoring evidence, or an unreplicated real-world defect. A new
 user-supplied defect requires a new case, renewed contract confirmation, and
-new baseline; it is not fed into this cycle's acceptance.
+new baseline; it is not fed into this cycle's acceptance. A scored candidate
+gate failure is classified as `validation_failed`, while an equal/rejected
+candidate, the consecutive no-improvement stop, and the round-count stop are
+classified as `no_strict_improvement`, `no_improvement_limit`, and
+`round_limit`, respectively, then all use the same finalization path.
 
 ### 9. candidate freeze
 
@@ -312,49 +348,98 @@ new baseline; it is not fed into this cycle's acceptance.
   runs once per cycle, after the candidate hash is frozen; its result is not
   fed back into this cycle. An interrupted slot may resume the same immutable
   acceptance manifests, but cannot create a second acceptance activity.
-- Next: `failure exit or delivery confirmation`.
-- Stop: an acceptance failure ends the cycle; do not edit the candidate or
-  rerun acceptance in the same cycle. The acceptance file remains owned by
-  `tune`, never by `verify`.
+- Next: `scored terminal outcome`, then `normalize final result`, render the
+  summary, append compact history, and create `prepared_commit`.
+- Stop: an acceptance failure is the scored result `acceptance_failed`; do not
+  edit the candidate or rerun acceptance in the same cycle. The acceptance
+  file remains owned by `tune`, never by `verify`, and the result proceeds to
+  the unified finalization path.
 
-### 11. failure exit or delivery confirmation
+### 11. normalize final result, summary, and `prepared_commit`
 
-If acceptance fails, take the failure exit: record the stop reason and compact
-failure history, and explicitly tell the user that this is an acceptance
-failure and that the candidate is not delivered. A failure-asset-only patch
-may be offered only after a separate delivery confirmation gate; it may contain
-confirmed evaluation assets and new failure history, but it does not deliver the candidate
-or production prompt. If the user declines, leave the worktree
-and original workspace unchanged.
+Every scored terminal outcome enters one finalization path. Normalize exactly
+these seven formal outcomes before presenting any delivery decision:
 
-If acceptance passes, show the paired reports, frozen hash, diff, gate results,
-and allowlisted files, then explicitly confirm whether to deliver the final
-production prompt. This success delivery confirmation gate is independent of
-the earlier contract confirmation gate. A decline preserves the original
-production prompt and performs no synchronization.
+When acceptance fails, normalize `acceptance_failed` and retain the candidate
+out of production delivery. When acceptance passes, normalize
+`acceptance_passed` and make the frozen candidate eligible for the success
+profile only after confirmation.
 
-### 12. worktree commit
+- `no_change_needed` — both baseline gates pass, so no candidate or acceptance
+  activity is needed.
+- `no_strict_improvement` — a candidate is rejected or equal without a strict
+  validation improvement.
+- `validation_failed` — a candidate gate or regression fails at validation.
+- `no_improvement_limit` — the consecutive no-improvement stop is reached.
+- `round_limit` — the candidate-round limit is reached.
+- `acceptance_failed` — the single acceptance activity fails; the candidate is
+  not eligible to change the production Prompt.
+- `acceptance_passed` — the frozen candidate passes the single acceptance
+  activity and is eligible for success delivery.
 
-- Inputs: affirmative success delivery confirmation, or affirmative failure
-  asset-only delivery confirmation; the frozen cycle state.
-- Action: on success only, replace the production Prompt with the frozen
-  candidate, update only the current Prompt hash/non-path fields in
-  `prompt-contract.yaml`, and append compact failure/optimization history.
-  On failure delivery, exclude the production Prompt and candidate. Commit the
-  selected deliverables, including the confirmed `coverage-obligations.yaml`,
-  in the same cycle worktree; never
-  commit runtime candidates, reports, raw responses, credentials, or tokens.
-- Output: final committed worktree `HEAD` and a cycle state tied to the
-  candidate/asset hashes.
-- Next: `allowlisted synchronization`.
-- Stop: a path redirection, unexpected changed file, hash mismatch, or commit
-  failure stops before synchronization; do not substitute a different prompt.
+Setup, protocol, transport, model-service, identity, asset, and user-confirmation
+failures are non-scoring interruptions. They do not generate a formal summary,
+`prepared_commit`, delivery confirmation, or cleanup; retain the diagnostic
+cycle under the corresponding failure policy.
+
+- Inputs: saved score reports, comparison reports, coverage audit and
+  confirmation evidence, runner slot counts, smoke result, normalized stop
+  reason, fixed UTC finish time, and (only for `acceptance_passed`) the frozen
+  candidate path and hash. Never infer facts from raw model responses.
+- Action: run
+  `finalize_cycle.py prepare --state STATE_PATH --result RESULT --finished-at UTC --evidence SUMMARY_JSON [--candidate FROZEN_CANDIDATE --candidate-hash SHA256]`.
+  Validate evidence and identity, normalize the result/profile, and render a
+  deterministic Markdown summary at
+  `.prompt-evals/<prompt-id>/evaluation-summaries/YYYY-MM-DD-HHMMSS-<result>.md`.
+  Do not overwrite an existing identity-matching destination, include hashes or
+  internal absolute paths in the summary, or include raw responses, tokens, or
+  patch details. Append one compact optimization-history entry before asking
+  for delivery confirmation.
+- Output: the result, stop reason, summary path, and planned delivery set. The
+  first six results use the `assets` (asset-only) profile; `acceptance_passed` uses the
+  `success` profile. The summary, compact history, and current-cycle
+  deliverable evaluation assets are committed in the worktree as
+  `prepared_commit`; the production Prompt is not changed yet.
+- Next: show the result, summary path, planned delivery set, paired acceptance
+  reports/diff when applicable, and the exact resources the authorized cleanup
+  would remove, then enter `delivery-and-cleanup confirmation`.
+
+### 12. delivery-and-cleanup confirmation
+
+- Inputs: every formal result's deterministic summary, planned delivery set,
+  `prepared_commit`, exact cycle worktree/branch identity, and the paired
+  acceptance evidence when the result is `acceptance_passed`.
+- Action: present one explicit confirmation that combines delivery and
+  successful-delivery cleanup. Explain that cleanup permanently removes the
+  exact managed worktree (including ignored `reports/`, `.runtime/`, raw
+  responses, patch files, manifests, and temporary candidates), the exact
+  cycle branch, and eventually the single external `STATE_PATH`; show the
+  precise branch name. For `acceptance_passed`, retain the paired reports,
+  frozen candidate identity, Prompt diff, and gate results in the confirmation
+  material.
+- Refusal retention: a declined, ambiguous, or cancelled answer performs no
+  synchronization, does not modify the original workspace, and does not start
+  cleanup. Retain the `prepared_commit`, summary, evidence, worktree, branch,
+  and state for inspection or a later delivery decision. This same retention
+  applies to delivery or verification failure.
+- On an affirmative answer, run
+  `finalize_cycle.py approve --state STATE_PATH` to resolve `delivery_commit`:
+  `assets` results reuse `prepared_commit` without an empty child commit;
+  `acceptance_passed` alone writes the frozen candidate to the canonical
+  production Prompt, updates only non-path fields in `prompt-contract.yaml`,
+  and creates a child `delivery_commit`. No other result may change the
+  production Prompt. The committed contract must retain the cycle's canonical
+  Prompt path.
+- State: atomically record delivery confirmation and cleanup authorization in
+  the single external `STATE_PATH`; do not create a second confirmation or
+  cleanup state file. Next: `allowlisted synchronization`.
 
 ### 13. allowlisted synchronization
 
-- Inputs: `cycle_base_commit`, final committed worktree `HEAD`, result type,
-  canonical Prompt path from the committed contract, and the user's delivery
-  confirmation.
+- Inputs: `cycle_base_commit`, `prepared_commit`/resolved `delivery_commit`,
+  final committed worktree `HEAD`, the formal result's delivery profile,
+  canonical Prompt path from the committed contract, and the combined delivery
+  and cleanup confirmation.
 - Commands:
 
   ```text
@@ -363,11 +448,15 @@ production prompt and performs no synchronization.
   ```
 
 - Output: a freshly generated, result-specific allowlisted patch applied
-  unstaged to the original workspace. Success may include the production
-  prompt and confirmed assets, including
-  `.prompt-evals/<prompt-id>/coverage-obligations.yaml`; failure excludes the
-  production prompt and candidate but may deliver that confirmed asset. The
-  original worktree and branch remain for inspection.
+  unstaged to the original workspace. The effective delivery profile is always
+  derived from current persisted finalization state; compatibility
+  `--result success|failure` remains accepted for this version but cannot
+  override that state. All formal results may deliver only the current prompt
+  ID's committed evaluation assets, including
+  `.prompt-evals/<prompt-id>/coverage-obligations.yaml`; only
+  `acceptance_passed` may include the production Prompt. Reports, `.runtime/`,
+  raw responses, `__pycache__`, temporary patch files, and unrelated paths are
+  excluded. The original worktree and branch remain until verified cleanup.
 - Delivery-time stale-state guard: after model phases and immediately before
   synchronization, re-check the original `HEAD == cycle_base_commit`, final
   worktree `HEAD`, committed contract identity, and the fixed managed-root
@@ -380,13 +469,57 @@ production prompt and performs no synchronization.
   compare Git-reported changed paths and patch paths exactly with the derived
   allowlist, rejecting reports/runtime/unrelated files, deletions, or extra
   sections. Immediately before apply require original `HEAD ==
-  cycle_base_commit` and the committed contract to retain the cycle's
-  canonical Prompt path. Run `git apply --check`, snapshot exact targets,
-  apply without staging, and verify actual paths and destination hashes. On
-  any conflict or verification error restore the exact snapshots; never
-  auto-merge, overwrite user edits, or rely on persisted patch/manifest/hash
-  as an adversarial trust anchor. Successful synchronization leaves files
-  unstaged and uncommitted, and does not auto-delete the worktree.
+  cycle_base_commit`, the final worktree `HEAD == delivery_commit`, the fixed
+  managed-root path, a clean cycle worktree, and the committed contract to
+  retain the cycle's canonical Prompt path. Run `git apply --check`, snapshot
+  exact targets, apply without staging, and verify actual paths and destination
+  hashes. Then atomically record applied/verified delivery state in
+  `STATE_PATH`. This is transactional: if apply, verification, or the delivery
+  state write fails, restore the exact pre-apply snapshots, report rollback,
+  and do not start cleanup or claim delivery success. Never auto-merge,
+  overwrite user edits, stage/commit the original workspace, or rely on a
+  persisted patch/manifest/hash as an adversarial trust anchor. Successful
+  synchronization leaves files unstaged and uncommitted; next is
+  `verified cleanup`.
+
+### 14. verified cleanup
+
+Start cleanup only after the combined confirmation, successful patch apply and
+destination verification, and the atomic `STATE_PATH` update recording
+`delivery_applied`, `delivery_verified`, and cleanup authorization. A setup,
+protocol, transport, model, confirmation, synchronization, or verification
+failure never starts cleanup.
+
+- Command: `manage_worktree.py cleanup --state STATE_PATH`. The command derives
+  every deletion target from the single current cycle state; it accepts no
+  caller-supplied worktree, branch, or extra path.
+- First-start gates: verify the original workspace identity and cleanliness,
+  the exact managed worktree and cycle branch, `delivery_commit`, and the
+  recorded delivery evidence. Then perform this exact sequence from outside
+  the worktree:
+
+  ```text
+  verify fixed Git cleanliness
+  -> git worktree remove <exact-cycle-worktree>
+  -> verify exact cycle directory and Git registration are absent
+  -> remove .worktrees/stabilizing-prompts/ only when empty
+  -> verify exact cycle branch is unused by every worktree
+  -> git branch -D <exact-cycle-branch>
+  -> delete exact STATE_PATH
+  ```
+
+  Never use `git worktree remove --force`, `git worktree prune`, reflog expiry,
+  Git GC, glob deletion, or recursive deletion. `.worktrees/` itself always
+  remains; an occupied managed parent belongs to another cycle or user and is
+  preserved.
+- Each successful phase atomically updates `STATE_PATH` before the next
+  destructive step. If cleanup partially fails, keep the delivered original
+  workspace unchanged, retain the branch/state and diagnostic progress, and
+  stop later steps. Cleanup is not a rollback of verified delivery.
+- Retry is phase-aware: revalidate already-completed postconditions and current
+  exact identities, operate only on resources still present, and do not repeat
+  deletion of a worktree or branch already verified absent. A removed worktree
+  does not have to pass the first-start existence/cleanliness gates again.
 
 ### CLI contracts
 
@@ -402,14 +535,20 @@ run_prompt_eval.py --eval-root PATH --prompt PATH --dataset dev|validation|accep
 score_results.py --manifest PATH --report PATH
 compare_runs.py --baseline PATH --candidate PATH --phase development|validation|acceptance --report PATH
 manage_worktree.py create --repo PATH --prompt-id ID --state PATH [--branch BRANCH]
+manage_worktree.py verify-ignores --state STATE_PATH
 manage_worktree.py build-patch --state PATH --out PATCH --out-manifest PATCH_JSON --result success|failure
 manage_worktree.py apply-patch --state PATH --patch PATCH --patch-manifest PATCH_JSON
+manage_worktree.py cleanup --state STATE_PATH
+finalize_cycle.py prepare --state STATE_PATH --result RESULT --finished-at UTC --evidence SUMMARY_JSON [--candidate FROZEN_CANDIDATE --candidate-hash SHA256]
+finalize_cycle.py approve --state STATE_PATH
 ```
 
 The runner defaults to `--mode tune`; callers running the read-only workflow
 must pass `--mode verify`. A verify invocation rejects `--dataset acceptance`
 before opening any manifest or case file, importing the adapter, or
-constructing the model client.
+constructing the model client. `build-patch` derives the effective delivery
+profile from current finalization state; its compatibility `--result` spelling
+is accepted during this version but is not an authority for result routing.
 
 `validate_cases.py` consumes the mandatory proposed/editable
 `coverage-obligations.yaml` during asset construction. User confirmation
@@ -417,10 +556,12 @@ freezes the asset; coverage obligations add no CLI option or command.
 
 ## verify
 
-`verify` is read-only execution in the current workspace. Reject
-`--dataset acceptance` immediately, before loading any dataset file and before
-constructing the model client. It must not read or run `acceptance-cases.yaml`
-—during a cycle or after it ends.
+`verify` is read-only execution in the current workspace and does not modify repository-local exclude. The check occurs before any output or model call; perform read-only
+Git checks for the concrete report/cache paths; missing ignore coverage returns
+`setup_error` without creating output. Reject `--dataset acceptance`
+immediately, before loading any dataset file and before constructing the model
+client. It must not read or run `acceptance-cases.yaml`—during a cycle or after
+it ends.
 
 ### verify state machine
 
