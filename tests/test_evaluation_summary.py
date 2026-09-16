@@ -278,6 +278,75 @@ def test_sensitive_camel_pascal_and_kebab_keys_are_omitted(sample_evidence, sens
     assert "top-secret" not in summary
 
 
+@pytest.mark.parametrize("near_duplicate_review", ["", "   ", [], {}])
+def test_near_duplicate_review_requires_meaningful_conclusion(
+    sample_evidence, near_duplicate_review
+):
+    values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
+    values["coverage"] = {
+        **sample_evidence.coverage,
+        "near_duplicate_review": near_duplicate_review,
+    }
+    with pytest.raises(ValueError, match="near_duplicate"):
+        render_summary(
+            normalize_formal_result("acceptance_passed", finished_at_utc="2026-09-16T08:09:10Z"),
+            SummaryEvidence(**values),
+        )
+
+
+@pytest.mark.parametrize("exclusions", [["x"], {"x": ""}, [{"id": "x"}]])
+def test_exclusions_require_an_explicit_reason(sample_evidence, exclusions):
+    values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
+    values["coverage"] = {**sample_evidence.coverage, "exclusions": exclusions}
+    with pytest.raises(ValueError, match="exclusions"):
+        render_summary(
+            normalize_formal_result("acceptance_passed", finished_at_utc="2026-09-16T08:09:10Z"),
+            SummaryEvidence(**values),
+        )
+
+
+@pytest.mark.parametrize(
+    "business_key",
+    ["responseType", "rawMaterial", "hashAlgorithm", "response", "raw", "hash"],
+)
+def test_unrelated_business_keys_are_preserved(sample_evidence, business_key):
+    values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
+    values["coverage"] = {**sample_evidence.coverage, business_key: "business-value"}
+    summary = render_summary(
+        normalize_formal_result("acceptance_passed", finished_at_utc="2026-09-16T08:09:10Z"),
+        SummaryEvidence(**values),
+    )
+    assert business_key in summary
+    assert "business\\-value" in summary
+
+
+@pytest.mark.parametrize(
+    "machine_key",
+    [
+        "delivery",
+        "deliveryStatus",
+        "deliveryCommit",
+        "deliveryConfirmed",
+        "deliveryApplied",
+        "deliveryVerified",
+        "delivery-status",
+        "delivery-commit",
+        "delivery-confirmed",
+        "delivery-applied",
+        "delivery-verified",
+    ],
+)
+def test_delivery_machine_state_keys_are_omitted(sample_evidence, machine_key):
+    values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
+    values["coverage"] = {**sample_evidence.coverage, machine_key: "confirmed"}
+    summary = render_summary(
+        normalize_formal_result("acceptance_passed", finished_at_utc="2026-09-16T08:09:10Z"),
+        SummaryEvidence(**values),
+    )
+    assert machine_key.casefold() not in summary.casefold()
+    assert "confirmed" not in summary
+
+
 @pytest.mark.parametrize(
     "prompt_path",
     [

@@ -86,40 +86,44 @@ class SummaryError(ValueError):
     """Raised when persisted summary evidence is not trustworthy."""
 
 
-_SENSITIVE_KEY_PARTS = frozenset(
+_SENSITIVE_EXACT_KEYS = frozenset(
     {
         "access_token",
         "api_key",
         "apikey",
         "authorization",
+        "authorization_token",
+        "auth_token",
         "bearer",
+        "bearer_token",
         "credential",
         "password",
+        "password_value",
         "secret",
+        "secret_key",
         "token",
     }
 )
-_PRIVATE_KEY_PARTS = frozenset(
+_SENSITIVE_CONTEXT_KEYS = frozenset({"access", "api", "auth", "authorization", "bearer"})
+_PRIVATE_EXACT_KEYS = frozenset(
     {
         "absolute_path",
         "cleanup",
         "commit",
         "confirmation",
-        "delivery_commit",
-        "delivery_state",
-        "delivery_status",
-        "hash",
+        "delivery",
         "manifest",
         "patch",
         "prepared_commit",
         "prepared_state",
         "private_worktree",
-        "raw",
-        "response",
         "sha",
         "sha256",
         "worktree",
     }
+)
+_MACHINE_STATE_SUFFIXES = frozenset(
+    {"applied", "commit", "confirmed", "state", "status", "verified"}
 )
 _MARKDOWN_META = frozenset("\\`*_{}[]()#+-.!|<>")
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;\"']+")
@@ -172,14 +176,40 @@ def _normalise_key(key: str) -> str:
 
 def _is_sensitive_key(key: str) -> bool:
     normalized = _normalise_key(key)
-    pieces = set(_key_tokens(key))
-    return normalized in _SENSITIVE_KEY_PARTS or bool(pieces & _SENSITIVE_KEY_PARTS)
+    if normalized in _SENSITIVE_EXACT_KEYS:
+        return True
+    tokens = _key_tokens(key)
+    # Only a token paired with an authentication/access context is secret
+    # material.  A generic ``tokenCount`` or ``responseType`` remains valid
+    # business evidence instead of being dropped by token intersection.
+    return "token" in tokens and bool(set(tokens) & _SENSITIVE_CONTEXT_KEYS)
+
+
+def _has_adjacent_tokens(tokens: tuple[str, ...], first: str, second: str) -> bool:
+    return any(left == first and right == second for left, right in zip(tokens, tokens[1:]))
 
 
 def _is_private_key(key: str) -> bool:
     normalized = _normalise_key(key)
-    pieces = set(_key_tokens(key))
-    return normalized in _PRIVATE_KEY_PARTS or bool(pieces & _PRIVATE_KEY_PARTS)
+    if normalized in _PRIVATE_EXACT_KEYS:
+        return True
+    tokens = _key_tokens(key)
+    # These are explicit phrases, not independent token matches.  This keeps
+    # legal fields such as ``rawMaterial``, ``responseType`` and
+    # ``hashAlgorithm`` in field-level evidence.
+    if _has_adjacent_tokens(tokens, "raw", "response"):
+        return True
+    if "delivery" in tokens and any(
+        _has_adjacent_tokens(tokens, "delivery", suffix)
+        for suffix in _MACHINE_STATE_SUFFIXES
+    ):
+        return True
+    if "prepared" in tokens and any(
+        _has_adjacent_tokens(tokens, "prepared", suffix)
+        for suffix in ("commit", "state")
+    ):
+        return True
+    return False
 
 
 def _freeze_json(value: object, *, label: str, stack: set[int] | None = None) -> object:
@@ -631,6 +661,57 @@ def _require_nonempty_value(value: object, *, label: str) -> None:
     raise SummaryError(f"{label} has an invalid value")
 
 
+def _has_meaningful_content(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        return bool(value) and any(_has_meaningful_content(item) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return bool(value) and any(_has_meaningful_content(item) for item in value)
+    return False
+
+
+def _validate_near_duplicate_review(value: object) -> None:
+    if not _has_meaningful_content(value):
+        raise SummaryError("coverage.near_duplicate_review must contain a meaningful conclusion")
+
+
+def _validate_exclusions(value: object) -> None:
+    if isinstance(value, Mapping):
+        if not value:
+            raise SummaryError("coverage.exclusions must not be empty")
+        for excluded, reason in value.items():
+            if not isinstance(excluded, str) or not excluded.strip():
+                raise SummaryError("coverage.exclusions requires an excluded item")
+            if isinstance(reason, Mapping):
+                found, nested_reason = _field_by_alias(reason, ("reason",))
+                if not found:
+                    raise SummaryError("coverage.exclusions requires an explicit reason")
+                _require_nonempty_text(
+                    nested_reason,
+                    label="coverage.exclusions.reason",
+                )
+            else:
+                _require_nonempty_text(reason, label="coverage.exclusions.reason")
+        return
+    if isinstance(value, (tuple, list)):
+        if not value:
+            raise SummaryError("coverage.exclusions must not be empty")
+        for index, exclusion in enumerate(value):
+            if not isinstance(exclusion, Mapping):
+                raise SummaryError(
+                    f"coverage.exclusions[{index}] requires an explicit reason"
+                )
+            found, reason = _field_by_alias(exclusion, ("reason",))
+            if not found:
+                raise SummaryError(
+                    f"coverage.exclusions[{index}] requires an explicit reason"
+                )
+            _require_nonempty_text(reason, label=f"coverage.exclusions[{index}].reason")
+        return
+    raise SummaryError("coverage.exclusions has an invalid value")
+
+
 def _validate_metric_record(value: object, *, label: str) -> None:
     if not isinstance(value, Mapping):
         raise SummaryError(f"{label} must be a mapping")
@@ -678,15 +759,12 @@ def _validate_coverage(coverage: Mapping[str, object]) -> None:
             if type(value) is not bool:
                 raise SummaryError("coverage.matrix_complete must be boolean")
         elif name == "exclusions":
-            _require_nonempty_value(value, label="coverage.exclusions")
+            _validate_exclusions(value)
         elif name == "saturation":
             if not isinstance(value, str) or not value.strip():
                 raise SummaryError("coverage.saturation must be a non-empty summary")
         elif name == "near_duplicate_review":
-            # An empty list is a meaningful recorded review: no near duplicate
-            # pairs were found.  Null still means that the review is missing.
-            if value is None:
-                raise SummaryError("coverage.near_duplicate_review is missing")
+            _validate_near_duplicate_review(value)
         else:
             _require_nonempty_value(value, label=f"coverage.{name}")
 
