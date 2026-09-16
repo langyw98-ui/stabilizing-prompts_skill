@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
@@ -60,9 +60,29 @@ _ASSET_NAMES = frozenset(
 )
 _FORBIDDEN_SEGMENTS = frozenset({".runtime", "reports"})
 
+# These are the only repository-local rules this module may initialize.  The
+# concrete paths used to prove each category are derived for the current
+# cycle; the rules themselves deliberately remain stable and repository-root
+# anchored.
+MANAGED_EXCLUDES = (
+    "/.worktrees/stabilizing-prompts/",
+    "/.prompt-evals/*/reports/",
+    "/.prompt-evals/*/.runtime/",
+)
+_MANAGED_EXCLUDES_COMMENT = b"# stabilizing-prompts managed local excludes"
+
 
 class WorktreeError(RuntimeError):
     """Raised when a cycle cannot be created or loaded safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExcludeResult:
+    """The repository-local exclude file and the gates it satisfied."""
+
+    path: Path
+    changed: bool
+    verified_paths: tuple[str, ...]
 
 
 class DeliveryError(ValueError):
@@ -750,11 +770,62 @@ def _cycle_worktree_path(root: Path, prompt_id: str, identity: str) -> Path:
     return target
 
 
-def _require_ignored_worktree(root: Path, target: Path) -> None:
+def _repository_local_exclude(root: Path) -> Path:
+    """Resolve Git's repository-local exclude inside shared metadata."""
+
+    root = _repo_root(Path(root))
+    common = _resolved_git_directory(root, "--git-common-dir")
+    value = Path(_git_text(root, "rev-parse", "--git-path", "info/exclude"))
+    resolved = (value if value.is_absolute() else root / value).resolve(strict=False)
+    if not _path_is_within(resolved, common):
+        raise WorktreeError(
+            "repository-local exclude is outside shared Git metadata: "
+            f"{resolved} (common directory {common})"
+        )
+    return resolved
+
+
+def _validate_exclude_prompt_id(prompt_id: str) -> str:
+    if (
+        not isinstance(prompt_id, str)
+        or not prompt_id.strip()
+        or "\x00" in prompt_id
+        or "/" in prompt_id
+        or "\\" in prompt_id
+        or prompt_id in {".", ".."}
+        or any(character in prompt_id for character in "*?[")
+        or not re.fullmatch(r"[A-Za-z0-9._-]+", prompt_id)
+    ):
+        raise WorktreeError("prompt_id is not a safe evaluation directory name")
+    return prompt_id
+
+
+def _exclude_targets(
+    root: Path, prompt_id: str, worktree: Path
+) -> tuple[tuple[str, str], ...]:
+    """Return concrete ignore probes paired with their managed rule."""
+
+    root = Path(root).resolve(strict=False)
+    target = Path(worktree).absolute()
+    _validate_exclude_prompt_id(prompt_id)
+    _reject_worktree_path_links(root, target)
     try:
-        relative = target.relative_to(root).as_posix() + "/"
+        relative_worktree = target.relative_to(root).as_posix()
     except ValueError as error:
-        raise WorktreeError("derived worktree path escapes the original repository") from error
+        raise WorktreeError(
+            f"derived worktree path escapes the original repository: {target}"
+        ) from error
+    relative_worktree = relative_worktree.rstrip("/")
+    if not relative_worktree or relative_worktree in {".", ".."}:
+        raise WorktreeError("derived worktree path is not a concrete repository path")
+    return (
+        (relative_worktree + "/", MANAGED_EXCLUDES[0]),
+        (f".prompt-evals/{prompt_id}/reports/", MANAGED_EXCLUDES[1]),
+        (f".prompt-evals/{prompt_id}/.runtime/", MANAGED_EXCLUDES[2]),
+    )
+
+
+def _ignore_status(root: Path, relative: str) -> bool:
     result = _git(
         root,
         "check-ignore",
@@ -764,11 +835,227 @@ def _require_ignored_worktree(root: Path, target: Path) -> None:
         relative,
         check=False,
     )
+    if result.returncode == 0:
+        return True
     if result.returncode == 1:
-        raise WorktreeError(f"worktree directory is not ignored: {relative}")
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
-        raise WorktreeError(f"unable to verify worktree ignore rule: {detail}")
+        return False
+    detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+    raise WorktreeError(
+        f"unable to verify ignore rule for {relative}: "
+        f"{detail or 'git check-ignore failed'}"
+    )
+
+
+def _ignore_diagnostic(root: Path, relative: str) -> str:
+    result = _git(
+        root,
+        "check-ignore",
+        "--no-index",
+        "-v",
+        "--",
+        relative,
+        check=False,
+    )
+    detail = (result.stdout or result.stderr).decode("utf-8", "replace").strip()
+    return detail or "no matching ignore rule"
+
+
+def _raise_unignored(root: Path, relative: str, *, label: str) -> None:
+    if _ignore_status(root, relative):
+        return
+    diagnostic = _ignore_diagnostic(root, relative)
+    raise WorktreeError(
+        f"{label} is not ignored: {relative}; "
+        f"git check-ignore -v: {diagnostic}"
+    )
+
+
+def _read_exclude_bytes(path: Path) -> tuple[bool, bytes]:
+    try:
+        return True, path.read_bytes()
+    except FileNotFoundError:
+        return False, b""
+    except OSError as error:
+        raise WorktreeError(
+            f"unable to read repository-local exclude {path}: {error}"
+        ) from error
+
+
+def _exclude_candidate(existing: bytes, missing_rules: Sequence[str]) -> bytes:
+    """Append missing managed rules without changing existing bytes."""
+
+    lines = {line.rstrip(b"\r") for line in existing.split(b"\n")}
+    missing = [
+        rule.encode("ascii")
+        for rule in missing_rules
+        if rule.encode("ascii") not in lines
+    ]
+    if not missing:
+        return existing
+    additions: list[bytes] = []
+    if _MANAGED_EXCLUDES_COMMENT not in lines:
+        additions.append(_MANAGED_EXCLUDES_COMMENT)
+    additions.extend(missing)
+    suffix = b"\n".join(additions) + b"\n"
+    separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
+    return existing + separator + suffix
+
+
+def _unlink_exclude_temp(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise WorktreeError(
+            f"unable to remove temporary repository-local exclude {path}: {error}"
+        ) from error
+
+
+def _write_exclude_temp(path: Path, payload: bytes, mode: int | None) -> None:
+    created = False
+    try:
+        with path.open("xb") as stream:
+            created = True
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if mode is not None:
+            os.chmod(path, mode)
+    except OSError as error:
+        # ``xb`` may fail because a stale temp path already exists.  Only
+        # unlink a file after this invocation successfully created it.
+        if created:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                raise WorktreeError(
+                    f"unable to remove temporary repository-local exclude {path}: "
+                    f"{cleanup_error}; original write error: {error}"
+                ) from error
+        raise WorktreeError(
+            f"unable to write temporary repository-local exclude {path}: {error}"
+        ) from error
+
+
+def initialize_local_excludes(
+    root: Path, prompt_id: str, worktree: Path
+) -> ExcludeResult:
+    """Initialize and verify this cycle's repository-local ignore rules.
+
+    The replacement is intentionally bounded: one concurrent byte drift may
+    trigger a complete recomputation, while a second drift fails closed.
+    """
+
+    root = _repo_root(Path(root))
+    exclude = _repository_local_exclude(root)
+    targets = _exclude_targets(root, prompt_id, worktree)
+
+    for attempt in range(2):
+        existed, original = _read_exclude_bytes(exclude)
+        missing: list[tuple[str, str]] = []
+        for relative, rule in targets:
+            if not _ignore_status(root, relative):
+                missing.append((relative, rule))
+        if not missing:
+            return ExcludeResult(
+                path=exclude,
+                changed=False,
+                verified_paths=tuple(relative for relative, _ in targets),
+            )
+
+        candidate = _exclude_candidate(original, [rule for _, rule in missing])
+        if candidate == original and existed:
+            # The missing behavior is caused by a higher-precedence rule (for
+            # example a project-level negation); duplicating identical text
+            # cannot repair it and would violate idempotence.
+            _raise_unignored(root, missing[0][0], label="ignore target")
+
+        temporary = exclude.parent / f".{exclude.name}.{uuid.uuid4().hex}.tmp"
+        mode: int | None = None
+        if existed:
+            try:
+                mode = stat.S_IMODE(exclude.stat().st_mode)
+            except OSError as error:
+                raise WorktreeError(
+                    f"unable to inspect repository-local exclude {exclude}: {error}"
+                ) from error
+        temporary_owned = False
+        try:
+            try:
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                raise WorktreeError(
+                    f"unable to prepare repository-local exclude directory "
+                    f"{exclude.parent}: {error}"
+                ) from error
+            _write_exclude_temp(temporary, candidate, mode)
+            temporary_owned = True
+            current_exists, current = _read_exclude_bytes(exclude)
+            if current_exists != existed or current != original:
+                if attempt == 1:
+                    raise WorktreeError(
+                        "repository-local exclude changed concurrently before replacement"
+                    )
+                continue
+            try:
+                os.replace(temporary, exclude)
+            except OSError as error:
+                raise WorktreeError(
+                    f"unable to replace repository-local exclude {exclude}: {error}"
+                ) from error
+        finally:
+            if temporary_owned and temporary.exists():
+                _unlink_exclude_temp(temporary)
+
+        missing_after = [
+            relative
+            for relative, _ in targets
+            if not _ignore_status(root, relative)
+        ]
+        if missing_after:
+            _raise_unignored(root, missing_after[0], label="ignore target")
+        return ExcludeResult(
+            path=exclude,
+            changed=True,
+            verified_paths=tuple(relative for relative, _ in targets),
+        )
+
+    # The loop either returns or raises on the second drift.  Keep a defensive
+    # guard in case its bounds are changed during future maintenance.
+    raise WorktreeError("repository-local exclude initialization did not complete")
+
+
+def _require_ignored_worktree(root: Path, target: Path) -> None:
+    try:
+        relative = target.relative_to(root).as_posix() + "/"
+    except ValueError as error:
+        raise WorktreeError("derived worktree path escapes the original repository") from error
+    _raise_unignored(root, relative, label="worktree directory")
+
+
+def _runtime_ignore_paths(cycle: WorktreeCycle) -> tuple[str, str]:
+    if cycle.prompt_id is None:
+        raise WorktreeError("cycle prompt_id is required to verify runtime ignores")
+    prompt_id = _validate_exclude_prompt_id(cycle.prompt_id)
+    return (
+        f".prompt-evals/{prompt_id}/reports/",
+        f".prompt-evals/{prompt_id}/.runtime/",
+    )
+
+
+def verify_runtime_ignores(cycle: WorktreeCycle) -> tuple[str, str]:
+    """Verify both runtime output directories from the linked worktree."""
+
+    if not isinstance(cycle, WorktreeCycle):
+        raise TypeError("verify_runtime_ignores expects a WorktreeCycle")
+    _validate_managed_cycle(cycle)
+    paths = _runtime_ignore_paths(cycle)
+    for relative in paths:
+        _raise_unignored(cycle.worktree, relative, label="runtime path")
+    return paths
 
 
 def create_cycle(
@@ -777,6 +1064,7 @@ def create_cycle(
     *,
     branch: str | None = None,
     prompt_path: Path | str | None = None,
+    state_path: Path | None = None,
 ) -> WorktreeCycle:
     """Create a dedicated branch/worktree rooted at the original ``HEAD``."""
 
@@ -844,10 +1132,22 @@ def create_cycle(
     selected_worktree = _cycle_worktree_path(root, prompt_id, identity)
     if selected_worktree.exists():
         raise WorktreeError(f"worktree path already exists: {selected_worktree}")
+    if state_path is not None:
+        # Reject a state location inside the not-yet-created cycle before the
+        # initializer or any worktree/branch creation can leave resources
+        # without an authoritative recovery file.
+        provisional = WorktreeCycle(root, selected_worktree, selected_branch, base)
+        _validate_state_path(provisional, Path(state_path))
+    exclude_result = initialize_local_excludes(root, prompt_id, selected_worktree)
+    if selected_worktree.relative_to(root).as_posix() + "/" not in exclude_result.verified_paths:
+        raise WorktreeError(
+            "worktree directory is not covered by repository-local exclude initialization: "
+            f"{selected_worktree.relative_to(root).as_posix()}/"
+        )
     _require_ignored_worktree(root, selected_worktree)
     selected_worktree.parent.mkdir(parents=True, exist_ok=True)
     _git(root, "worktree", "add", "-b", selected_branch, str(selected_worktree), base)
-    return WorktreeCycle(
+    cycle = WorktreeCycle(
         original_repo=root,
         worktree=selected_worktree,
         branch=selected_branch,
@@ -857,7 +1157,43 @@ def create_cycle(
         branch_ref=f"refs/heads/{selected_branch}",
         branch_origin="custom" if branch is not None else "generated",
         branch_created_by_cycle=True,
+        exclude_initialized=True,
+        precreate_ignore_verified=True,
     )
+    if state_path is not None:
+        try:
+            save_cycle(cycle, Path(state_path))
+        except BaseException as error:
+            wrapped = WorktreeError(
+                "unable to persist created cycle identity: "
+                f"state={Path(state_path)}; worktree={cycle.worktree}; "
+                f"branch={cycle.branch}: {error}"
+            )
+            setattr(wrapped, "cycle", cycle)
+            raise wrapped from error
+    try:
+        verify_runtime_ignores(cycle)
+    except BaseException as error:
+        wrapped = WorktreeError(
+            "post-create runtime ignore gate failed: "
+            f"state={Path(state_path) if state_path is not None else '<not persisted>'}; "
+            f"worktree={cycle.worktree}; branch={cycle.branch}: {error}"
+        )
+        setattr(wrapped, "cycle", cycle)
+        raise wrapped from error
+    cycle = replace(cycle, runtime_ignores_verified=True)
+    if state_path is not None:
+        try:
+            save_cycle(cycle, Path(state_path))
+        except BaseException as error:
+            wrapped = WorktreeError(
+                "unable to persist completed ignore gates: "
+                f"state={Path(state_path)}; worktree={cycle.worktree}; "
+                f"branch={cycle.branch}: {error}"
+            )
+            setattr(wrapped, "cycle", replace(cycle, runtime_ignores_verified=False))
+            raise wrapped from error
+    return cycle
 
 
 def _changed_paths(cycle: WorktreeCycle, final_commit: str) -> tuple[str, ...]:
@@ -1720,6 +2056,9 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--state", type=Path, required=True)
     create.add_argument("--branch")
 
+    verify_ignores = commands.add_parser("verify-ignores")
+    verify_ignores.add_argument("--state", type=Path, required=True)
+
     build = commands.add_parser("build-patch")
     build.add_argument("--state", type=Path, required=True)
     build.add_argument("--out", type=Path, required=True)
@@ -1738,28 +2077,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "create":
-            cycle = create_cycle(
-                args.repo,
-                args.prompt_id,
-                branch=args.branch,
-            )
             try:
-                save_cycle(cycle, args.state)
+                cycle = create_cycle(
+                    args.repo,
+                    args.prompt_id,
+                    branch=args.branch,
+                    state_path=args.state,
+                )
             except Exception as error:
+                retained = getattr(error, "cycle", None)
+                payload: dict[str, object] = {
+                    "status": "error",
+                    "error": str(error),
+                }
+                if isinstance(retained, WorktreeCycle):
+                    payload.update(
+                        {
+                            "state": str(args.state),
+                            "worktree": str(retained.worktree),
+                            "branch": retained.branch,
+                        }
+                    )
                 print(
                     json.dumps(
-                        {
-                            "status": "error",
-                            "error": str(error),
-                            "worktree": str(cycle.worktree),
-                            "branch": cycle.branch,
-                        },
+                        payload,
                         ensure_ascii=False,
                         sort_keys=True,
                     )
                 )
                 return 2
             print(json.dumps(cycle.to_dict(), ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.command == "verify-ignores":
+            cycle = load_cycle(args.state, require_current=True)
+            verified_paths = verify_runtime_ignores(cycle)
+            cycle = replace(cycle, runtime_ignores_verified=True)
+            save_cycle_atomic(cycle, args.state)
+            print(
+                json.dumps(
+                    {
+                        "status": "verified",
+                        "state": str(args.state),
+                        "paths": list(verified_paths),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
             return 0
         cycle = load_cycle(args.state)
         if args.command == "build-patch":
@@ -1787,8 +2151,10 @@ __all__ = [
     "DeliveryConflict",
     "DeliveryError",
     "DeliveryPatch",
+    "ExcludeResult",
     "FAILURE_ALLOWLIST",
     "FinalizationState",
+    "MANAGED_EXCLUDES",
     "Patch",
     "PatchError",
     "SUCCESS_ALLOWLIST",
@@ -1798,6 +2164,7 @@ __all__ = [
     "apply_delivery_patch",
     "build_delivery_patch",
     "create_cycle",
+    "initialize_local_excludes",
     "load_cycle",
     "load_patch",
     "main",
@@ -1805,6 +2172,7 @@ __all__ = [
     "save_cycle",
     "save_cycle_atomic",
     "save_patch",
+    "verify_runtime_ignores",
 ]
 
 

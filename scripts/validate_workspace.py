@@ -30,6 +30,10 @@ class WorkspaceError(RuntimeError):
     """Raised when a workspace cannot be safely evaluated."""
 
 
+class RuntimeIgnoreError(WorkspaceError):
+    """Raised when verify mode cannot prove its output paths are ignored."""
+
+
 @dataclass(frozen=True)
 class WorkspaceSnapshot:
     """The repository facts that must stay fixed for an evaluation cycle."""
@@ -68,7 +72,11 @@ def prompt_id_for_path(path: str) -> str:
     return f"{slug}--{suffix}"
 
 
-def _git(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def _git(
+    repo_root: Path,
+    *arguments: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
             ["git", *arguments],
@@ -80,7 +88,7 @@ def _git(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         )
     except OSError as exc:
         raise WorkspaceError(f"unable to run git: {exc}") from exc
-    if result.returncode != 0:
+    if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         if detail:
             raise WorkspaceError(f"git {' '.join(arguments)} failed: {detail}")
@@ -91,6 +99,64 @@ def _git(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
 def _git_lines(repo_root: Path, *arguments: str) -> list[str]:
     result = _git(repo_root, *arguments)
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def validate_runtime_ignores(repo_root: Path, prompt_id: str) -> tuple[str, str]:
+    """Read-only verification of the two runtime output directories.
+
+    Verify mode is intentionally not allowed to repair the repository-local
+    exclude.  The caller receives the concrete failed path and Git's safe
+    diagnostic so it can stop before creating output or invoking a model.
+    """
+
+    if (
+        not isinstance(prompt_id, str)
+        or not prompt_id.strip()
+        or "\x00" in prompt_id
+        or "/" in prompt_id
+        or "\\" in prompt_id
+        or prompt_id in {".", ".."}
+        or not re.fullmatch(r"[A-Za-z0-9._-]+", prompt_id)
+    ):
+        raise RuntimeIgnoreError("prompt_id is not a safe evaluation directory name")
+    root = Path(repo_root).resolve(strict=False)
+    paths = (
+        f".prompt-evals/{prompt_id}/reports/",
+        f".prompt-evals/{prompt_id}/.runtime/",
+    )
+    for relative in paths:
+        result = _git(
+            root,
+            "check-ignore",
+            "--no-index",
+            "--quiet",
+            "--",
+            relative,
+            check=False,
+        )
+        if result.returncode == 0:
+            continue
+        if result.returncode != 1:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeIgnoreError(
+                f"unable to verify runtime ignore for {relative}: "
+                f"{detail or 'git check-ignore failed'}"
+            )
+        diagnostic_result = _git(
+            root,
+            "check-ignore",
+            "--no-index",
+            "-v",
+            "--",
+            relative,
+            check=False,
+        )
+        diagnostic = (diagnostic_result.stdout or diagnostic_result.stderr).strip()
+        raise RuntimeIgnoreError(
+            f"runtime path is not ignored: {relative}; "
+            f"git check-ignore -v: {diagnostic or 'no matching ignore rule'}"
+        )
+    return paths
 
 
 def _ensure_kds_environment() -> None:
@@ -241,7 +307,11 @@ def _validate_file_target(repo_root: Path, path: Path, *, label: str) -> str:
 
 
 def validate_workspace(
-    repo_root: Path, prompt_path: Path, dependency_paths: Sequence[Path]
+    repo_root: Path,
+    prompt_path: Path,
+    dependency_paths: Sequence[Path],
+    *,
+    mode: str = "tune",
 ) -> WorkspaceSnapshot:
     """Validate and snapshot one clean prompt plus its critical dependencies.
 
@@ -289,6 +359,13 @@ def validate_workspace(
 
     prompt_id = prompt_id_for_path(prompt_relative)
     _validate_recorded_contract(requested_root, prompt_relative, prompt_id)
+    if mode not in {"tune", "verify"}:
+        raise WorkspaceError("workspace validation mode must be tune or verify")
+    # A bare repository with no evaluation directory is still useful to the
+    # existing snapshot API.  Once verify has a concrete evaluation root,
+    # enforce the runtime ignore gate before its output path can be written.
+    if mode == "verify" and (requested_root / ".prompt-evals").is_dir():
+        validate_runtime_ignores(requested_root, prompt_id)
     prompt_hash = hashlib.sha256(prompt_resolved.read_bytes()).hexdigest()
 
     return WorkspaceSnapshot(
@@ -362,15 +439,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = _parser().parse_args(argv)
     try:
-        snapshot = validate_workspace(args.repo, args.prompt, ())
+        snapshot = validate_workspace(args.repo, args.prompt, (), mode=args.mode)
         payload = _snapshot_payload(snapshot, args.mode)
         _write_json(args.output, payload)
     except (WorkspaceError, OSError, ValueError, TypeError) as error:
         payload = {"status": "error", "error": _safe_error(error)}
-        try:
-            _write_json(args.output, payload)
-        except OSError as write_error:
-            payload["error"] = f"{payload['error']}; unable to write output: {_safe_error(write_error)}"
+        if not isinstance(error, RuntimeIgnoreError):
+            try:
+                _write_json(args.output, payload)
+            except OSError as write_error:
+                payload["error"] = f"{payload['error']}; unable to write output: {_safe_error(write_error)}"
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 2
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -378,10 +456,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "RuntimeIgnoreError",
     "WorkspaceError",
     "WorkspaceSnapshot",
     "main",
     "prompt_id_for_path",
+    "validate_runtime_ignores",
     "validate_workspace",
 ]
 

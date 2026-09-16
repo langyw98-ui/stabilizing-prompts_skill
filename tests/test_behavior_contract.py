@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from scripts.local_model_client import safe_client_config
-from scripts.manage_worktree import WorktreeError
+from scripts.manage_worktree import initialize_local_excludes
 from scripts.validate_workspace import prompt_id_for_path
 from scripts.run_prompt_eval import _redacted, _safe_serialize
 from tests.integration_support import (
@@ -21,6 +21,11 @@ def test_cli_chain_uses_production_renderer_and_schema_without_duplicate_contrac
     tmp_path: Path,
 ) -> None:
     target_repo = build_target_repo(tmp_path / "target-repo", complete_assets=True)
+    initialize_local_excludes(
+        target_repo,
+        prompt_id_for_path("prompts/classify.md"),
+        target_repo / ".worktrees" / "stabilizing-prompts" / "cli-probe",
+    )
 
     evidence = run_cli_chain(target_repo)
 
@@ -42,11 +47,12 @@ def test_delivery_rollback_restores_exact_targets_after_post_apply_failure(tmp_p
     assert not result.partially_delivered_paths
 
 
-def test_tune_rejects_unignored_project_local_worktree_before_model_call(
+def test_tune_initializes_repository_local_excludes_before_model_call(
     tmp_path: Path,
 ) -> None:
     target_repo = build_target_repo(tmp_path / "target-repo")
-    (target_repo / ".git" / "info" / "exclude").write_text("", encoding="utf-8")
+    exclude = target_repo / ".git" / "info" / "exclude"
+    exclude.write_text("", encoding="utf-8")
     (target_repo / ".gitignore").write_text(
         ".prompt-evals/**/reports/\n"
         ".prompt-evals/**/.runtime/\n"
@@ -54,12 +60,19 @@ def test_tune_rejects_unignored_project_local_worktree_before_model_call(
         "*.pyc\n",
         encoding="utf-8",
     )
-    transport = CountingTransport()
+    transport = CountingTransport(scenario="no-change")
 
-    with pytest.raises(WorktreeError, match="not ignored"):
-        run_tune_with_fake_transport(target_repo, transport=transport)
+    result = run_tune_with_fake_transport(
+        target_repo,
+        scenario="no-change",
+        transport=transport,
+    )
 
-    assert transport.call_count == 0
+    assert result.stop_reason == "no_change_needed"
+    assert transport.call_count > 0
+    assert "/.worktrees/stabilizing-prompts/" in exclude.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_tune_creates_project_local_worktree_before_model_call(tmp_path: Path) -> None:

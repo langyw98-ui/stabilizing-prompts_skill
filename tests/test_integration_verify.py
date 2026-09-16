@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from scripts import run_prompt_eval as runner_module
+from scripts import validate_workspace as workspace_module
 from tests.integration_support import (
     CountingTransport,
     build_target_repo,
@@ -135,6 +136,48 @@ def test_verify_does_not_create_candidate_or_modify_canonical_assets(target_repo
         and "__pycache__" not in path.parts
     }
     assert tracked_after == tracked_before
+
+
+def test_verify_missing_runtime_ignores_is_read_only_before_output_or_model(
+    target_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exclude = target_repo / ".git" / "info" / "exclude"
+    before = exclude.read_bytes()
+    project_ignore = target_repo / ".gitignore"
+    project_ignore.write_text(
+        "\n".join(
+            line
+            for line in project_ignore.read_text(encoding="utf-8").splitlines()
+            if "reports" not in line and ".runtime" not in line
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "workspace.json"
+    transport = CountingTransport()
+    monkeypatch.setattr(workspace_module, "_ensure_kds_environment", lambda: None)
+
+    code = workspace_module.main(
+        [
+            "--repo",
+            str(target_repo),
+            "--prompt",
+            "prompts/classify.md",
+            "--mode",
+            "verify",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert code == 2
+    assert "runtime path" in capsys.readouterr().out
+    assert exclude.read_bytes() == before
+    assert not output.exists()
+    assert transport.call_count == 0
 
 
 def test_project_transport_setting_is_ignored_by_production_client_path(

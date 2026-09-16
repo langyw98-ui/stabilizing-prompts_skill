@@ -97,6 +97,225 @@ def make_repo(path: Path) -> tuple[Path, str]:
     return path, prompt_id
 
 
+def _exclude_path(repo: Path) -> Path:
+    value = Path(git(repo, "rev-parse", "--git-path", "info/exclude"))
+    return value if value.is_absolute() else repo / value
+
+
+def test_create_cycle_initializes_repository_local_excludes(tmp_path: Path) -> None:
+    original, prompt_id = make_repo(tmp_path / "repo")
+    (original / ".gitignore").write_text("", encoding="utf-8")
+    _exclude_path(original).write_bytes(b"")
+
+    cycle = create_cycle(original, prompt_id)
+
+    text = _exclude_path(original).read_text(encoding="utf-8")
+    assert "/.worktrees/stabilizing-prompts/" in text
+    assert "/.prompt-evals/*/reports/" in text
+    assert "/.prompt-evals/*/.runtime/" in text
+    assert cycle.exclude_initialized is True
+    assert cycle.precreate_ignore_verified is True
+    assert cycle.runtime_ignores_verified is True
+
+
+def test_postcreate_ignore_failure_retains_persisted_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original, prompt_id = make_repo(tmp_path / "repo")
+    state = tmp_path / "cycle.json"
+    monkeypatch.setattr(
+        manage_worktree,
+        "verify_runtime_ignores",
+        lambda cycle: (_ for _ in ()).throw(
+            WorktreeError("runtime path is not ignored")
+        ),
+        raising=False,
+    )
+
+    with pytest.raises(WorktreeError, match="runtime path is not ignored"):
+        create_cycle(original, prompt_id, state_path=state)
+
+    retained = load_cycle(state, require_current=True)
+    assert retained.worktree.is_dir()
+    assert retained.branch_created_by_cycle is True
+    assert retained.runtime_ignores_verified is False
+
+
+def test_verify_ignores_cli_updates_state_only_after_both_paths_pass(
+    repo: tuple[Path, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    original, prompt_id = repo
+    state = tmp_path / "cycle.json"
+    cycle = create_cycle(original, prompt_id, state_path=state)
+    assert cycle.runtime_ignores_verified is True
+
+    exclude = _exclude_path(original)
+    before = exclude.read_bytes()
+    result = main(["verify-ignores", "--state", str(state)])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 0
+    assert payload["status"] == "verified"
+    assert exclude.read_bytes() == before
+    assert load_cycle(state, require_current=True).runtime_ignores_verified is True
+
+
+def test_local_exclude_preserves_bytes_without_trailing_newline(
+    repo: tuple[Path, str],
+) -> None:
+    original, prompt_id = repo
+    exclude = _exclude_path(original)
+    existing = b"# user rule\r\ncustom-pattern"
+    exclude.write_bytes(existing)
+    worktree = original / ".worktrees" / "stabilizing-prompts" / "path with spaces"
+
+    result = manage_worktree.initialize_local_excludes(original, prompt_id, worktree)
+
+    updated = exclude.read_bytes()
+    assert result.changed is True
+    assert updated.startswith(existing + b"\n")
+    assert updated.count(b"# stabilizing-prompts managed local excludes") == 1
+
+
+def test_local_exclude_second_call_is_byte_identical(repo: tuple[Path, str]) -> None:
+    original, prompt_id = repo
+    worktree = original / ".worktrees" / "stabilizing-prompts" / "cycle"
+
+    first = manage_worktree.initialize_local_excludes(original, prompt_id, worktree)
+    before = _exclude_path(original).read_bytes()
+    second = manage_worktree.initialize_local_excludes(original, prompt_id, worktree)
+
+    assert first.changed is True
+    assert second.changed is False
+    assert _exclude_path(original).read_bytes() == before
+
+
+def test_local_exclude_partial_rules_only_fill_missing_rules(
+    repo: tuple[Path, str],
+) -> None:
+    original, prompt_id = repo
+    exclude = _exclude_path(original)
+    exclude.write_bytes(b"/.worktrees/stabilizing-prompts/\n")
+    worktree = original / ".worktrees" / "stabilizing-prompts" / "cycle"
+
+    manage_worktree.initialize_local_excludes(original, prompt_id, worktree)
+
+    updated = exclude.read_text(encoding="utf-8")
+    assert updated.count("/.worktrees/stabilizing-prompts/") == 1
+    assert updated.count("/.prompt-evals/*/reports/") == 1
+    assert updated.count("/.prompt-evals/*/.runtime/") == 1
+
+
+def test_local_exclude_wider_rules_do_not_change_bytes(repo: tuple[Path, str]) -> None:
+    original, prompt_id = repo
+    exclude = _exclude_path(original)
+    existing = b"/.worktrees/\n/.prompt-evals/\n"
+    exclude.write_bytes(existing)
+    worktree = original / ".worktrees" / "stabilizing-prompts" / "cycle"
+
+    result = manage_worktree.initialize_local_excludes(original, prompt_id, worktree)
+
+    assert result.changed is False
+    assert exclude.read_bytes() == existing
+
+
+def test_local_exclude_recomputes_once_after_first_drift(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    exclude = _exclude_path(original)
+    exclude.write_bytes(b"user-rule\n")
+    worktree = original / ".worktrees" / "stabilizing-prompts" / "cycle"
+    real_read = manage_worktree._read_exclude_bytes
+    reads = 0
+
+    def drift_once(path: Path) -> tuple[bool, bytes]:
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            path.write_bytes(path.read_bytes() + b"concurrent-rule\n")
+        return real_read(path)
+
+    monkeypatch.setattr(manage_worktree, "_read_exclude_bytes", drift_once)
+
+    result = manage_worktree.initialize_local_excludes(original, prompt_id, worktree)
+
+    assert result.changed is True
+    assert reads == 4
+    assert b"concurrent-rule\n" in exclude.read_bytes()
+    assert list(exclude.parent.glob(f".{exclude.name}.*.tmp")) == []
+
+
+def test_local_exclude_fails_closed_after_second_drift(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    exclude = _exclude_path(original)
+    exclude.write_bytes(b"user-rule\n")
+    worktree = original / ".worktrees" / "stabilizing-prompts" / "cycle"
+    real_read = manage_worktree._read_exclude_bytes
+    reads = 0
+
+    def drift_twice(path: Path) -> tuple[bool, bytes]:
+        nonlocal reads
+        reads += 1
+        if reads in {2, 4}:
+            path.write_bytes(path.read_bytes() + f"drift-{reads}\n".encode())
+        return real_read(path)
+
+    monkeypatch.setattr(manage_worktree, "_read_exclude_bytes", drift_twice)
+
+    with pytest.raises(WorktreeError, match="changed concurrently"):
+        manage_worktree.initialize_local_excludes(original, prompt_id, worktree)
+
+    assert reads == 4
+    assert b"drift-4\n" in exclude.read_bytes()
+    assert list(exclude.parent.glob(f".{exclude.name}.*.tmp")) == []
+
+
+def test_local_exclude_replace_failure_preserves_original_and_cleans_temp(
+    repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, prompt_id = repo
+    exclude = _exclude_path(original)
+    existing = b"user-rule\n"
+    exclude.write_bytes(existing)
+    worktree = original / ".worktrees" / "stabilizing-prompts" / "cycle"
+
+    monkeypatch.setattr(
+        manage_worktree.os,
+        "replace",
+        lambda source, target: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(WorktreeError, match="replace failed"):
+        manage_worktree.initialize_local_excludes(original, prompt_id, worktree)
+
+    assert exclude.read_bytes() == existing
+    assert list(exclude.parent.glob(f".{exclude.name}.*.tmp")) == []
+
+
+def test_another_local_exclude_initializer_completes_remaining_rules(
+    repo: tuple[Path, str],
+) -> None:
+    original, prompt_id = repo
+    exclude = _exclude_path(original)
+    exclude.write_bytes(b"/.worktrees/stabilizing-prompts/\n")
+    worktree = original / ".worktrees" / "stabilizing-prompts" / "cycle"
+
+    first = manage_worktree.initialize_local_excludes(original, prompt_id, worktree)
+    second = manage_worktree.initialize_local_excludes(original, prompt_id, worktree)
+
+    assert first.changed is True
+    assert second.changed is False
+    text = exclude.read_text(encoding="utf-8")
+    assert text.count("# stabilizing-prompts managed local excludes") == 1
+    assert all(rule in text for rule in manage_worktree.MANAGED_EXCLUDES)
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> tuple[Path, str]:
     return make_repo(tmp_path / "repo")
@@ -344,7 +563,9 @@ def test_loaded_cycle_rejects_symlink_alias_inside_managed_root(
         load_cycle(state_path)
 
 
-def test_create_cycle_rejects_special_child_only_ignore(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_create_cycle_initializes_when_project_has_no_managed_ignore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     original, prompt_id = make_repo(tmp_path / "repo")
     _freeze_cycle_uuid(monkeypatch)
     (original / ".gitignore").write_text(
@@ -353,15 +574,12 @@ def test_create_cycle_rejects_special_child_only_ignore(tmp_path: Path, monkeypa
     (original / ".git" / "info" / "exclude").write_text("", encoding="utf-8")
     git(original, "add", ".gitignore")
     git(original, "commit", "-m", "ignore only probe")
-    before_branches = git(original, "branch", "--format=%(refname:short)")
-    before_files = snapshot_filesystem(original)
+    cycle = create_cycle(original, prompt_id)
 
-    with pytest.raises(WorktreeError, match="ignored"):
-        create_cycle(original, prompt_id)
-
-    assert git(original, "branch", "--format=%(refname:short)") == before_branches
-    assert snapshot_filesystem(original) == before_files
-    assert not (original / ".worktrees").exists()
+    assert cycle.worktree.is_dir()
+    assert "/.worktrees/stabilizing-prompts/" in _exclude_path(original).read_text(
+        encoding="utf-8"
+    )
 
 
 def test_create_cycle_api_rejects_removed_worktree_keyword(
