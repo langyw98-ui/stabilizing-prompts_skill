@@ -7,6 +7,7 @@
 
 | 修订 | 日期 | 变更内容 |
 | --- | --- | --- |
+| 4 | 2026-09-16 | 明确自定义周期分支的创建所有权与清理门禁，并为 local exclude 初始化增加有限乐观并发保护。 |
 | 3 | 2026-09-16 | 新增文档内历史变更记录。 |
 | 2 | 2026-09-16 | 收紧 worktree 清理范围，明确双 commit、单一状态文件及确定性 cleanliness 合同。 |
 | 1 | 2026-09-16 | 整合 local-exclude 初始化与 finalization/delivery/cleanup 设计，形成独立最终态规范。 |
@@ -154,6 +155,8 @@ __pycache__/
 - 自动写入仅限当前仓库由 Git 解析出的 repository-local exclude 文件。
 - 必须逐字保留用户已有 exclude 内容，不删除、排序、规范化或重写其规则和注释。
 - 初始化必须幂等；重复执行不能生成第二个管理块或重复规则。
+- 初始化必须检测读取后发生的普通并发漂移，最多基于最新字节重算一次；持续
+  漂移 fail closed，不引入长期文件锁或无限重试。
 - 不承诺绕过使 repository-local exclude 失效的项目级否定规则；最终
   `git check-ignore` 结果是安全依据。
 - `verify` 仍是只读工作流，不因本设计获得修改 repository-local exclude 的
@@ -171,6 +174,11 @@ __pycache__/
   `git gc --prune`、`git worktree prune` 或其他仓库级破坏性命令。
 - 清理只作用于当前周期精确记录且重新验证的 managed worktree、周期分支和临时
   状态，不能触碰已交付评测目录、远端分支、默认/当前分支或其他周期。
+- 自动生成的周期分支必须位于 `stabilizing-prompts/...` 命名空间；调用者指定的
+  自定义分支可以使用其他合法名称，但只能在创建时确认该完整本地 ref 原先不
+  存在，并在状态中记录 `branch_ref`、`branch_origin` 和
+  `branch_created_by_cycle`；清理前重新验证精确 ref、commit 和 worktree 身份后
+  才能删除。
 - `.worktrees/` 是保留的仓库容器；当前周期目录必须完整移除，
   `.worktrees/stabilizing-prompts/` 仅在变空时删除，任何其他周期或用户 worktree
   都不得为了使容器为空而被删除。
@@ -265,8 +273,10 @@ repository-local exclude 初始化：
    `.git/info/exclude` 字符串拼接假定实际位置。
 2. 将解析结果约束到当前仓库的 shared Git metadata，以兼容普通仓库、linked
    worktree 和 Prompt 仓库自身为 submodule 的场景。
-3. 读取并逐字保留原文件；只有实际覆盖不足时才追加管理规则。
-4. 原文件非空且没有结尾换行时，先增加一个分隔换行。
+3. 以二进制方式读取原文件的原始字节快照并逐字保留；先查询三个具体目标的实际
+   Git ignore 行为，全部满足时不写文件并直接成功。
+4. 只有实际覆盖不足时才基于该字节快照构造候选内容；原文件非空且没有结尾换行
+   时，先增加一个分隔换行。
 5. 使用固定注释标记建立可审计管理块，但不依赖标记判断规则是否生效：
 
    ```gitignore
@@ -276,14 +286,25 @@ repository-local exclude 初始化：
    /.prompt-evals/*/.runtime/
    ```
 
-6. 在 exclude 文件同目录写临时文件并原子替换；任何写入或替换失败都保留原文件
-   并返回精确错误。
+6. 在 exclude 文件同目录写入本次调用拥有的唯一临时文件；原子替换前重新读取
+   目标文件并与原始字节快照比较。
+7. 字节未变化时执行原子替换；任何写入或替换失败都保留原文件、精确清理本次
+   临时文件并返回错误，不使用 glob 清理。
+8. 字节已经变化时，丢弃本次临时文件并基于最新字节完整重算一次。若最新内容
+   已经满足全部 Git ignore 行为则不再写入；若第二次替换前再次漂移，则保留最新
+   文件并返回 `setup_error`。
+9. 替换成功后仍执行最终 Git 行为验证；字节保真检查不能替代
+   `git check-ignore`，后者也不能替代并发漂移检查。
 
 该设计复用 Git 自身的仓库本地、非跟踪配置边界，使 primary workspace 和新建
 linked worktree 共享规则，同时避免污染项目资产、提交历史或用户全局环境。
 满足全部可观察结果和硬约束的替代实现可以替换具体函数拆分、临时文件命名或
 管理块写法，但不能改用项目/全局配置边界，不能丢失原子性、幂等性、用户内容
 保真和最终 Git 行为验证。
+
+该有限乐观重算处理普通编辑器写入和两个初始化器并发运行，但不承诺消除最终
+字节比较与原子替换之间的理论 TOCTOU。这个残余窗口属于既定本地单用户、
+非对抗性威胁模型；不得为此增加仓库锁、长期文件锁、后台等待或无限重试。
 
 ### 6.3 两阶段验证
 
@@ -318,6 +339,7 @@ git check-ignore --no-index --quiet --
 
 - Git 无法解析 repository-local exclude 文件；
 - 文件不可读、不可写，或无法原子替换；
+- 第一次漂移后已经重算，第二次替换前仍检测到 exclude 字节漂移；
 - 解析出的 Git metadata 路径不属于当前仓库；
 - 创建前 managed worktree 目标未被忽略；
 - 创建后任一具体 `reports/` 或 `.runtime/` 路径未被忽略；
@@ -435,7 +457,8 @@ git check-ignore --no-index --quiet --
 周期清理；它不授权更宽的文件或 Git 操作。确认材料必须明确说明：删除精确
 managed worktree 会永久删除其中的 ignored 运行产物，包括 `reports/`、
 `.runtime/`、原始响应、patch、patch manifest 和临时候选，同时永久删除可见的
-本地周期分支。
+本地周期分支。确认材料必须展示将被删除的精确分支名，包括调用者指定的自定义
+分支名；自定义名称不产生“交付后保留分支”的第二终态。
 
 acceptance 通过时，确认材料还必须保留现有的 paired reports、冻结候选身份、
 Prompt diff 和各门禁结果，使用户能够核对即将交付的生产 Prompt。内部 hash 可以
@@ -555,11 +578,16 @@ verify fixed Git cleanliness
   宣告 worktree 清理成功；不得把仅删除注册或仅清空目录视为成功。
 - 当前周期目录移除后，`.worktrees/stabilizing-prompts/` 只使用非递归空目录删除；
   非空表示存在其他周期或用户内容，必须保留。`.worktrees/` 本身始终保留。
-- 分支必须是本周期记录的 `stabilizing-prompts/...` 分支，名称和 commit 都匹配；
-  当前分支、默认分支、远端分支和其他 worktree 使用的分支一律拒绝。
+- 自动生成分支必须是本周期记录的 `stabilizing-prompts/...` 完整本地 ref；自定义
+  分支可以使用其他合法名称，但状态必须记录 `branch_origin == custom`、规范化
+  `branch_ref` 和 `branch_created_by_cycle == true`。创建流程只有在确认该 ref 原先
+  不存在且 `git worktree add -b` 成功后，才能把最后一个字段写为 `true`。两类分支
+  都必须在删除前重新验证精确 ref 指向 `delivery_commit`，且当前分支、默认分支、
+  远端分支和其他 worktree 使用的分支一律拒绝。
 - `git branch -D` 是推荐且获准的操作：评测资产通过 patch 交付为原工作区未提交
   文件，周期 prepared/delivery commit 不会 merge；用户确认必须明确覆盖永久
-  删除这个可见本地分支引用。
+  删除确认材料中展示的这个可见本地分支引用。分支身份验证必须紧邻删除命令；
+  删除失败时保留 `STATE_PATH` 并停止后续步骤。
 - confirmation、delivery 和 cleanup 进度只存在于 worktree 外的单一
   `STATE_PATH`；清理器不接受其他文件删除目标。`STATE_PATH` 最后精确删除，不用
   glob 或递归目录删除。
@@ -609,8 +637,9 @@ verify fixed Git cleanliness
 
 单一 `STATE_PATH` 中的 `WorktreeCycle` 或关联 finalization 状态需要表达：
 
-- 原工作区、managed worktree、周期分支、`cycle_base_commit` 和 canonical
-  Prompt 身份；
+- 原工作区、managed worktree、周期分支的规范化完整本地 `branch_ref`、
+  `branch_origin`（`generated` 或 `custom`）、`branch_created_by_cycle == true`、
+  `cycle_base_commit` 和 canonical Prompt 身份；
 - repository-local exclude 初始化与两阶段验证结果；
 - 规范化正式结果、固定结束时间和简报仓库相对路径；
 - `prepared_commit`、可选/解析后的 `delivery_commit` 与结果对应的交付 profile；
@@ -640,10 +669,11 @@ exclude 初始化和两阶段验证应由受控 worktree 管理接口提供；�
 
 ### 10.1 迁移与兼容性
 
-新状态和自动清理只适用于包含这里所需 prepared/delivery/cleanup 字段、使用单一
-原子 `STATE_PATH` 的新周期。旧
-worktree、旧周期状态、已结束分支和外部路径不自动迁移或清理，必须由用户检查后
-另行处理。
+新状态和自动清理只适用于包含这里所需 `branch_ref`、`branch_origin`、
+`branch_created_by_cycle`、prepared/delivery/cleanup 字段并使用单一原子
+`STATE_PATH` 的新周期。缺少任一分支所有权字段或创建记录的旧状态不得通过名称
+推断所有权。旧 worktree、旧周期状态、已结束分支和外部路径不自动迁移或清理，
+必须由用户检查后另行处理。
 
 现有 `.prompt-evals/<prompt-id>/` 继续有效。新周期只在其
 `evaluation-summaries/` 下追加独立文件，并沿用既有资产身份和 allowlist 规则；
@@ -708,6 +738,10 @@ acceptance 保持每周期一次，不编辑候选也不重跑。正式结果记
   正确分隔。
 - 第二次初始化字节不变；已有等价/更宽规则不重复追加；只有部分覆盖时只补足
   缺口。
+- 第一次读取后文件发生变化时，初始化器精确删除自己的临时文件，并基于最新
+  字节最多完整重算一次；另一个初始化器已经补齐规则时直接幂等成功。
+- 用户在第一次读取后增加的内容经重算逐字保留；第二次替换前仍发生漂移时保留
+  最新文件、无临时文件残留并返回 `setup_error`。
 - 写入或原子替换失败时原文件不变并返回 `setup_error`。
 - `.gitignore`、`.git/config` 和全局配置始终不变。
 - managed worktree 目标通过创建前 gate；linked worktree 中两个具体运行目录
@@ -758,6 +792,11 @@ acceptance 保持每周期一次，不编辑候选也不重跑。正式结果记
 - 成功交付后只移除精确周期 worktree；周期目录和 Git 注册都消失后，删除空的
   `stabilizing-prompts/`、精确周期分支和单一 `STATE_PATH`，始终保留
   `.worktrees/`。
+- 自动生成分支使用受管前缀；合法自定义分支记录 `branch_ref`、`branch_origin`
+  和 `branch_created_by_cycle`，在确认材料展示精确名称并通过 commit/worktree
+  身份复核后正常删除。
+- 创建前已存在的自定义分支、缺少创建记录的旧状态、分支 ref 或 commit 漂移、
+  已成为当前/默认分支或被其他 worktree 使用的分支都拒绝删除并保留状态。
 - 当前/默认/远端分支、其他 worktree 和其他周期不受影响。
 - 每个清理步骤失败都停止后续危险步骤，并按第 9.3 节保留诊断状态和已交付资产。
 - 清理实现从不调用 `git worktree prune`、reflog expire、Git GC 或任意目标递归
