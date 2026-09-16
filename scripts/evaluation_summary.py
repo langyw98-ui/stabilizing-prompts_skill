@@ -126,9 +126,29 @@ _MACHINE_STATE_SUFFIXES = frozenset(
     {"applied", "commit", "confirmed", "state", "status", "verified"}
 )
 _MARKDOWN_META = frozenset("\\`*_{}[]()#+-.!|<>")
-_BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;\"']+")
-_AUTH_RE = re.compile(
-    r"(?i)authorization\s*[:=]\s*(?:bearer\s+)?[^\s,;\"']+"
+_CREDENTIAL_VALUE = r'''(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;"']+)'''
+_SCHEME_CREDENTIAL_RE = re.compile(
+    rf'''(?ix)
+        \b(?P<label>authorization|access[\s_-]*token|token)
+        (?P<separator>\s*(?:[:=])\s*|\s+)
+        (?P<scheme>bearer|basic|digest|hmac|mac|negotiate|ntlm|oauth2?|token)
+        \s*(?:[:=]\s*)?
+        (?P<value>{_CREDENTIAL_VALUE})
+    '''
+)
+_CREDENTIAL_RE = re.compile(
+    rf'''(?ix)
+        \b(?P<label>authorization|access[\s_-]*token|token)
+        (?P<separator>\s*(?:[:=])\s*|\s+)
+        (?P<value>{_CREDENTIAL_VALUE})
+    '''
+)
+_BEARER_RE = re.compile(
+    rf'''(?ix)
+        \bbearer
+        (?:\s*(?:[:=])\s*|\s+)
+        (?P<value>{_CREDENTIAL_VALUE})
+    '''
 )
 _PRIVATE_PATH_RE = re.compile(r"(?i)\b[A-Z]:\\[^\r\n\"']+")
 _PRIVATE_POSIX_PATH_RE = re.compile(
@@ -137,10 +157,97 @@ _PRIVATE_POSIX_PATH_RE = re.compile(
 _FORBIDDEN_TEXT_RE = re.compile(
     r"(?i)\b(?:raw\s+response|prepared_commit|delivery_commit|delivered)\b"
 )
+_BENIGN_CREDENTIAL_FOLLOWERS = frozenset(
+    {
+        "and",
+        "algorithm",
+        "based",
+        "budget",
+        "claim",
+        "claims",
+        "configured",
+        "count",
+        "encoding",
+        "expired",
+        "expiry",
+        "field",
+        "fields",
+        "flow",
+        "format",
+        "formats",
+        "handling",
+        "header",
+        "headers",
+        "is",
+        "kind",
+        "length",
+        "limit",
+        "limits",
+        "metadata",
+        "method",
+        "methods",
+        "missing",
+        "mode",
+        "name",
+        "names",
+        "optional",
+        "policy",
+        "policies",
+        "present",
+        "protocol",
+        "rate",
+        "record",
+        "records",
+        "remained",
+        "remains",
+        "required",
+        "rotation",
+        "scope",
+        "scopes",
+        "set",
+        "stable",
+        "stability",
+        "status",
+        "string",
+        "strings",
+        "type",
+        "types",
+        "usage",
+        "valid",
+        "validation",
+        "value",
+        "values",
+        "was",
+        "were",
+    }
+)
 
 
 def _normalise_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _credential_value_is_benign(value: str) -> bool:
+    candidate = value.strip("\"'").casefold().rstrip(".,;:!?)]}")
+    return candidate in _BENIGN_CREDENTIAL_FOLLOWERS
+
+
+def _redact_credential_match(match: re.Match[str]) -> str:
+    """Redact credential-shaped labels without hiding ordinary prose.
+
+    Explicit header syntax (``:``/``=``) and a Bearer scheme are unambiguous.
+    A whitespace-only label is ambiguous in prose, so retain a small set of
+    ordinary followers such as ``token count`` while treating every other
+    value as credential material.
+    """
+
+    separator = match.groupdict().get("separator", "")
+    if ":" in separator or "=" in separator or match.groupdict().get("scheme"):
+        return "[REDACTED]"
+    value = match.groupdict().get("value") or ""
+    if _credential_value_is_benign(value):
+        return match.group(0)
+    return "[REDACTED]"
 
 
 def _safe_text(value: str) -> str:
@@ -151,7 +258,8 @@ def _safe_text(value: str) -> str:
     text = _normalise_newlines(value)
     # A value must not be able to create a second Markdown line or heading.
     text = text.replace("\n", " ")
-    text = _AUTH_RE.sub("[REDACTED]", text)
+    text = _SCHEME_CREDENTIAL_RE.sub(_redact_credential_match, text)
+    text = _CREDENTIAL_RE.sub(_redact_credential_match, text)
     text = _BEARER_RE.sub("[REDACTED]", text)
     text = _PRIVATE_PATH_RE.sub("[PATH REDACTED]", text)
     text = _PRIVATE_POSIX_PATH_RE.sub("[PATH REDACTED]", text)

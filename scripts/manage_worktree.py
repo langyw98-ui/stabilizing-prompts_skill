@@ -469,6 +469,10 @@ class CleanupProgress:
     worktree_removed: bool = False
     managed_parent_handled: bool = False
     branch_deleted: bool = False
+    # A pending step is written before its destructive operation.  If the
+    # completion checkpoint cannot be persisted after that operation, a retry
+    # can distinguish its exact postcondition from an unrelated manual edit.
+    pending_step: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -476,6 +480,7 @@ class CleanupProgress:
             "worktree_removed": self.worktree_removed,
             "managed_parent_handled": self.managed_parent_handled,
             "branch_deleted": self.branch_deleted,
+            "pending_step": self.pending_step,
         }
 
     @classmethod
@@ -494,7 +499,28 @@ class CleanupProgress:
                 "cycle cleanup state contains non-boolean fields: "
                 + ", ".join(invalid)
             )
-        return cls(**{name: value.get(name, False) for name in fields})
+        pending_step = value.get("pending_step")
+        if pending_step not in (None, "worktree", "managed_parent", "branch"):
+            raise WorktreeError("cycle cleanup state contains an invalid pending step")
+        completed = {
+            name: value.get(name, False)
+            for name in fields
+        }
+        if pending_step == "worktree" and any(
+            completed[name] for name in ("worktree_removed", "managed_parent_handled", "branch_deleted")
+        ):
+            raise WorktreeError("cycle cleanup state has an out-of-order pending step")
+        if pending_step == "managed_parent" and (
+            not completed["worktree_removed"]
+            or completed["managed_parent_handled"]
+            or completed["branch_deleted"]
+        ):
+            raise WorktreeError("cycle cleanup state has an out-of-order pending step")
+        if pending_step == "branch" and (
+            not completed["managed_parent_handled"] or completed["branch_deleted"]
+        ):
+            raise WorktreeError("cycle cleanup state has an out-of-order pending step")
+        return cls(**completed, pending_step=pending_step)
 
 
 @dataclass(frozen=True, slots=True)
@@ -662,10 +688,15 @@ class WorktreeCycle:
         original_repo = Path(str(value["original_repo"]))
         worktree = Path(str(value["worktree"]))
         # A cleanup retry may load the state after its exact worktree has been
-        # removed.  The saved checkpoint is the only condition that permits
-        # that missing path; all other states still require the directory.
+        # removed.  A completed checkpoint or a durable pre-mutation intent is
+        # the only condition that permits that missing path; all other states
+        # still require the directory.
         require_worktree = not (
-            finalization is not None and finalization.cleanup.worktree_removed
+            finalization is not None
+            and (
+                finalization.cleanup.worktree_removed
+                or finalization.cleanup.pending_step == "worktree"
+            )
         )
         _validate_managed_worktree_path(
             original_repo,
@@ -711,13 +742,19 @@ class WorktreeCycle:
         )
 
 
-def _validate_managed_cycle(cycle: WorktreeCycle) -> None:
+def _validate_managed_cycle(
+    cycle: WorktreeCycle, *, require_worktree: bool = True
+) -> None:
     """Reject legacy or externally located cycle state before delivery."""
 
     root = _repo_root(cycle.original_repo)
     if root != cycle.original_repo:
         raise WorktreeError("cycle original repository is not canonical")
-    _validate_managed_worktree_path(root, cycle.worktree)
+    _validate_managed_worktree_path(
+        root,
+        cycle.worktree,
+        require_exists=require_worktree,
+    )
 
 
 def _validate_current_cycle(cycle: WorktreeCycle) -> None:
@@ -2072,6 +2109,79 @@ def _assert_branch_deleted(cycle: WorktreeCycle) -> None:
         )
 
 
+def _assert_cleanup_retry_identity(
+    cycle: WorktreeCycle, *, branch_required: bool
+) -> str:
+    """Recheck identity needed to reconcile a pending cleanup operation.
+
+    The worktree may be gone by the time a completion checkpoint is retried,
+    so this deliberately uses only shared-repository evidence and the exact
+    recorded targets.  A pending marker never bypasses ownership, delivery,
+    or primary-workspace gates; it only records that the preceding call had
+    already entered this specific destructive step.
+    """
+
+    finalization = cycle.finalization
+    if finalization is None:
+        raise WorktreeError("cleanup gate requires current finalization state")
+    if finalization.cleanup.authorized is not True:
+        raise WorktreeError("cleanup gate requires explicit cleanup authorization")
+    if finalization.delivery_applied is not True:
+        raise WorktreeError("cleanup gate requires delivery_applied=True")
+    if finalization.delivery_verified is not True:
+        raise WorktreeError("cleanup gate requires delivery_verified=True")
+
+    try:
+        _validate_managed_cycle(cycle, require_worktree=False)
+        if _path_is_within(
+            Path.cwd().resolve(strict=False), cycle.worktree.resolve(strict=False)
+        ):
+            raise WorktreeError("cleanup gate must run from outside the cycle worktree")
+        if _primary_workspace_head(cycle.original_repo) != cycle.cycle_base_commit:
+            raise WorktreeError(
+                "cleanup gate original repository HEAD is not the cycle base commit"
+            )
+        resolved_base = _git_text(
+            cycle.original_repo,
+            "rev-parse",
+            "--verify",
+            f"{cycle.cycle_base_commit}^{{commit}}",
+        )
+        if resolved_base != cycle.cycle_base_commit:
+            raise WorktreeError("cleanup gate cycle base commit is not canonical")
+        delivery_commit = _delivery_commit_for_cleanup(cycle)
+        if branch_required:
+            branch_sha = _branch_sha(cycle.original_repo, cycle.branch_ref or "")
+            if branch_sha != delivery_commit:
+                raise WorktreeError(
+                    "cleanup gate exact branch ref does not match delivery_commit"
+                )
+    except WorktreeError as error:
+        if str(error).startswith("cleanup gate"):
+            raise
+        raise WorktreeError(f"cleanup gate identity verification failed: {error}") from error
+    return delivery_commit
+
+
+def _save_cleanup_progress(
+    cycle: WorktreeCycle, state: Path, **changes: object
+) -> WorktreeCycle:
+    """Atomically save one cleanup progress transition and return its state."""
+
+    finalization = cycle.finalization
+    if finalization is None:
+        raise WorktreeError("cleanup requires current finalization state")
+    updated = replace(
+        cycle,
+        finalization=replace(
+            finalization,
+            cleanup=replace(finalization.cleanup, **changes),
+        ),
+    )
+    save_cycle_atomic(updated, state)
+    return updated
+
+
 def _unlink_cycle_state(path: Path) -> None:
     """Unlink only the exact authoritative state path."""
 
@@ -2101,20 +2211,29 @@ def cleanup_cycle(state_path: Path) -> CleanupOutcome:
     _validate_current_cycle(cycle)
     worktree_removed = progress.worktree_removed
     if not worktree_removed:
-        delivery_commit = _cleanup_first_start_gates(cycle)
-        del delivery_commit
-        _remove_cycle_worktree(cycle)
-        _assert_cycle_worktree_absent(cycle)
-        finalization = cycle.finalization
-        assert finalization is not None
-        cycle = replace(
-            cycle,
-            finalization=replace(
-                finalization,
-                cleanup=replace(finalization.cleanup, worktree_removed=True),
-            ),
-        )
-        save_cycle_atomic(cycle, state)
+        if progress.pending_step == "worktree" and not _path_present(cycle.worktree):
+            _assert_cleanup_retry_identity(cycle, branch_required=True)
+            _assert_cycle_worktree_absent(cycle)
+            cycle = _save_cleanup_progress(
+                cycle,
+                state,
+                worktree_removed=True,
+                pending_step=None,
+            )
+        else:
+            _cleanup_first_start_gates(cycle)
+            # Persist the intent before mutating the worktree.  If this save
+            # fails, no destructive action has occurred and a later retry can
+            # safely start from the original first-start gates.
+            cycle = _save_cleanup_progress(cycle, state, pending_step="worktree")
+            _remove_cycle_worktree(cycle)
+            _assert_cycle_worktree_absent(cycle)
+            cycle = _save_cleanup_progress(
+                cycle,
+                state,
+                worktree_removed=True,
+                pending_step=None,
+            )
         progress = cycle.finalization.cleanup  # type: ignore[union-attr]
         worktree_removed = True
     else:
@@ -2127,33 +2246,48 @@ def cleanup_cycle(state_path: Path) -> CleanupOutcome:
 
     parent_removed = False
     if not progress.managed_parent_handled:
-        parent_removed = _remove_managed_parent(cycle)
-        finalization = cycle.finalization
-        assert finalization is not None
-        cycle = replace(
+        if progress.pending_step == "managed_parent":
+            _assert_cleanup_retry_identity(cycle, branch_required=True)
+            parent = _managed_worktrees_root(cycle)
+            if _path_present(parent):
+                parent_removed = _remove_managed_parent(cycle)
+            else:
+                parent_removed = True
+        else:
+            cycle = _save_cleanup_progress(
+                cycle,
+                state,
+                pending_step="managed_parent",
+            )
+            parent_removed = _remove_managed_parent(cycle)
+        cycle = _save_cleanup_progress(
             cycle,
-            finalization=replace(
-                finalization,
-                cleanup=replace(finalization.cleanup, managed_parent_handled=True),
-            ),
+            state,
+            managed_parent_handled=True,
+            pending_step=None,
         )
-        save_cycle_atomic(cycle, state)
         progress = cycle.finalization.cleanup  # type: ignore[union-attr]
     else:
         parent_removed = _assert_managed_parent_handled(cycle)
 
     if not progress.branch_deleted:
-        _delete_cycle_branch(cycle)
-        finalization = cycle.finalization
-        assert finalization is not None
-        cycle = replace(
+        if progress.pending_step == "branch":
+            branch_sha = _branch_sha(cycle.original_repo, cycle.branch_ref or "")
+            if branch_sha is None:
+                _assert_cleanup_retry_identity(cycle, branch_required=False)
+                _assert_branch_deleted(cycle)
+            else:
+                _assert_cleanup_retry_identity(cycle, branch_required=True)
+                _delete_cycle_branch(cycle)
+        else:
+            cycle = _save_cleanup_progress(cycle, state, pending_step="branch")
+            _delete_cycle_branch(cycle)
+        cycle = _save_cleanup_progress(
             cycle,
-            finalization=replace(
-                finalization,
-                cleanup=replace(finalization.cleanup, branch_deleted=True),
-            ),
+            state,
+            branch_deleted=True,
+            pending_step=None,
         )
-        save_cycle_atomic(cycle, state)
     else:
         _assert_branch_deleted(cycle)
 

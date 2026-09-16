@@ -842,10 +842,43 @@ def test_cleanup_stops_when_worktree_checkpoint_save_fails(
         manage_worktree.cleanup_cycle(delivered_state)
     monkeypatch.setattr(manage_worktree, "save_cycle_atomic", real_save)
 
-    assert not cycle.worktree.exists()
+    assert cycle.worktree.exists()
     saved = json.loads(delivered_state.read_text(encoding="utf-8"))
     assert saved["finalization"]["cleanup"]["worktree_removed"] is False
     assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
+
+
+def test_cleanup_retries_after_worktree_removal_checkpoint_save_failure(
+    delivered_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_save = manage_worktree.save_cycle_atomic
+    failed = False
+
+    def fail_after_worktree_removal(saved: WorktreeCycle, path: Path) -> None:
+        nonlocal failed
+        finalization = saved.finalization
+        if (
+            not failed
+            and finalization is not None
+            and finalization.cleanup.worktree_removed
+        ):
+            failed = True
+            raise WorktreeError("worktree checkpoint save failed after removal")
+        real_save(saved, path)
+
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", fail_after_worktree_removal)
+    cycle = load_cycle(delivered_state, require_current=True)
+    with pytest.raises(WorktreeError, match="after removal"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    assert not cycle.worktree.exists()
+    saved = json.loads(delivered_state.read_text(encoding="utf-8"))
+    assert saved["finalization"]["cleanup"]["worktree_removed"] is False
+    assert saved["finalization"]["cleanup"]["pending_step"] == "worktree"
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", real_save)
+
+    assert manage_worktree.cleanup_cycle(delivered_state).status == "complete"
+    assert not delivered_state.exists()
 
 
 def test_cleanup_stops_after_managed_parent_removal_failure(
@@ -871,6 +904,80 @@ def test_cleanup_stops_after_managed_parent_removal_failure(
     assert saved.finalization.cleanup.branch_deleted is False
     assert parent.is_dir()
     assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
+
+
+def test_cleanup_retries_after_managed_parent_removal_checkpoint_save_failure(
+    delivered_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_save = manage_worktree.save_cycle_atomic
+    failed = False
+
+    def fail_after_parent_removal(saved: WorktreeCycle, path: Path) -> None:
+        nonlocal failed
+        finalization = saved.finalization
+        if (
+            not failed
+            and finalization is not None
+            and finalization.cleanup.managed_parent_handled
+        ):
+            failed = True
+            raise WorktreeError("managed parent checkpoint save failed after removal")
+        real_save(saved, path)
+
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", fail_after_parent_removal)
+    cycle = load_cycle(delivered_state, require_current=True)
+    parent = cycle.original_repo / ".worktrees" / "stabilizing-prompts"
+    with pytest.raises(WorktreeError, match="after removal"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    assert not cycle.worktree.exists()
+    assert not parent.exists()
+    saved = json.loads(delivered_state.read_text(encoding="utf-8"))
+    assert saved["finalization"]["cleanup"]["worktree_removed"] is True
+    assert saved["finalization"]["cleanup"]["managed_parent_handled"] is False
+    assert saved["finalization"]["cleanup"]["pending_step"] == "managed_parent"
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", real_save)
+
+    assert manage_worktree.cleanup_cycle(delivered_state).status == "complete"
+    assert not delivered_state.exists()
+
+
+def test_cleanup_retries_after_branch_deletion_checkpoint_save_failure(
+    delivered_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_save = manage_worktree.save_cycle_atomic
+    failed = False
+
+    def fail_after_branch_deletion(saved: WorktreeCycle, path: Path) -> None:
+        nonlocal failed
+        finalization = saved.finalization
+        if (
+            not failed
+            and finalization is not None
+            and finalization.cleanup.branch_deleted
+        ):
+            failed = True
+            raise WorktreeError("branch checkpoint save failed after deletion")
+        real_save(saved, path)
+
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", fail_after_branch_deletion)
+    cycle = load_cycle(delivered_state, require_current=True)
+    branch_ref = cycle.branch_ref
+    assert branch_ref is not None
+    with pytest.raises(WorktreeError, match="after deletion"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    assert not cycle.worktree.exists()
+    assert git(cycle.original_repo, "show-ref", "--verify", branch_ref, check=False) == ""
+    saved = json.loads(delivered_state.read_text(encoding="utf-8"))
+    assert saved["finalization"]["cleanup"]["worktree_removed"] is True
+    assert saved["finalization"]["cleanup"]["managed_parent_handled"] is True
+    assert saved["finalization"]["cleanup"]["branch_deleted"] is False
+    assert saved["finalization"]["cleanup"]["pending_step"] == "branch"
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", real_save)
+
+    assert manage_worktree.cleanup_cycle(delivered_state).status == "complete"
+    assert not delivered_state.exists()
 
 
 def test_cleanup_state_unlink_failure_preserves_completed_checkpoints(
@@ -1003,7 +1110,8 @@ def test_cleanup_rejects_reparse_alias_in_worktree_absence_postcondition(
 
     saved = json.loads(delivered_state.read_text(encoding="utf-8"))
     assert saved["finalization"]["cleanup"]["worktree_removed"] is False
-    assert calls == {"save": 0, "parent": 0, "branch": 0, "unlink": 0}
+    assert saved["finalization"]["cleanup"]["pending_step"] == "worktree"
+    assert calls == {"save": 1, "parent": 0, "branch": 0, "unlink": 0}
     assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
     assert delivered_state.exists()
 

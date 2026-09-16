@@ -166,6 +166,74 @@ def test_summary_is_deterministic_and_redacted(sample_result, sample_evidence):
     assert "delivered" not in first.casefold()
 
 
+@pytest.mark.parametrize(
+    ("location", "prose", "secret"),
+    [
+        ("stop_reason", "stopped after ToKeN: stopsecret1", "stopsecret1"),
+        ("failure_reason", "access ToKeN failuresecret2", "failuresecret2"),
+        ("coverage", "aUtHoRiZaTiOn coveragesecret3", "coveragesecret3"),
+        ("model_name", "fixed-model; bEaReR: modelsecret4", "modelsecret4"),
+        ("evidence_identity", "AUTHORIZATION identitysecret5", "identitysecret5"),
+        ("failure_bearer", "BEARER=failsecret6", "failsecret6"),
+    ],
+)
+def test_summary_redacts_credentials_in_prose_values(
+    sample_result, sample_evidence, location, prose, secret
+):
+    values = {
+        field: getattr(sample_evidence, field)
+        for field in sample_evidence.__dataclass_fields__
+    }
+    result = sample_result
+    if location == "stop_reason":
+        result = normalize_formal_result(
+            "acceptance_passed",
+            finished_at_utc="2026-09-16T08:09:10Z",
+            stop_reason=prose,
+        )
+    elif location == "failure_reason":
+        failures = [dict(failure) for failure in sample_evidence.failure_summaries]
+        failures[0]["reason"] = prose
+        values["failure_summaries"] = failures
+    elif location == "failure_bearer":
+        failures = [dict(failure) for failure in sample_evidence.failure_summaries]
+        failures[0]["reason"] = prose
+        values["failure_summaries"] = failures
+    elif location == "coverage":
+        values["coverage"] = {**sample_evidence.coverage, "saturation": prose}
+    elif location == "model_name":
+        values["model_name"] = prose
+    elif location == "evidence_identity":
+        values["evidence_identity"] = {
+            **sample_evidence.evidence_identity,
+            "mode": prose,
+        }
+    else:  # pragma: no cover - protects the parameterized test setup
+        raise AssertionError(f"unknown test location: {location}")
+
+    summary = render_summary(result, SummaryEvidence(**values))
+    assert secret not in summary
+    assert summary == render_summary(result, SummaryEvidence(**values))
+
+
+def test_summary_preserves_benign_token_and_authorization_prose(
+    sample_result, sample_evidence
+):
+    values = {
+        field: getattr(sample_evidence, field)
+        for field in sample_evidence.__dataclass_fields__
+    }
+    values["coverage"] = {
+        **sample_evidence.coverage,
+        "saturation": "token count and authorization flow remain stable",
+    }
+
+    summary = render_summary(sample_result, SummaryEvidence(**values))
+
+    assert "token count" in summary
+    assert "authorization flow" in summary
+
+
 def test_summary_has_fixed_sections_and_stable_failure_order(sample_result, sample_evidence):
     summary = render_summary(sample_result, sample_evidence)
     headings = [line for line in summary.splitlines() if line.startswith("## ")]
