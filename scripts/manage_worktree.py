@@ -13,7 +13,7 @@ failed cycle and clean it up explicitly when they are ready.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
@@ -59,6 +59,17 @@ _ASSET_NAMES = frozenset(
     }
 )
 _FORBIDDEN_SEGMENTS = frozenset({".runtime", "reports"})
+_FORMAL_RESULT_KINDS = frozenset(
+    {
+        "no_change_needed",
+        "no_strict_improvement",
+        "validation_failed",
+        "no_improvement_limit",
+        "round_limit",
+        "acceptance_failed",
+        "acceptance_passed",
+    }
+)
 
 # These are the only repository-local rules this module may initialize.  The
 # concrete paths used to prove each category are derived for the current
@@ -1325,6 +1336,118 @@ def _canonical_allowlist_paths(
     return _allowlist_paths(cycle, defaults, result=result, changed_paths=changed_paths)
 
 
+def _recorded_summary_path(cycle: WorktreeCycle) -> str:
+    """Return the one summary path recorded by the current finalization."""
+
+    finalization = cycle.finalization
+    if finalization is None:
+        raise DeliveryError("current finalization state is required for delivery")
+    prefix = _evaluation_prefix(cycle)
+    if prefix is None:
+        raise DeliveryError("current finalization state is missing prompt_id")
+    try:
+        summary = _normalize_relative(finalization.summary_path, label="summary path")
+    except AllowlistError as error:
+        raise DeliveryError("finalization summary path is unsafe") from error
+    summary_prefix = f"{prefix}evaluation-summaries/"
+    if not summary.startswith(summary_prefix) or summary == summary_prefix:
+        raise AllowlistError(
+            "finalization summary path must be under the current prompt evaluation-summaries"
+        )
+    # Finalization currently renders one summary directly in the directory.
+    # Reject nested paths so a state edit cannot broaden the delivery boundary.
+    summary_name = summary[len(summary_prefix) :]
+    if "/" in summary_name or not summary_name.casefold().endswith(".md"):
+        raise AllowlistError("finalization summary path must be one Markdown file")
+    return _reject_unsafe_delivery_path(summary, label="summary path")
+
+
+def _recorded_commit(cycle: WorktreeCycle, value: object, *, label: str) -> str:
+    """Resolve a persisted commit and require its canonical full spelling."""
+
+    if not isinstance(value, str) or not value:
+        raise DeliveryError(f"finalization is missing {label}")
+    try:
+        resolved = _git_text(
+            cycle.worktree,
+            "rev-parse",
+            "--verify",
+            f"{value}^{{commit}}",
+        )
+    except WorktreeError as error:
+        raise DeliveryError(f"finalization {label} is not a valid Git commit") from error
+    if resolved != value:
+        raise DeliveryError(f"finalization {label} must use its canonical commit ID")
+    return resolved
+
+
+def _finalization_delivery_metadata(
+    cycle: WorktreeCycle,
+    *,
+    requested_result: str | None = None,
+    requested_final: str | None = None,
+) -> tuple[str, str, frozenset[str], str, str]:
+    """Derive delivery result, commit, and paths solely from current state.
+
+    The finalization record is the trust anchor after a scored result.  A
+    caller-provided result, commit, or allowlist may narrow transport details,
+    but never changes this state-derived delivery profile.
+    """
+
+    finalization = cycle.finalization
+    if finalization is None:
+        raise DeliveryError("current finalization state is required for delivery")
+    profile = finalization.delivery_profile
+    if profile not in {"assets", "success"}:
+        raise DeliveryError("finalization contains an unknown delivery profile")
+    if finalization.result_kind not in _FORMAL_RESULT_KINDS:
+        raise DeliveryError("finalization contains an unknown formal result")
+    if profile == "success" and finalization.result_kind != "acceptance_passed":
+        raise DeliveryError("success delivery profile does not match finalization result")
+    if profile == "assets" and finalization.result_kind == "acceptance_passed":
+        raise DeliveryError("asset delivery profile does not match finalization result")
+    if finalization.delivery_confirmed is not True:
+        raise DeliveryError("delivery confirmation is required before patch generation")
+    if finalization.delivery_verified and not finalization.delivery_applied:
+        raise DeliveryError("finalization delivery verification state is inconsistent")
+
+    prepared = _recorded_commit(cycle, finalization.prepared_commit, label="prepared_commit")
+    delivery = _recorded_commit(cycle, finalization.delivery_commit, label="delivery_commit")
+    if requested_final is not None and requested_final != delivery:
+        raise DeliveryConflict("requested final commit does not match finalization delivery_commit")
+    if cycle.final_worktree_commit != delivery:
+        raise DeliveryConflict("cycle final_worktree_commit does not match finalization delivery_commit")
+    if profile == "assets" and delivery != prepared:
+        raise DeliveryConflict("asset delivery_commit must equal prepared_commit")
+    if profile == "success":
+        try:
+            parent = _git_text(cycle.worktree, "rev-parse", f"{delivery}^")
+        except WorktreeError as error:
+            raise DeliveryConflict("success delivery_commit has no prepared parent") from error
+        if parent != prepared:
+            raise DeliveryConflict("success delivery_commit is not the prepared commit's child")
+
+    current_head = _current_worktree_head(cycle)
+    if current_head != delivery:
+        raise DeliveryConflict(
+            "cycle worktree HEAD does not match finalization delivery_commit"
+        )
+    summary = _recorded_summary_path(cycle)
+    prefix = _evaluation_prefix(cycle)
+    assert prefix is not None
+    allowed = {f"{prefix}{name}" for name in _ASSET_NAMES}
+    if profile == "success":
+        prompt = _discover_prompt_path(cycle)
+        if prompt is None:
+            raise DeliveryError("success finalization has no canonical Prompt path")
+        allowed.add(_reject_unsafe_delivery_path(prompt, label="prompt path"))
+    allowed.add(summary)
+    result = "success" if profile == "success" else "failure"
+    if requested_result is not None and requested_result != result:
+        raise DeliveryError("requested delivery result does not match finalization profile")
+    return result, delivery, frozenset(allowed), summary, prepared
+
+
 def _commit_blob(cycle: WorktreeCycle, commit: str, path: str) -> bytes | None:
     type_result = _git(cycle.worktree, "cat-file", "-t", f"{commit}:{path}", check=False)
     if type_result.returncode != 0:
@@ -1472,6 +1595,26 @@ def _assert_worktree_clean(cycle: WorktreeCycle, final: str) -> None:
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", "replace").strip()
             raise DeliveryError(f"unable to inspect cycle worktree content: {detail}")
+    status = _git(
+        cycle.worktree,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=no",
+        "-z",
+        "--",
+        check=False,
+    )
+    if status.returncode != 0:
+        detail = status.stderr.decode("utf-8", "replace").strip()
+        raise DeliveryError(f"unable to inspect cycle worktree status: {detail}")
+    entries = [entry for entry in status.stdout.split(b"\x00") if entry]
+    if entries:
+        rendered = ", ".join(os.fsdecode(entry).strip() for entry in entries)
+        raise DeliveryConflict(
+            "cycle worktree contains staged, tracked, or nonignored untracked files: "
+            + rendered
+        )
 
 
 def _assert_worktree_snapshot(cycle: WorktreeCycle, patch: "DeliveryPatch") -> None:
@@ -1563,46 +1706,83 @@ def build_delivery_patch(
     allowlist: Sequence[str] | set[str] | frozenset[str] | Mapping[str, object] | None = None,
     *,
     final_commit: str | None = None,
-    result: str = "success",
+    result: str | None = None,
 ) -> DeliveryPatch:
-    """Build a patch containing only paths rejected into the allowlist boundary."""
+    """Build a patch from the canonical finalization result when available."""
 
     if not isinstance(cycle, WorktreeCycle):
         raise TypeError("build_delivery_patch expects a WorktreeCycle")
-    if result not in {"success", "failure"}:
-        raise DeliveryError("delivery result must be success or failure")
     _validate_managed_cycle(cycle)
-    final = _final_commit(cycle, final_commit)
-    _assert_prompt_contract_identity(cycle, final)
-    changed = _changed_paths(cycle, final)
-    canonical = _canonical_allowlist_paths(
-        cycle,
-        result=result,
-        changed_paths=changed,
-    )
-    if allowlist is None:
-        allowed = canonical
-    else:
-        requested = _allowlist_paths(
+    if cycle.finalization is not None:
+        result, final, canonical, summary, _prepared = _finalization_delivery_metadata(
             cycle,
-            allowlist,
-            result=result,
-            changed_paths=changed,
+            requested_result=result,
+            requested_final=final_commit,
         )
-        if not requested.issubset(canonical):
-            outside = sorted(requested - canonical)
-            raise AllowlistError(
-                "requested delivery allowlist contains unsupported paths: "
-                + ", ".join(outside)
+    else:
+        effective_result = result or "success"
+        if effective_result not in {"success", "failure"}:
+            raise DeliveryError("delivery result must be success or failure")
+        final = _final_commit(cycle, final_commit)
+        canonical = _canonical_allowlist_paths(
+            cycle,
+            result=effective_result,
+        )
+        result = effective_result
+        summary = None
+    _assert_prompt_contract_identity(cycle, final)
+    _assert_worktree_clean(cycle, final)
+    changed = _changed_paths(cycle, final)
+    if cycle.finalization is not None:
+        # Every committed change in a finalized result is part of the
+        # state-derived profile.  Silent filtering would hide tampering or an
+        # accidental extra asset, so compare the complete changed set.
+        if allowlist is not None:
+            requested = _allowlist_paths(
+                cycle,
+                allowlist,
+                result=result,
+                changed_paths=changed,
             )
-        allowed = requested
-    selected = tuple(path for path in changed if path in allowed)
+            if requested != canonical:
+                raise AllowlistError(
+                    "requested delivery allowlist does not match the finalization profile"
+                )
+        unexpected = sorted(set(changed) - canonical)
+        if unexpected:
+            raise AllowlistError(
+                "cycle changes contain paths outside the finalization delivery profile: "
+                + ", ".join(unexpected)
+            )
+        if summary not in changed:
+            raise DeliveryError("recorded evaluation summary is not part of delivery commit")
+        allowed = canonical
+        selected = changed
+    else:
+        if allowlist is None:
+            allowed = canonical
+        else:
+            requested = _allowlist_paths(
+                cycle,
+                allowlist,
+                result=result,
+                changed_paths=changed,
+            )
+            if not requested.issubset(canonical):
+                outside = sorted(requested - canonical)
+                raise AllowlistError(
+                    "requested delivery allowlist contains unsupported paths: "
+                    + ", ".join(outside)
+                )
+            allowed = requested
+        selected = tuple(path for path in changed if path in allowed)
+    selected = tuple(selected)
     source_hashes = {path: _build_source_hash(cycle, path) for path in selected}
     destination_hashes = {
         path: _build_destination_hash(cycle, final, path)
-        for path in selected
+        for path in (changed if cycle.finalization is not None else selected)
     }
-    if any(destination_hashes[path] is None for path in selected):
+    if any(destination_hashes[path] is None for path in destination_hashes):
         raise DeliveryError("deletion delivery is not supported")
     patch_text = ""
     if selected:
@@ -1633,7 +1813,7 @@ def build_delivery_patch(
         final_worktree_commit=final,
         result=result,
         prompt_path=_discover_prompt_path(cycle),
-        allowlist_paths=tuple(sorted(canonical)),
+        allowlist_paths=tuple(sorted(allowed)),
     )
 
 
@@ -1711,11 +1891,13 @@ def _index_changed(root: Path, relative: str) -> bool:
     return False
 
 
-def _canonical_delivery_patch(cycle: WorktreeCycle, *, result: str) -> DeliveryPatch:
+def _canonical_delivery_patch(
+    cycle: WorktreeCycle,
+    *,
+    result: str | None = None,
+) -> DeliveryPatch:
     """Regenerate delivery data solely from trusted cycle/worktree state."""
 
-    if result not in {"success", "failure"}:
-        raise DeliveryError("delivery result must be success or failure")
     _assert_cycle_base(cycle)
     final = _current_worktree_head(cycle)
     _assert_worktree_clean(cycle, final)
@@ -1727,13 +1909,13 @@ def _assert_supplied_patch_paths(
     supplied: DeliveryPatch,
     canonical: DeliveryPatch,
 ) -> None:
-    """Reject extra persisted paths while keeping canonical data authoritative.
+    """Reject tampered persisted delivery data while keeping state authoritative.
 
     A persisted patch is useful as an internal transport object, but it is not
-    trusted.  Only its requested result and path shape are checked; the
-    canonical patch regenerated from the cycle is what the caller applies.
-    Git parses the supplied text to catch extra sections without reproducing
-    Git's patch grammar in Python.
+    trusted.  Finalized cycles require every manifest field and the patch text
+    to equal a fresh state-derived patch; legacy cycles retain the older result
+    and path-shape compatibility check.  Git parses supplied text to catch
+    extra sections without reproducing Git's patch grammar in Python.
     """
 
     if supplied.result != canonical.result:
@@ -1742,6 +1924,21 @@ def _assert_supplied_patch_paths(
         if any(path not in canonical.allowlist_paths for path in supplied.paths):
             raise AllowlistError("patch paths do not match the canonical delivery allowlist")
         raise DeliveryError("patch paths do not match the canonical cycle diff")
+    if cycle.finalization is not None:
+        if supplied.text != canonical.text:
+            raise DeliveryError("persisted delivery patch does not match canonical cycle content")
+        if dict(supplied.source_hashes) != dict(canonical.source_hashes):
+            raise DeliveryError("patch source hashes do not match canonical cycle content")
+        if dict(supplied.destination_hashes) != dict(canonical.destination_hashes):
+            raise DeliveryError("patch destination hashes do not match canonical cycle content")
+        if supplied.cycle_base_commit != canonical.cycle_base_commit:
+            raise DeliveryError("patch cycle base commit does not match canonical cycle state")
+        if supplied.final_worktree_commit != canonical.final_worktree_commit:
+            raise DeliveryError("patch final worktree commit does not match canonical delivery state")
+        if supplied.prompt_path != canonical.prompt_path:
+            raise DeliveryError("patch Prompt identity does not match canonical cycle state")
+        if supplied.allowlist_paths != canonical.allowlist_paths:
+            raise AllowlistError("patch allowlist does not match canonical delivery profile")
     actual_paths = _native_patch_paths(cycle.original_repo, supplied.text)
     if actual_paths != canonical.paths:
         raise DeliveryError("patch sections do not match canonical delivery paths")
@@ -1794,18 +1991,30 @@ def preflight_patch(
         raise TypeError("preflight_patch expects a WorktreeCycle")
     _validate_managed_cycle(cycle)
     if patch is None:
-        canonical = _canonical_delivery_patch(cycle, result="success")
+        canonical = _canonical_delivery_patch(cycle)
     else:
-        if isinstance(patch, (str, Path)):
-            raise DeliveryError("a patch file requires its patch manifest metadata")
-        if not isinstance(patch, DeliveryPatch):
-            raise TypeError("preflight_patch expects a DeliveryPatch")
-        if not isinstance(patch.result, str) or patch.result not in {"success", "failure"}:
-            raise DeliveryError("delivery result must be success or failure")
-        # Regenerate from cycle state.  The persisted object is only checked
-        # for its result and path shape; its text and hashes are never applied.
-        canonical = _canonical_delivery_patch(cycle, result=patch.result)
-        _assert_supplied_patch_paths(cycle, patch, canonical)
+        if isinstance(patch, DeliveryPatch):
+            if not isinstance(patch.result, str) or patch.result not in {"success", "failure"}:
+                raise DeliveryError("delivery result must be success or failure")
+            # Regenerate from cycle state.  The persisted object is only checked
+            # against the canonical state and is never trusted for application.
+            canonical = _canonical_delivery_patch(cycle, result=patch.result)
+            _assert_supplied_patch_paths(cycle, patch, canonical)
+        else:
+            if isinstance(patch, Path):
+                try:
+                    supplied_text = patch.read_text(
+                        encoding="utf-8", errors="surrogateescape"
+                    )
+                except OSError as error:
+                    raise DeliveryError(f"unable to read delivery patch: {error}") from error
+            elif isinstance(patch, str):
+                supplied_text = patch
+            else:
+                raise TypeError("preflight_patch expects a DeliveryPatch, Path, or patch text")
+            canonical = _canonical_delivery_patch(cycle)
+            supplied = replace(canonical, text=supplied_text)
+            _assert_supplied_patch_paths(cycle, supplied, canonical)
     # Source checks intentionally happen immediately before Git's check.  The
     # application path repeats them after this function and before apply.
     _check_sources(cycle, canonical, expected_source_hashes)
@@ -1902,14 +2111,17 @@ def _restore_snapshots(root: Path, snapshots: Sequence[_Snapshot]) -> None:
 
 def apply_delivery_patch(
     cycle: WorktreeCycle,
-    patch: DeliveryPatch | None = None,
+    patch: DeliveryPatch | Path | str | None = None,
     *,
     expected_source_hashes: Mapping[str, object] | None = None,
+    on_verified: Callable[[DeliveryPatch], None] | None = None,
 ) -> DeliveryPatch:
     """Preflight, apply without staging, verify, and rollback on any error."""
 
     if not isinstance(cycle, WorktreeCycle):
         raise TypeError("apply_delivery_patch expects a WorktreeCycle")
+    if on_verified is not None and not callable(on_verified):
+        raise TypeError("on_verified must be callable")
     _validate_managed_cycle(cycle)
     prepared = preflight_patch(
         cycle,
@@ -1921,9 +2133,6 @@ def apply_delivery_patch(
     # transport object, supplies the bytes and hashes.
     latest = _canonical_delivery_patch(cycle, result=prepared.result)
     prepared = latest
-    if not prepared.text:
-        return prepared
-
     # Repeat source checks after preflight and immediately before snapshot/apply
     # so a concurrent user edit cannot slip between the checks.
     _check_sources(cycle, prepared, expected_source_hashes)
@@ -1940,18 +2149,22 @@ def apply_delivery_patch(
         # next to Git's mutating command as the final stale-state guard.
         _assert_cycle_base(cycle)
         _assert_prompt_contract_identity(cycle, prepared.final_worktree_commit)
-        result = _git(
-            cycle.original_repo,
-            "apply",
-            "--whitespace=nowarn",
-            "--no-3way",
-            "-",
-            input_data=prepared.text,
-            check=False,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.decode("utf-8", "replace").strip()
-            raise DeliveryConflict(f"delivery patch application failed: {detail or 'git apply failed'}")
+        if prepared.text:
+            result = _git(
+                cycle.original_repo,
+                "apply",
+                "--whitespace=nowarn",
+                "--no-3way",
+                "-",
+                input_data=prepared.text,
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = result.stderr.decode("utf-8", "replace").strip()
+                raise DeliveryConflict(
+                    "delivery patch application failed: "
+                    f"{detail or 'git apply failed'}"
+                )
         _assert_worktree_snapshot(cycle, prepared)
         for path, expected in prepared.destination_hashes.items():
             actual = _current_hash(cycle.original_repo, path)
@@ -1959,6 +2172,8 @@ def apply_delivery_patch(
                 raise DeliveryError(
                     f"destination hash mismatch for {path}: expected {expected}, got {actual}"
                 )
+        if on_verified is not None:
+            on_verified(prepared)
         return prepared
     except BaseException as error:
         # Restore even if Git partially applied a patch or verification raised.
@@ -2047,6 +2262,58 @@ def load_patch(patch_path: Path, manifest_path: Path) -> DeliveryPatch:
     return DeliveryPatch.from_dict(value, text=text)
 
 
+def _require_runtime_output(cycle: WorktreeCycle, path: Path, label: str) -> Path:
+    """Require a directly-created regular artifact in this cycle's runtime."""
+
+    if not isinstance(cycle, WorktreeCycle):
+        raise TypeError("_require_runtime_output expects a WorktreeCycle")
+    _validate_managed_cycle(cycle)
+    prefix = _evaluation_prefix(cycle)
+    if prefix is None:
+        raise DeliveryError("cycle prompt_id is required for runtime output")
+    runtime = cycle.worktree / Path(prefix) / ".runtime"
+    if not runtime.exists() or not runtime.is_dir():
+        raise DeliveryError(f"{label} parent is not the exact cycle .runtime directory")
+
+    # Inspect the lexical path before resolving it.  This catches symlinks,
+    # junctions, and other Windows reparse points that could otherwise resolve
+    # to a path which appears to be inside the runtime directory.
+    current = runtime
+    while True:
+        if _is_link_or_junction(current):
+            raise DeliveryError(f"{label} path contains a symlink or reparse point")
+        if current == cycle.worktree:
+            break
+        if not _path_is_within(current, cycle.worktree):
+            raise DeliveryError(f"{label} escapes the cycle worktree")
+        parent = current.parent
+        if parent == current:
+            raise DeliveryError(f"{label} escapes the cycle worktree")
+        current = parent
+
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    try:
+        relative = candidate.relative_to(cycle.worktree)
+    except ValueError as error:
+        raise DeliveryError(f"{label} must be under the exact cycle .runtime") from error
+    if any(part in {".", ".."} for part in relative.parts):
+        raise DeliveryError(f"{label} must not contain . or .. path components")
+    if candidate.parent != runtime:
+        raise DeliveryError(f"{label} must be a direct child of the exact cycle .runtime")
+    try:
+        if candidate.parent.resolve(strict=False) != runtime.resolve(strict=False):
+            raise DeliveryError(f"{label} parent is not the exact cycle .runtime directory")
+    except OSError as error:
+        raise DeliveryError(f"unable to inspect {label} parent: {error}") from error
+    if _is_link_or_junction(candidate):
+        raise DeliveryError(f"{label} must not be a symlink or reparse point")
+    if candidate.exists() and not candidate.is_file():
+        raise DeliveryError(f"{label} must be a regular file")
+    return candidate
+
+
 # Narrow read-only helpers used by ``finalize_cycle``.  Keep the identity and
 # contract parsing rules in this module so finalization cannot create a second,
 # weaker interpretation of cycle paths or canonical Prompt identity.
@@ -2074,7 +2341,7 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--state", type=Path, required=True)
     build.add_argument("--out", type=Path, required=True)
     build.add_argument("--out-manifest", type=Path, required=True)
-    build.add_argument("--result", choices=("success", "failure"), required=True)
+    build.add_argument("--result", choices=("success", "failure"))
     build.add_argument("--final-commit")
 
     apply = commands.add_parser("apply-patch")
@@ -2136,20 +2403,44 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0
-        cycle = load_cycle(args.state)
+        cycle = load_cycle(args.state, require_current=True)
         if args.command == "build-patch":
+            patch_path = _require_runtime_output(cycle, args.out, "patch output")
+            manifest_path = _require_runtime_output(
+                cycle, args.out_manifest, "patch manifest output"
+            )
             patch = build_delivery_patch(
                 cycle,
-                FAILURE_ALLOWLIST if args.result == "failure" else SUCCESS_ALLOWLIST,
                 final_commit=args.final_commit,
                 result=args.result,
             )
-            save_patch(patch, args.out, args.out_manifest)
+            save_patch(patch, patch_path, manifest_path)
             print(json.dumps(patch.to_dict(), ensure_ascii=False, sort_keys=True))
             return 0
-        patch = load_patch(args.patch, args.patch_manifest)
-        apply_delivery_patch(cycle, patch)
-        print(json.dumps({"status": "applied", "paths": list(patch.paths)}, ensure_ascii=False))
+        patch_path = _require_runtime_output(cycle, args.patch, "patch input")
+        manifest_path = _require_runtime_output(
+            cycle, args.patch_manifest, "patch manifest input"
+        )
+        patch = load_patch(patch_path, manifest_path)
+
+        def record_verified(_applied: DeliveryPatch) -> None:
+            finalization = cycle.finalization
+            if finalization is None:
+                raise WorktreeError("current finalization state is required for delivery")
+            updated_finalization = replace(
+                finalization,
+                delivery_applied=True,
+                delivery_verified=True,
+                cleanup=replace(
+                    finalization.cleanup,
+                    authorized=finalization.cleanup.authorized,
+                ),
+            )
+            updated = replace(cycle, finalization=updated_finalization)
+            save_cycle_atomic(updated, args.state)
+
+        applied = apply_delivery_patch(cycle, patch, on_verified=record_verified)
+        print(json.dumps({"status": "applied", "paths": list(applied.paths)}, ensure_ascii=False))
         return 0
     except Exception as error:
         print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False))
@@ -2185,6 +2476,7 @@ __all__ = [
     "normalize_relative_path",
     "parse_prompt_contract_path",
     "preflight_patch",
+    "_require_runtime_output",
     "save_cycle",
     "save_cycle_atomic",
     "save_patch",

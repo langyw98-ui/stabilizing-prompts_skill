@@ -8,7 +8,9 @@ import pytest
 from scripts import manage_worktree
 from scripts.local_model_client import safe_client_config
 from scripts.manage_worktree import (
+    DeliveryError,
     WorktreeError,
+    create_cycle,
     initialize_local_excludes,
     load_cycle,
 )
@@ -42,6 +44,21 @@ def test_cli_chain_uses_production_renderer_and_schema_without_duplicate_contrac
     assert evidence.comparison_status == "passed"
     assert evidence.schema_name == "Decision"
     assert evidence.renderer_marker == "production-renderer"
+
+
+def test_delivery_artifacts_require_the_exact_cycle_runtime(tmp_path: Path) -> None:
+    target_repo = build_target_repo(tmp_path / "target-repo")
+    prompt_id = prompt_id_for_path("prompts/classify.md")
+    cycle = create_cycle(target_repo, prompt_id)
+    runtime = cycle.worktree / ".prompt-evals" / prompt_id / ".runtime"
+    runtime.mkdir(parents=True)
+
+    with pytest.raises(DeliveryError, match=r"exact cycle \.runtime"):
+        manage_worktree._require_runtime_output(
+            cycle,
+            tmp_path / "outside.patch",
+            "patch output",
+        )
 
 
 def test_delivery_rollback_restores_exact_targets_after_post_apply_failure(tmp_path: Path) -> None:

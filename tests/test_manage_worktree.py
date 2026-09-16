@@ -15,6 +15,7 @@ from scripts.manage_worktree import (
     AllowlistError,
     CleanupProgress,
     FAILURE_ALLOWLIST,
+    DeliveryPatch,
     FinalizationState,
     SUCCESS_ALLOWLIST,
     DeliveryConflict,
@@ -27,6 +28,7 @@ from scripts.manage_worktree import (
     load_cycle,
     main,
     preflight_patch,
+    save_patch,
     save_cycle_atomic,
 )
 
@@ -346,6 +348,55 @@ def completed_cycle(repo: tuple[Path, str]) -> WorktreeCycle:
     git(cycle.worktree, "add", "-A")
     git(cycle.worktree, "commit", "-m", "complete cycle")
     return cycle
+
+
+@pytest.fixture
+def finalized_state(repo: tuple[Path, str], tmp_path: Path) -> Path:
+    original, prompt_id = repo
+    cycle = create_cycle(original, prompt_id)
+    eval_dir = cycle.worktree / ".prompt-evals" / prompt_id
+    for name in (
+        "eval-config.yaml",
+        "dev-cases.yaml",
+        "validation-cases.yaml",
+        "acceptance-cases.yaml",
+        "coverage-obligations.yaml",
+        "adapter.py",
+        "optimization-history.yaml",
+    ):
+        (eval_dir / name).write_text(f"name: {name}\n", encoding="utf-8")
+    summary = eval_dir / "evaluation-summaries" / "2026-09-16-080910-no_change_needed.md"
+    summary.parent.mkdir(parents=True)
+    summary.write_text("# Evaluation summary\n", encoding="utf-8")
+    (eval_dir / "reports").mkdir()
+    (eval_dir / ".runtime").mkdir()
+    git(cycle.worktree, "add", "-A")
+    git(cycle.worktree, "commit", "-m", "prepare finalized result")
+    prepared_commit = git(cycle.worktree, "rev-parse", "HEAD")
+    finalization = FinalizationState(
+        result_kind="no_change_needed",
+        stop_reason="all baseline slots passed",
+        finished_at_utc="2026-09-16T08:09:10Z",
+        summary_path=summary.relative_to(cycle.worktree).as_posix(),
+        delivery_profile="assets",
+        prepared_commit=prepared_commit,
+        delivery_commit=prepared_commit,
+        delivery_confirmed=True,
+        cleanup=CleanupProgress(authorized=True),
+    )
+    finalized = replace(
+        cycle,
+        final_worktree_commit=prepared_commit,
+        finalization=finalization,
+    )
+    state = tmp_path / "finalized-state.json"
+    save_cycle_atomic(finalized, state)
+    return state
+
+
+@pytest.fixture
+def finalized_cycle(finalized_state: Path) -> WorktreeCycle:
+    return load_cycle(finalized_state, require_current=True)
 
 
 @pytest.fixture
@@ -931,6 +982,253 @@ def test_unallowlisted_change_is_rejected_from_patch_before_application(
     patch = build_delivery_patch(completed_cycle, SUCCESS_ALLOWLIST)
 
     assert "unrelated.txt" not in patch.paths
+
+
+def test_patch_allows_only_recorded_evaluation_summary(
+    finalized_cycle: WorktreeCycle,
+) -> None:
+    patch = build_delivery_patch(finalized_cycle)
+
+    assert finalized_cycle.finalization is not None
+    assert finalized_cycle.finalization.summary_path in patch.paths
+    assert all(
+        "reports/" not in path and "/.runtime/" not in path
+        for path in patch.paths
+    )
+
+
+def test_apply_invokes_verified_callback_for_an_empty_patch(
+    repo: tuple[Path, str],
+) -> None:
+    original, prompt_id = repo
+    cycle = create_cycle(original, prompt_id)
+    patch = build_delivery_patch(cycle)
+    assert patch.text == ""
+    observed: list[DeliveryPatch] = []
+
+    apply_delivery_patch(cycle, patch, on_verified=observed.append)
+
+    assert observed == [patch]
+
+
+@pytest.mark.parametrize("name", ["outside.patch", "../escape.patch"])
+def test_build_cli_rejects_output_outside_exact_runtime_output(
+    finalized_state: Path,
+    tmp_path: Path,
+    name: str,
+) -> None:
+    code = main(
+        [
+            "build-patch",
+            "--state",
+            str(finalized_state),
+            "--out",
+            str(tmp_path / name),
+            "--out-manifest",
+            str(tmp_path / "manifest.json"),
+            "--result",
+            "failure",
+        ]
+    )
+
+    assert code == 2
+
+
+def test_apply_cli_records_verified_delivery_and_retains_cleanup_authorization(
+    finalized_state: Path,
+) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    runtime = cycle.worktree / ".prompt-evals" / cycle.prompt_id / ".runtime"
+    patch_path = runtime / "delivery.patch"
+    manifest_path = runtime / "delivery-manifest.json"
+    assert (
+        main(
+            [
+                "build-patch",
+                "--state",
+                str(finalized_state),
+                "--out",
+                str(patch_path),
+                "--out-manifest",
+                str(manifest_path),
+            ]
+        )
+        == 0
+    )
+
+    assert (
+        main(
+            [
+                "apply-patch",
+                "--state",
+                str(finalized_state),
+                "--patch",
+                str(patch_path),
+                "--patch-manifest",
+                str(manifest_path),
+            ]
+        )
+        == 0
+    )
+    applied = load_cycle(finalized_state, require_current=True)
+    assert applied.finalization is not None
+    assert applied.finalization.delivery_applied is True
+    assert applied.finalization.delivery_verified is True
+    assert applied.finalization.cleanup.authorized is True
+
+
+def test_build_rejects_unrecorded_summary(finalized_state: Path) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    assert cycle.finalization is not None
+    tampered = replace(
+        cycle,
+        finalization=replace(
+            cycle.finalization,
+            summary_path=(
+                f".prompt-evals/{cycle.prompt_id}/evaluation-summaries/not-recorded.md"
+            ),
+        ),
+    )
+
+    with pytest.raises(DeliveryError, match="summary|allowlist|finalization"):
+        build_delivery_patch(tampered)
+
+
+def test_build_rejects_summary_from_another_prompt(finalized_state: Path) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    assert cycle.finalization is not None
+    tampered = replace(
+        cycle,
+        finalization=replace(
+            cycle.finalization,
+            summary_path=(
+                ".prompt-evals/another-prompt/evaluation-summaries/summary.md"
+            ),
+        ),
+    )
+
+    with pytest.raises(DeliveryError, match="summary|prompt|allowlist"):
+        build_delivery_patch(tampered)
+
+
+def test_build_rejects_deleted_recorded_summary(finalized_state: Path) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    assert cycle.finalization is not None
+    summary = cycle.worktree / Path(cycle.finalization.summary_path)
+    summary.unlink()
+    git(cycle.worktree, "add", "-u", str(summary.relative_to(cycle.worktree)))
+    git(cycle.worktree, "commit", "-m", "delete recorded summary")
+
+    with pytest.raises(DeliveryError, match="deletion|summary|delivery"):
+        build_delivery_patch(cycle)
+
+
+def test_build_rejects_wrong_finalization_delivery_profile(finalized_state: Path) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    assert cycle.finalization is not None
+    tampered = replace(
+        cycle,
+        finalization=replace(cycle.finalization, delivery_profile="success"),
+    )
+
+    with pytest.raises(DeliveryError, match="profile|result|finalization"):
+        build_delivery_patch(tampered)
+
+
+def test_build_rejects_extra_changed_path(finalized_state: Path) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    extra = cycle.worktree / "extra-delivery.txt"
+    extra.write_text("must not ship\n", encoding="utf-8")
+    git(cycle.worktree, "add", "extra-delivery.txt")
+    git(cycle.worktree, "commit", "-m", "add unallowlisted delivery path")
+
+    with pytest.raises(DeliveryError, match="allowlist|unexpected|changed|HEAD"):
+        build_delivery_patch(cycle)
+
+
+def test_build_rejects_head_that_does_not_match_delivery_commit(
+    finalized_state: Path,
+) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    assert cycle.finalization is not None
+    tampered = replace(
+        cycle,
+        finalization=replace(cycle.finalization, delivery_commit=cycle.cycle_base_commit),
+    )
+
+    with pytest.raises(DeliveryError, match="HEAD|delivery commit|final_worktree"):
+        build_delivery_patch(tampered)
+
+
+def test_build_rejects_nonignored_untracked_worktree_dirt(
+    finalized_state: Path,
+) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    (cycle.worktree / "untracked-delivery.txt").write_text(
+        "must not be silently ignored\n", encoding="utf-8"
+    )
+
+    with pytest.raises(DeliveryError, match="untracked|dirty|worktree"):
+        build_delivery_patch(cycle)
+
+
+def test_cli_rejects_persisted_manifest_tampering(
+    finalized_state: Path,
+) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    assert cycle.finalization is not None
+    runtime = cycle.worktree / ".prompt-evals" / cycle.prompt_id / ".runtime"
+    patch_path = runtime / "delivery.patch"
+    manifest_path = runtime / "delivery-manifest.json"
+    patch = build_delivery_patch(cycle)
+    save_patch(patch, patch_path, manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    first_path = patch.paths[0]
+    manifest["source_hashes"][first_path] = "0" * 64
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True), encoding="utf-8"
+    )
+
+    code = main(
+        [
+            "apply-patch",
+            "--state",
+            str(finalized_state),
+            "--patch",
+            str(patch_path),
+            "--patch-manifest",
+            str(manifest_path),
+        ]
+    )
+
+    assert code == 2
+
+
+def test_apply_rolls_back_when_verified_state_save_fails(
+    finalized_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cycle = load_cycle(finalized_state, require_current=True)
+    patch = build_delivery_patch(cycle)
+    before = snapshot_filesystem(cycle.original_repo)
+
+    monkeypatch.setattr(
+        manage_worktree,
+        "save_cycle_atomic",
+        lambda cycle, path: (_ for _ in ()).throw(
+            WorktreeError("state replace failed")
+        ),
+    )
+    with pytest.raises(WorktreeError, match="state replace failed"):
+        apply_delivery_patch(
+            cycle,
+            patch,
+            on_verified=lambda applied: manage_worktree.save_cycle_atomic(
+                cycle, finalized_state
+            ),
+        )
+
+    assert snapshot_filesystem(cycle.original_repo) == before
 
 
 def test_apply_conflict_leaves_original_workspace_unchanged(
