@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import math
 from pathlib import Path, PureWindowsPath
 import re
@@ -43,6 +44,42 @@ _RESULT_MATRIX: dict[str, tuple[str, bool, str]] = {
 _PHASES = ("dev", "validation", "acceptance")
 _PHASE_ALIASES = {"development": "dev", "dev": "dev", "validation": "validation", "acceptance": "acceptance"}
 _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_METRIC_FIELDS = {
+    "pass": ("pass", "passes", "pass_count"),
+    "parse_error": ("parse_error", "parse_errors", "parse_error_count"),
+    "schema_error": ("schema_error", "schema_errors", "schema_error_count"),
+    "business_error": ("business_error", "business_errors", "business_error_count"),
+    "schema_valid_rate": ("schema_valid_rate", "schema_validity_rate"),
+    "run_accuracy": ("run_accuracy", "accuracy", "single_run_accuracy"),
+    "stable_case_rate": ("stable_case_rate", "stability_rate"),
+}
+_COMPARISON_FIELDS = {
+    "fixes": ("fixes", "fix_count", "improvements", "improvement_count", "repairs", "repair_count"),
+    "regressions": ("regressions", "regression_count"),
+    "stability_regressions": (
+        "stability_regressions",
+        "stability_regression_count",
+        "stability_regression",
+    ),
+    "unchanged": ("unchanged", "unchanged_count", "no_change", "no_change_count"),
+}
+_COVERAGE_FIELDS = {
+    "categories": ("categories", "business_categories"),
+    "boundaries": ("boundaries", "key_boundaries", "critical_boundaries"),
+    "matrix_complete": (
+        "matrix_complete",
+        "mechanical_matrix_complete",
+        "coverage_matrix_complete",
+    ),
+    "near_duplicate_review": (
+        "near_duplicate_review",
+        "near_duplicate_review_status",
+        "near_duplicates",
+        "near_duplicate",
+    ),
+    "exclusions": ("exclusions", "explicit_exclusions"),
+    "saturation": ("saturation", "saturation_statement"),
+}
 
 
 class SummaryError(ValueError):
@@ -68,15 +105,14 @@ _PRIVATE_KEY_PARTS = frozenset(
         "cleanup",
         "commit",
         "confirmation",
-        "delivery",
         "delivery_commit",
+        "delivery_state",
         "delivery_status",
-        "file",
         "hash",
         "manifest",
         "patch",
-        "path",
         "prepared_commit",
+        "prepared_state",
         "private_worktree",
         "raw",
         "response",
@@ -119,19 +155,30 @@ def _safe_text(value: str) -> str:
     return text
 
 
+def _key_tokens(key: str) -> tuple[str, ...]:
+    """Split snake/kebab/space/camel/Pascal keys into stable tokens."""
+
+    # Split acronym-to-word boundaries first (``HTTPResponse``), then the
+    # ordinary lower/digit-to-upper boundary (``rawResponse``).
+    separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", key)
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", separated)
+    separated = re.sub(r"[^A-Za-z0-9]+", "_", separated)
+    return tuple(token.casefold() for token in separated.split("_") if token)
+
+
 def _normalise_key(key: str) -> str:
-    return re.sub(r"[-\s]+", "_", key.casefold())
+    return "_".join(_key_tokens(key))
 
 
 def _is_sensitive_key(key: str) -> bool:
     normalized = _normalise_key(key)
-    pieces = set(normalized.split("_"))
+    pieces = set(_key_tokens(key))
     return normalized in _SENSITIVE_KEY_PARTS or bool(pieces & _SENSITIVE_KEY_PARTS)
 
 
 def _is_private_key(key: str) -> bool:
     normalized = _normalise_key(key)
-    pieces = set(normalized.split("_"))
+    pieces = set(_key_tokens(key))
     return normalized in _PRIVATE_KEY_PARTS or bool(pieces & _PRIVATE_KEY_PARTS)
 
 
@@ -166,7 +213,10 @@ def _freeze_json(value: object, *, label: str, stack: set[int] | None = None) ->
                 # These fields are intentionally not part of a user summary.
                 if _is_sensitive_key(key) or _is_private_key(key):
                     continue
-                normalized[_safe_text(key)] = _freeze_json(
+                safe_key = _safe_text(key)
+                if safe_key in normalized:
+                    raise SummaryError(f"{label} contains duplicate normalized keys")
+                normalized[safe_key] = _freeze_json(
                     item, label=f"{label}.{key}", stack=active
                 )
             return MappingProxyType(dict(sorted(normalized.items(), key=lambda pair: pair[0])))
@@ -210,10 +260,19 @@ def _validate_relative_prompt_path(value: object) -> str:
         raise SummaryError("prompt_path must be a non-empty string")
     # Check the caller's raw spelling before secret/path redaction can turn a
     # drive-qualified path into a relative-looking placeholder.
-    raw_path = _normalise_newlines(value).replace("\n", "")
+    raw_path = _normalise_newlines(value)
+    if "\n" in raw_path:
+        raise SummaryError("prompt_path must be a single relative path")
     # Path.is_absolute() follows the host platform.  PureWindowsPath catches
     # drive-qualified and UNC paths even when this module runs on POSIX.
-    if Path(raw_path).is_absolute() or PureWindowsPath(raw_path).is_absolute() or PureWindowsPath(raw_path).drive:
+    windows_path = PureWindowsPath(raw_path)
+    if (
+        raw_path.startswith(("/", "\\"))
+        or Path(raw_path).is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.root
+        or windows_path.drive
+    ):
         raise SummaryError("prompt_path must be repository-relative")
     path = _safe_text(value)
     normalized = path.replace("\\", "/")
@@ -255,34 +314,77 @@ def _mapping(value: object, *, label: str, require_nonempty: bool = True) -> Map
 def _acceptance_records(comparisons: Mapping[str, object], metrics: Mapping[str, object]) -> tuple[tuple[str, str, str | None], ...]:
     records: list[tuple[str, str, str | None]] = []
     for source_name, source in (("comparisons", comparisons), ("metrics", metrics)):
-        direct = source.get("acceptance_status")
-        if direct is not None:
-            records.append((source_name, "acceptance_status", _coerce_acceptance_status(direct, label=f"{source_name}.acceptance_status")))
-        payload = source.get("acceptance")
-        if isinstance(payload, Mapping):
-            status_value = payload.get("status")
-            if status_value is None and "ran" in payload:
-                ran = payload.get("ran")
-                if type(ran) is not bool:
-                    raise SummaryError(f"{source_name}.acceptance.ran must be boolean")
-                if not ran:
-                    status_value = "not_run"
-            if status_value is None and "passed" in payload:
-                passed = payload.get("passed")
-                if passed is None:
-                    status_value = "not_run"
-                elif type(passed) is bool:
-                    status_value = "passed" if passed else "failed"
-                else:
-                    raise SummaryError(f"{source_name}.acceptance.passed must be boolean or null")
-            if status_value is not None:
-                records.append((source_name, "acceptance.status", _coerce_acceptance_status(status_value, label=f"{source_name}.acceptance.status")))
-            if "passed" in payload and payload.get("passed") is not None:
-                passed = payload.get("passed")
-                if type(passed) is not bool:
-                    raise SummaryError(f"{source_name}.acceptance.passed must be boolean or null")
-                if status_value is not None and (status_value == "passed") != passed:
-                    raise SummaryError("acceptance evidence contains contradictory status")
+        if "acceptance_status" in source:
+            direct = source["acceptance_status"]
+            records.append(
+                (
+                    source_name,
+                    "acceptance_status",
+                    _coerce_acceptance_status(
+                        direct, label=f"{source_name}.acceptance_status"
+                    ),
+                )
+            )
+        if "acceptance" not in source:
+            continue
+        payload = source["acceptance"]
+        if not isinstance(payload, Mapping):
+            raise SummaryError(f"{source_name}.acceptance must be a mapping")
+
+        has_status = "status" in payload
+        status_value = payload.get("status")
+        status = (
+            _coerce_acceptance_status(
+                status_value, label=f"{source_name}.acceptance.status"
+            )
+            if has_status
+            else None
+        )
+
+        has_ran = "ran" in payload
+        ran = payload.get("ran")
+        if has_ran and type(ran) is not bool:
+            raise SummaryError(f"{source_name}.acceptance.ran must be boolean")
+
+        has_passed = "passed" in payload
+        passed = payload.get("passed")
+        if has_passed and passed is not None and type(passed) is not bool:
+            raise SummaryError(
+                f"{source_name}.acceptance.passed must be boolean or null"
+            )
+
+        # Every supplied representation describes the same state.  A run can
+        # only be ``not_run`` when ``ran`` is false and its result is null;
+        # ran=true requires an explicit boolean result.
+        if status is not None and has_ran:
+            expected_ran = status != "not_run"
+            if ran is not expected_ran:
+                raise SummaryError("acceptance evidence contains contradictory status/ran")
+        if status is not None and has_passed:
+            expected_passed = None if status == "not_run" else status == "passed"
+            if passed is not expected_passed:
+                raise SummaryError(
+                    "acceptance evidence contains contradictory status/passed"
+                )
+        if has_ran and has_passed:
+            if not ran and passed is not None:
+                raise SummaryError("acceptance evidence contains contradictory ran/passed")
+            if ran and passed is None:
+                raise SummaryError("acceptance evidence contains contradictory ran/passed")
+
+        if status is None:
+            if has_ran and not ran:
+                status = "not_run"
+            elif has_passed and passed is None:
+                status = "not_run"
+            elif has_passed and type(passed) is bool:
+                status = "passed" if passed else "failed"
+            elif has_ran and ran:
+                raise SummaryError(
+                    "acceptance evidence with ran=true requires status or passed"
+                )
+        if status is not None:
+            records.append((source_name, "acceptance.status", status))
     statuses = {status for _, _, status in records}
     if len(statuses) > 1:
         raise SummaryError("acceptance evidence contains contradictory status")
@@ -490,6 +592,105 @@ def _phase_value(values: Mapping[str, object], phase: str) -> object | None:
     return None
 
 
+def _field_by_alias(values: Mapping[str, object], aliases: Sequence[str]) -> tuple[bool, object | None]:
+    normalized = {_normalise_key(key): value for key, value in values.items()}
+    for alias in aliases:
+        normalized_alias = _normalise_key(alias)
+        if normalized_alias in normalized:
+            return True, normalized[normalized_alias]
+    return False, None
+
+
+def _require_nonnegative_count(value: object, *, label: str) -> None:
+    if type(value) is not int or value < 0:
+        raise SummaryError(f"{label} must be a non-negative integer")
+
+
+def _require_finite_rate(value: object, *, label: str) -> None:
+    if type(value) is bool or not isinstance(value, (str, int, float)):
+        raise SummaryError(f"{label} must be a finite numeric rate")
+    try:
+        rate = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise SummaryError(f"{label} must be a finite numeric rate") from None
+    if not rate.is_finite():
+        raise SummaryError(f"{label} must be a finite numeric rate")
+
+
+def _require_nonempty_value(value: object, *, label: str) -> None:
+    if value is None:
+        raise SummaryError(f"{label} is missing")
+    if isinstance(value, str):
+        if not value.strip():
+            raise SummaryError(f"{label} must not be empty")
+        return
+    if isinstance(value, Mapping) or isinstance(value, (tuple, list)):
+        if not value:
+            raise SummaryError(f"{label} must not be empty")
+        return
+    raise SummaryError(f"{label} has an invalid value")
+
+
+def _validate_metric_record(value: object, *, label: str) -> None:
+    if not isinstance(value, Mapping):
+        raise SummaryError(f"{label} must be a mapping")
+    for name, aliases in _METRIC_FIELDS.items():
+        found, metric = _field_by_alias(value, aliases)
+        if not found:
+            raise SummaryError(f"{label} is missing required field {name}")
+        if name in {"pass", "parse_error", "schema_error", "business_error"}:
+            _require_nonnegative_count(metric, label=f"{label}.{name}")
+        else:
+            _require_finite_rate(metric, label=f"{label}.{name}")
+
+
+def _validate_comparison_record(value: object, *, label: str) -> None:
+    if not isinstance(value, Mapping):
+        raise SummaryError(f"{label} must be a mapping")
+    for name, aliases in _COMPARISON_FIELDS.items():
+        found, comparison = _field_by_alias(value, aliases)
+        if not found:
+            raise SummaryError(f"{label} is missing required field {name}")
+        _require_nonnegative_count(comparison, label=f"{label}.{name}")
+
+
+def _validate_coverage(coverage: Mapping[str, object]) -> None:
+    for name, aliases in _COVERAGE_FIELDS.items():
+        found, value = _field_by_alias(coverage, aliases)
+        if not found:
+            # The matrix may be represented by the saved mechanical-gate
+            # object; this is still the same Spec 7.3 completeness evidence.
+            if name == "matrix_complete":
+                matrix = coverage.get("matrix")
+                if isinstance(matrix, Mapping):
+                    found, value = _field_by_alias(
+                        matrix, ("complete", "is_complete", "status")
+                    )
+                if not found:
+                    gates = coverage.get("mechanical_gates")
+                    if isinstance(gates, Mapping):
+                        found, value = _field_by_alias(
+                            gates, ("coverage_matrix", "matrix_complete")
+                        )
+            if not found:
+                raise SummaryError(f"coverage is missing required field {name}")
+        if name == "matrix_complete":
+            if type(value) is not bool:
+                raise SummaryError("coverage.matrix_complete must be boolean")
+        elif name == "exclusions":
+            _require_nonempty_value(value, label="coverage.exclusions")
+        elif name == "saturation":
+            if not isinstance(value, str) or not value.strip():
+                raise SummaryError("coverage.saturation must be a non-empty summary")
+        elif name == "near_duplicate_review":
+            # An empty list is a meaningful recorded review: no near duplicate
+            # pairs were found.  Null still means that the review is missing.
+            if value is None:
+                raise SummaryError("coverage.near_duplicate_review is missing")
+        else:
+            _require_nonempty_value(value, label=f"coverage.{name}")
+
+
 def _phase_label(phase: str) -> str:
     return {"dev": "dev", "validation": "validation", "acceptance": "acceptance"}[phase]
 
@@ -508,6 +709,13 @@ def _require_phase_evidence(evidence: SummaryEvidence, result: FormalResult) -> 
             raise SummaryError(f"missing metrics.{phase} evidence")
         if _phase_value(evidence.comparisons, phase) is None:
             raise SummaryError(f"missing comparisons.{phase} evidence")
+        _validate_metric_record(
+            _phase_value(evidence.metrics, phase), label=f"metrics.{phase}"
+        )
+        _validate_comparison_record(
+            _phase_value(evidence.comparisons, phase),
+            label=f"comparisons.{phase}",
+        )
     if result.acceptance_status != "not_run":
         for label, values in (
             ("case_counts", evidence.case_counts),
@@ -521,6 +729,14 @@ def _require_phase_evidence(evidence: SummaryEvidence, result: FormalResult) -> 
             raise SummaryError("missing metrics.acceptance evidence")
         if _phase_value(evidence.comparisons, "acceptance") is None:
             raise SummaryError("missing comparisons.acceptance evidence")
+        _validate_metric_record(
+            _phase_value(evidence.metrics, "acceptance"), label="metrics.acceptance"
+        )
+        _validate_comparison_record(
+            _phase_value(evidence.comparisons, "acceptance"),
+            label="comparisons.acceptance",
+        )
+    _validate_coverage(evidence.coverage)
 
 
 def _render_target(evidence: SummaryEvidence) -> list[str]:

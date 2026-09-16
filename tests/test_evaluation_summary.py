@@ -44,18 +44,48 @@ def sample_evidence() -> SummaryEvidence:
                 "run_accuracy": "1",
                 "stable_case_rate": "1",
             },
-            "dev": {"pass": 20, "parse_error": 0, "schema_error": 0, "business_error": 0},
+            "dev": {
+                "pass": 20,
+                "parse_error": 0,
+                "schema_error": 0,
+                "business_error": 0,
+                "schema_valid_rate": "1",
+                "run_accuracy": "1",
+                "stable_case_rate": "1",
+            },
             "validation": {
                 "pass": 15,
                 "parse_error": 0,
                 "schema_error": 0,
                 "business_error": 0,
+                "schema_valid_rate": "1",
+                "run_accuracy": "1",
+                "stable_case_rate": "1",
             },
         },
         comparisons={
-            "acceptance": {"status": "passed", "reason": "all gates passed"},
-            "dev": {"status": "passed"},
-            "validation": {"status": "passed"},
+            "acceptance": {
+                "status": "passed",
+                "reason": "all gates passed",
+                "fixes": 2,
+                "regressions": 0,
+                "stability_regressions": 0,
+                "unchanged": 1,
+            },
+            "dev": {
+                "status": "passed",
+                "fixes": 2,
+                "regressions": 0,
+                "stability_regressions": 0,
+                "unchanged": 2,
+            },
+            "validation": {
+                "status": "passed",
+                "fixes": 2,
+                "regressions": 0,
+                "stability_regressions": 0,
+                "unchanged": 1,
+            },
         },
         coverage={
             "categories": ["routing", "safety"],
@@ -159,7 +189,11 @@ def test_summary_escapes_user_markdown(sample_evidence):
     values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
     values["prompt_name"] = "evil | [link](https://example.invalid)\nnext"
     values["prompt_path"] = "prompts/<classify>|x.md"
-    values["coverage"] = {"categories": ["a * b", "c | d"], "saturation": "line1\r\nline2"}
+    values["coverage"] = {
+        **sample_evidence.coverage,
+        "categories": ["a * b", "c | d"],
+        "saturation": "line1\r\nline2",
+    }
     result = normalize_formal_result(
         "acceptance_passed", finished_at_utc="2026-09-16T08:09:10Z"
     )
@@ -192,6 +226,138 @@ def test_contradictory_acceptance_evidence_is_rejected(sample_evidence):
 
 
 @pytest.mark.parametrize(
+    "acceptance_payload",
+    [
+        {"status": "passed", "ran": False, "reason": "contradiction"},
+        {"status": "failed", "ran": False, "reason": "contradiction"},
+        {"status": "not_run", "ran": True, "reason": "contradiction"},
+        {"status": "not_run", "passed": False, "reason": "contradiction"},
+        {"status": "not_run", "passed": True, "reason": "contradiction"},
+        {"status": "passed", "passed": False, "reason": "contradiction"},
+        {"status": "failed", "passed": True, "reason": "contradiction"},
+        {"status": "passed", "passed": None, "reason": "contradiction"},
+    ],
+)
+def test_acceptance_status_ran_and_passed_must_agree(sample_evidence, acceptance_payload):
+    values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
+    values["comparisons"] = {
+        "dev": sample_evidence.comparisons["dev"],
+        "validation": sample_evidence.comparisons["validation"],
+        "acceptance": acceptance_payload,
+    }
+    with pytest.raises(ValueError, match="acceptance"):
+        SummaryEvidence(**values)
+
+
+@pytest.mark.parametrize(
+    "sensitive_key",
+    [
+        "accessToken",
+        "AuthorizationToken",
+        "rawResponse",
+        "deliveryStatus",
+        "AccessToken",
+        "RawResponse",
+        "DeliveryStatus",
+        "access-token",
+        "raw-response",
+        "delivery-status",
+    ],
+)
+def test_sensitive_camel_pascal_and_kebab_keys_are_omitted(sample_evidence, sensitive_key):
+    values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
+    values["coverage"] = {
+        **sample_evidence.coverage,
+        sensitive_key: "top-secret",
+    }
+    summary = render_summary(
+        normalize_formal_result("acceptance_passed", finished_at_utc="2026-09-16T08:09:10Z"),
+        SummaryEvidence(**values),
+    )
+    assert sensitive_key.casefold() not in summary.casefold()
+    assert "top-secret" not in summary
+
+
+@pytest.mark.parametrize(
+    "prompt_path",
+    [
+        "/tmp/private/prompt.md",
+        "C:\\private\\prompt.md",
+        "\\\\server\\share\\prompt.md",
+        "\\rooted\\prompt.md",
+    ],
+)
+def test_rejects_all_absolute_and_rooted_prompt_paths(sample_evidence, prompt_path):
+    values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
+    values["prompt_path"] = prompt_path
+    with pytest.raises(ValueError, match="relative"):
+        SummaryEvidence(**values)
+
+
+@pytest.mark.parametrize(
+    "missing_metric",
+    [
+        "pass",
+        "parse_error",
+        "schema_error",
+        "business_error",
+        "schema_valid_rate",
+        "run_accuracy",
+        "stable_case_rate",
+    ],
+)
+def test_metrics_require_spec_73_fields(sample_evidence, missing_metric):
+    values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
+    metrics = {phase: dict(payload) for phase, payload in sample_evidence.metrics.items()}
+    metrics["dev"].pop(missing_metric)
+    values["metrics"] = metrics
+    with pytest.raises(ValueError, match="metrics"):
+        render_summary(
+            normalize_formal_result("acceptance_passed", finished_at_utc="2026-09-16T08:09:10Z"),
+            SummaryEvidence(**values),
+        )
+
+
+@pytest.mark.parametrize(
+    "missing_coverage",
+    [
+        "categories",
+        "boundaries",
+        "matrix_complete",
+        "near_duplicate_review",
+        "exclusions",
+        "saturation",
+    ],
+)
+def test_coverage_requires_spec_73_fields(sample_evidence, missing_coverage):
+    values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
+    coverage = dict(sample_evidence.coverage)
+    coverage.pop(missing_coverage)
+    values["coverage"] = coverage
+    with pytest.raises(ValueError, match="coverage"):
+        render_summary(
+            normalize_formal_result("acceptance_passed", finished_at_utc="2026-09-16T08:09:10Z"),
+            SummaryEvidence(**values),
+        )
+
+
+def test_relative_path_and_file_evidence_is_preserved_and_escaped(sample_evidence):
+    values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
+    values["coverage"] = {
+        **sample_evidence.coverage,
+        "paths": {"case|1": "cases/input.md"},
+        "files": {"schema[1].py": "relative/file.md"},
+    }
+    summary = render_summary(
+        normalize_formal_result("acceptance_passed", finished_at_utc="2026-09-16T08:09:10Z"),
+        SummaryEvidence(**values),
+    )
+    assert "case\\|1" in summary
+    assert "schema\\[1\\]\\.py" in summary
+    assert "relative/file\\.md" in summary
+
+
+@pytest.mark.parametrize(
     "timestamp",
     [
         "2026-09-16T08:09:10",
@@ -208,9 +374,12 @@ def test_invalid_finished_timestamps_are_rejected(timestamp):
 def test_non_run_acceptance_has_rule_explanation(sample_evidence):
     values = {field: getattr(sample_evidence, field) for field in sample_evidence.__dataclass_fields__}
     values["comparisons"] = {
-        "dev": {"status": "passed"},
-        "validation": {"status": "passed"},
-        "acceptance": {"status": "not_run", "reason": "not run by no-change rule"},
+        **sample_evidence.comparisons,
+        "acceptance": {
+            **sample_evidence.comparisons["acceptance"],
+            "status": "not_run",
+            "reason": "not run by no-change rule",
+        },
     }
     result = normalize_formal_result(
         "no_change_needed", finished_at_utc="2026-09-16T08:09:10Z"
