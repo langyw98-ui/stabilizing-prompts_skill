@@ -893,6 +893,101 @@ def test_cleanup_state_unlink_failure_preserves_completed_checkpoints(
     assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False) == ""
 
 
+def test_cleanup_rejects_state_parent_alias_before_unlink_and_retry_is_safe(
+    delivered_state: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    holder = tmp_path / "state-holder"
+    holder.mkdir()
+    state = holder / "cycle.json"
+    delivered_state.rename(state)
+    external = tmp_path / "state-external"
+    external.mkdir()
+    external_state = external / state.name
+    external_state.write_bytes(b"external sentinel\n")
+    real_holder = tmp_path / "state-holder-real"
+    real_save = manage_worktree.save_cycle_atomic
+    aliased = False
+
+    def save_and_replace_parent(saved: WorktreeCycle, path: Path) -> None:
+        nonlocal aliased
+        real_save(saved, path)
+        finalization = saved.finalization
+        if not aliased and finalization is not None and finalization.cleanup.branch_deleted:
+            aliased = True
+            holder.rename(real_holder)
+            _make_directory_symlink(holder, external)
+
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", save_and_replace_parent)
+    with pytest.raises(WorktreeError, match="state|symlink|junction|reparse|alias"):
+        manage_worktree.cleanup_cycle(state)
+
+    assert external_state.read_bytes() == b"external sentinel\n"
+    assert (real_holder / state.name).exists()
+    assert manage_worktree._is_link_or_junction(holder)
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", real_save)
+    try:
+        holder.unlink()
+    except OSError:
+        holder.rmdir()
+    real_holder.rename(holder)
+
+    assert manage_worktree.cleanup_cycle(state).status == "complete"
+    assert not state.exists()
+
+
+def test_cleanup_rejects_reparse_alias_in_worktree_absence_postcondition(
+    delivered_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    real_is_link_or_junction = manage_worktree._is_link_or_junction
+    calls = {"save": 0, "parent": 0, "branch": 0, "unlink": 0}
+
+    def report_missing_worktree_as_reparse(path: Path) -> bool:
+        if path.absolute() == cycle.worktree.absolute() and not cycle.worktree.exists():
+            return True
+        return real_is_link_or_junction(path)
+
+    real_save = manage_worktree.save_cycle_atomic
+    real_parent = manage_worktree._remove_managed_parent
+    real_branch = manage_worktree._delete_cycle_branch
+    real_unlink = manage_worktree._unlink_cycle_state
+
+    def record_save(saved: WorktreeCycle, path: Path) -> None:
+        calls["save"] += 1
+        real_save(saved, path)
+
+    def record_parent(saved: WorktreeCycle) -> bool:
+        calls["parent"] += 1
+        return real_parent(saved)
+
+    def record_branch(saved: WorktreeCycle) -> None:
+        calls["branch"] += 1
+        real_branch(saved)
+
+    def record_unlink(path: Path) -> None:
+        calls["unlink"] += 1
+        real_unlink(path)
+
+    monkeypatch.setattr(manage_worktree, "_is_link_or_junction", report_missing_worktree_as_reparse)
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", record_save)
+    monkeypatch.setattr(manage_worktree, "_remove_managed_parent", record_parent)
+    monkeypatch.setattr(manage_worktree, "_delete_cycle_branch", record_branch)
+    monkeypatch.setattr(manage_worktree, "_unlink_cycle_state", record_unlink)
+
+    with pytest.raises(WorktreeError, match="worktree|reparse|symlink|junction"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    saved = json.loads(delivered_state.read_text(encoding="utf-8"))
+    assert saved["finalization"]["cleanup"]["worktree_removed"] is False
+    assert calls == {"save": 0, "parent": 0, "branch": 0, "unlink": 0}
+    assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
+    assert delivered_state.exists()
+
+
 def test_cleanup_uses_fixed_status_cleanliness_command(
     delivered_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

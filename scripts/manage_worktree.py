@@ -755,7 +755,20 @@ def _validate_current_cycle(cycle: WorktreeCycle) -> None:
 def _validate_state_path(cycle: WorktreeCycle, path: Path) -> Path:
     """Ensure the authoritative state file survives removal of the worktree."""
 
-    destination = Path(path).resolve(strict=False)
+    lexical = Path(path).absolute()
+    current = lexical
+    while True:
+        if _is_link_or_junction(current):
+            raise WorktreeError(
+                "cycle state path contains a symlink, junction, or reparse point: "
+                f"{current}"
+            )
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    destination = lexical.resolve(strict=False)
     worktree = Path(cycle.worktree).resolve(strict=False)
     if _path_is_within(destination, worktree):
         raise WorktreeError(
@@ -1658,7 +1671,7 @@ _CLEANUP_STATUS_ARGUMENTS = (
 def _path_present(path: Path) -> bool:
     """Return true for ordinary paths and broken symlink/reparse aliases."""
 
-    return path.exists() or path.is_symlink()
+    return _is_link_or_junction(path) or path.exists()
 
 
 def _worktree_records(root: Path) -> tuple[dict[str, str], ...]:
@@ -2149,7 +2162,12 @@ def cleanup_cycle(state_path: Path) -> CleanupOutcome:
     else:
         _assert_branch_deleted(cycle)
 
-    _unlink_cycle_state(state)
+    state_target = _validate_state_path(cycle, state)
+    if _path_key(state_target) != _path_key(state):
+        raise WorktreeError(
+            "cycle state path changed before unlink; refusing to remove an alias"
+        )
+    _unlink_cycle_state(state_target)
     return CleanupOutcome(
         status="complete",
         worktree_removed=worktree_removed,
