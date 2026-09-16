@@ -80,8 +80,9 @@ linked worktree 目录；在 linked worktree 自身的 Git 视图中，prompt �
    只交付可交付评测目录。
 7. 用户拒绝或回答含糊时，原工作区保持不变，并保留已提交证据、worktree、
    周期分支和状态以供检查或以后重新发起交付。
-8. 用户确认且同步验证成功后，自动、按安全顺序移除本周期 worktree、清理
-   worktree 注册、删除精确周期分支和周期临时状态。
+8. 用户确认且同步验证成功后，自动、按安全顺序移除本周期 worktree 及其 Git
+   注册、删除精确周期分支和单一周期状态文件；当前周期目录不得残留，空的
+   `.worktrees/stabilizing-prompts/` 随后删除，但 `.worktrees/` 本身始终保留。
 9. 同步或验证失败时不开始清理；清理失败时不撤销已经验证成功的交付，也不
    扩大清理范围。
 10. 现有原工作区冲突检测、路径白名单、精确快照、失败回滚、内容哈希验证和
@@ -159,9 +160,15 @@ __pycache__/
 - 只有 acceptance 通过的结果可以修改生产 Prompt；其他正式结果禁止修改。
 - 只有明确确认、同步已应用且目标验证成功的周期可以自动清理。
 - worktree 移除不得使用 `--force`；不得运行 `git reflog expire`、
-  `git gc --prune` 或其他仓库级破坏性命令。
+  `git gc --prune`、`git worktree prune` 或其他仓库级破坏性命令。
 - 清理只作用于当前周期精确记录且重新验证的 managed worktree、周期分支和临时
   状态，不能触碰已交付评测目录、远端分支、默认/当前分支或其他周期。
+- `.worktrees/` 是保留的仓库容器；当前周期目录必须完整移除，
+  `.worktrees/stabilizing-prompts/` 仅在变空时删除，任何其他周期或用户 worktree
+  都不得为了使容器为空而被删除。
+- 周期外部只保留一个权威 `STATE_PATH`。confirmation、delivery 和 cleanup 进度
+  都写入该文件；它必须位于当前 managed worktree 之外并以同目录临时文件加原子
+  替换更新。
 
 ### 4.4 非目标
 
@@ -194,11 +201,13 @@ preflight
   -> optional single acceptance activity
   -> scored terminal outcome
   -> normalize final result and render summary
-  -> commit summary and deliverable evaluation assets
+  -> commit summary and deliverable evaluation assets as prepared_commit
   -> show result, summary path, and delivery set
   -> delivery-and-cleanup confirmation
        -> declined/ambiguous: retain cycle unchanged
-       -> approved: create result-specific final commit
+       -> approved: resolve delivery_commit
+                    -> asset-only: reuse prepared_commit
+                    -> acceptance-pass: create child delivery_commit
                     -> fresh-build allowlisted patch
                     -> apply and verify delivery
                     -> clean exact cycle resources
@@ -368,7 +377,10 @@ git check-ignore --no-index --quiet --
 6. **失败摘要**：可采取行动的失败类别、代表案例和字段级差异摘要，不含原始
    模型响应。
 7. **Prompt 结果**：保持原样、候选被拒绝及原因，或候选通过全部适用门禁并
-   等待/获得交付确认。
+   等待交付决定。
+
+简报在交付确认前进入 `prepared_commit`，因此不得声称已经获得确认、完成交付或
+完成清理。确认、交付和清理状态只属于机器状态与当次命令输出。
 
 ### 7.4 确定性数据来源
 
@@ -384,10 +396,10 @@ git check-ignore --no-index --quiet --
 ### 7.5 推荐设计及候选方案
 
 推荐使用独立的确定性生成器，将支持版本的报告与周期状态渲染为 Markdown，
-并在交付确认前把简报与可交付评测资产一起提交。该边界让相同证据产生稳定内容，
-使 Git 层只处理已经确定的文件，不让自然语言生成承担身份或路由职责。替代实现
-可以更换内部模块或模板，只要保持完整内容合同、确定性、fail-closed 证据校验和
-敏感信息排除。
+并在交付确认前把简报与可交付评测资产一起提交为 `prepared_commit`。该边界让
+相同证据产生稳定内容，使 Git 层只处理已经确定的文件，不让自然语言生成承担
+身份或路由职责。替代实现可以更换内部模块或模板，只要保持完整内容合同、
+确定性、fail-closed 证据校验和敏感信息排除。
 
 - **让模型自由读取 raw response 并总结**：拒绝。它会产生新事实、非确定输出
   和敏感内容泄漏风险。
@@ -412,7 +424,10 @@ git check-ignore --no-index --quiet --
 
 每一种正式结果都必须先展示简报结论、简报仓库相对路径和计划交付集合，再请求
 一次明确确认。确认同时授权该结果对应的同步，以及仅在同步验证成功后执行的精确
-周期清理；它不授权更宽的文件或 Git 操作。
+周期清理；它不授权更宽的文件或 Git 操作。确认材料必须明确说明：删除精确
+managed worktree 会永久删除其中的 ignored 运行产物，包括 `reports/`、
+`.runtime/`、原始响应、patch、patch manifest 和临时候选，同时永久删除可见的
+本地周期分支。
 
 acceptance 通过时，确认材料还必须保留现有的 paired reports、冻结候选身份、
 Prompt diff 和各门禁结果，使用户能够核对即将交付的生产 Prompt。内部 hash 可以
@@ -423,10 +438,11 @@ worktree/分支/状态，并保留已提交简报和证据。
 
 ### 8.2 acceptance 通过的 Prompt 语义
 
-只有 acceptance 通过且用户确认时，才把冻结候选作为 worktree 中的生产 Prompt，
-更新 `prompt-contract.yaml` 当前 Prompt 的非路径字段，追加精简历史并创建最终
-交付 commit。committed contract 必须继续指向周期开始时的 canonical Prompt
-path；任何路径重定向都拒绝交付。
+只有 acceptance 通过且用户确认时，才从 `prepared_commit` 把冻结候选作为
+worktree 中的生产 Prompt，更新 `prompt-contract.yaml` 当前 Prompt 的非路径字段，
+追加精简历史并创建子 `delivery_commit`。asset-only 结果不创建空 commit，直接令
+`delivery_commit == prepared_commit`。committed contract 必须继续指向周期开始时
+的 canonical Prompt path；任何路径重定向都拒绝交付。
 
 ### 8.3 交付前门禁
 
@@ -435,19 +451,24 @@ path；任何路径重定向都拒绝交付。
 - 原工作区仍是周期记录的 primary workspace；
 - 原工作区 `HEAD == cycle_base_commit`；
 - worktree 是固定 managed root 下记录的精确目录；
-- worktree 当前分支与周期分支一致，`HEAD` 等于 finalization 记录的最终 commit；
-- worktree 干净，没有未提交或仅存在于其中的未跟踪文件；
+- worktree 当前分支与周期分支一致，`HEAD == delivery_commit`；
+- 在 worktree 中执行固定配置的
+  `git -c status.showUntrackedFiles=all status --porcelain --untracked-files=all
+  --ignore-submodules=none` 没有输出；
 - committed contract 仍指向周期开始时的 canonical Prompt path；
 - 简报属于当前 prompt ID、当前周期和当前正式结果；
 - 实际 Git changed paths 与结果派生的白名单完全一致；
 - 原工作区每个目标路径都没有用户修改、新增或 staged 冲突。
+
+上述 cleanliness 检查拒绝 staged、tracked 修改和非 ignored untracked 文件。已经
+确认会随 worktree 删除的 ignored 运行产物不构成 dirty state。
 
 ### 8.4 patch、apply 与验证
 
 推荐继续复用现有结果感知交付边界，并扩充其 allowlist 以包含当前 prompt ID 的
 可交付资产和 evaluation summary：
 
-1. 从 `cycle_base_commit`、当前最终 worktree commit 和已提交内容实时生成
+1. 从 `cycle_base_commit`、`delivery_commit` 和已提交内容实时生成
    canonical patch；不信任预先持久化的 patch 文本、manifest 或 hash 作为信任锚。
 2. 所有正式结果可同步当前 prompt ID 的可交付评测文件；只有 acceptance 通过
    profile 可同步 canonical production Prompt。
@@ -458,6 +479,9 @@ path；任何路径重定向都拒绝交付。
 5. 任一步骤失败都恢复精确快照，确保没有部分交付，并且不启动清理。
 6. 成功文件保持 unstaged/uncommitted；不运行 `git add`、commit、merge 或
    checkout。
+7. 现有 `--out` 和 `--out-manifest` CLI 形状保持不变，但两个输出必须经机械验证
+   位于当前周期精确 `.runtime/` 下；apply 与目标验证成功后先原子更新
+   `STATE_PATH`，再允许开始清理。
 
 复用该责任边界是推荐默认设计，因为它继承现有 cycle-base 身份、stale-state
 guard、canonical prompt 约束、原生 Git patch 解析、精确 snapshot 和回滚行为。
@@ -490,8 +514,9 @@ guard、canonical prompt 约束、原生 Git patch 解析、精确 snapshot 和�
 - canonical patch 已应用；
 - 交付路径和目标内容验证成功；
 - 原工作区已交付文件仍通过刚完成的验证；
-- worktree 仍对应记录的精确周期目录、周期分支和最终 commit；
-- worktree 干净。
+- worktree 仍对应记录的精确周期目录、周期分支和 `delivery_commit`；
+- 第 8.3 节的固定 Git cleanliness 检查无输出；
+- `STATE_PATH` 已原子记录交付应用、目标验证成功和 cleanup 授权。
 
 任何同步或验证错误发生在清理之前并阻止清理。
 
@@ -500,26 +525,38 @@ guard、canonical prompt 约束、原生 Git patch 解析、精确 snapshot 和�
 清理必须从原工作区或其他位于目标 worktree 之外的目录执行：
 
 ```text
-git worktree remove <exact-cycle-worktree>
--> git worktree prune
+verify fixed Git cleanliness
+-> git worktree remove <exact-cycle-worktree>
+-> verify exact cycle directory and Git registration are absent
+-> remove .worktrees/stabilizing-prompts/ only when empty
+-> verify exact cycle branch is unused by every worktree
 -> git branch -D <exact-cycle-branch>
--> delete exact cycle/confirmation/delivery temporary state files
+-> delete exact STATE_PATH
 ```
 
-该顺序按可恢复性排列：先让 Git 安全验证并移除 worktree，再清理注册，然后删除
-不会被 merge 的周期分支引用，最后删除诊断和恢复所需状态。
+该顺序按可恢复性排列：先让 Git 安全验证并移除精确 worktree 及其注册，确认
+文件系统与 Git 两个后置条件，再删除不会被 merge 的周期分支引用，最后删除诊断
+和恢复所需的单一状态文件。
 
-- `git worktree remove` 不使用 `--force`；若发现未提交或未跟踪文件，停止并列出
-  风险文件。
+- `git worktree remove` 不使用 `--force`；固定 cleanliness 检查发现 staged、tracked
+  修改或非 ignored untracked 文件时，停止并列出风险文件。ignored 运行产物已由
+  用户确认随整个 worktree 永久删除。
 - worktree 必须是 `WorktreeCycle` 记录、位于固定 managed root 且本次重新验证
   的精确路径。
+- `git worktree remove` 返回后，精确周期目录和对应 Git 注册必须都不存在，才能
+  宣告 worktree 清理成功；不得把仅删除注册或仅清空目录视为成功。
+- 当前周期目录移除后，`.worktrees/stabilizing-prompts/` 只使用非递归空目录删除；
+  非空表示存在其他周期或用户内容，必须保留。`.worktrees/` 本身始终保留。
 - 分支必须是本周期记录的 `stabilizing-prompts/...` 分支，名称和 commit 都匹配；
   当前分支、默认分支、远端分支和其他 worktree 使用的分支一律拒绝。
 - `git branch -D` 是推荐且获准的操作：评测资产通过 patch 交付为原工作区未提交
-  文件，周期 asset/finalization commit 不会 merge；用户确认必须明确覆盖永久
+  文件，周期 prepared/delivery commit 不会 merge；用户确认必须明确覆盖永久
   删除这个可见本地分支引用。
-- 状态文件最后删除，且只删除周期精确记录的 cycle、confirmation 和 delivery
-  临时状态。
+- confirmation、delivery 和 cleanup 进度只存在于 worktree 外的单一
+  `STATE_PATH`；清理器不接受其他文件删除目标。`STATE_PATH` 最后精确删除，不用
+  glob 或递归目录删除。
+- patch、patch manifest 和其他临时传递产物位于当前周期 `.runtime/`，随精确
+  worktree 删除，不由独立状态清理步骤处理。
 - 不删除或改写 `.prompt-evals/<prompt-id>/` 中已交付内容。
 
 具体清理函数和逐步状态字段可以替换，但执行顺序、精确目标派生、重新验证、
@@ -530,13 +567,16 @@ git worktree remove <exact-cycle-worktree>
 清理不与 patch apply 构成一个原子事务。交付已经验证成功后，任何清理失败都不
 回滚原工作区资产：
 
-- worktree 移除失败：分支和状态均保留；
-- prune 失败：分支和状态均保留；
+- worktree 移除命令失败，或周期目录/注册任一仍存在：不得宣告成功，分支和
+  `STATE_PATH` 保留，并报告命令结果、目录残留和注册残留；
+- 空的 `.worktrees/stabilizing-prompts/` 无法移除：停止后续清理并保留分支和
+  `STATE_PATH`；因其他周期或用户内容而非空则正常保留，不是失败；
 - 分支删除失败：已交付资产不变，状态保留并记录精确剩余分支；
-- 状态删除失败：报告残留的精确状态文件，不影响已交付资产。
+- `STATE_PATH` 删除失败：报告这个精确残留文件，不影响已交付资产。
 
-失败后不猜测替代目标、不扩大范围、不执行仓库级破坏性命令。重试必须重新检查
-当前 Git 身份、worktree 清洁度和已完成的交付证据，不能仅凭旧路径重放命令。
+失败后不猜测替代目标、不扩大范围、不执行仓库级破坏性命令。重试必须重新验证
+已完成交付证据以及每一步的当前后置条件；已经缺失的 worktree 或分支只有在精确
+身份和前置步骤状态一致时才能视为已完成，不能仅凭旧路径重放命令。
 
 ### 9.4 候选方案与取舍
 
@@ -546,6 +586,8 @@ git worktree remove <exact-cycle-worktree>
   已获得完整资产。
 - **同步/验证失败后仍清理**：拒绝。它会删除修复、检查和重试所需证据。
 - **使用 `git worktree remove --force`**：拒绝。它可能丢弃未提交或未跟踪内容。
+- **运行 `git worktree prune`**：拒绝。它扫描仓库级 worktree 注册，超出当前
+  精确周期的清理授权；精确 `worktree remove` 已负责移除对应注册。
 - **使用调用者给出的任意 worktree、branch 或状态路径**：拒绝。清理目标必须
   从经过验证的周期状态派生。
 - **使用安全分支删除 `-d`**：不采用为默认。周期 commit 有意不 merge，`-d`
@@ -557,19 +599,22 @@ git worktree remove <exact-cycle-worktree>
 
 ## 10. 状态模型与 CLI 合同
 
-`WorktreeCycle` 或关联 finalization 状态需要表达：
+单一 `STATE_PATH` 中的 `WorktreeCycle` 或关联 finalization 状态需要表达：
 
 - 原工作区、managed worktree、周期分支、`cycle_base_commit` 和 canonical
   Prompt 身份；
 - repository-local exclude 初始化与两阶段验证结果；
 - 规范化正式结果、固定结束时间和简报仓库相对路径；
-- finalization commit 与结果对应的交付 profile；
+- `prepared_commit`、可选/解析后的 `delivery_commit` 与结果对应的交付 profile；
 - 交付确认状态；
 - apply、目标验证与 rollback 状态；
-- cleanup 授权及 worktree remove、prune、branch delete、state delete 的逐步状态；
-- 本周期精确的 cycle、confirmation 和 delivery 临时状态文件集合。
+- cleanup 授权及 worktree remove、周期目录/注册后置验证、空容器删除、branch
+  delete 和 state delete 的逐步状态。
 
 这些机器状态可以包含内部安全哈希；简报的无哈希约束不适用于它们。
+confirmation、delivery 和 cleanup 不再拥有独立外部状态文件。每次状态转换必须
+在 `STATE_PATH` 同目录写临时文件并原子替换；`STATE_PATH` 必须位于当前 managed
+worktree 之外，避免 worktree 删除提前销毁唯一恢复状态。
 
 清理入口的稳定命令形状为：
 
@@ -577,8 +622,9 @@ git worktree remove <exact-cycle-worktree>
 manage_worktree.py cleanup --state STATE_PATH
 ```
 
-该入口不接受调用者提供的 worktree、branch 或删除路径。缺少“用户已授权清理”
-或“交付已应用且验证成功”状态时必须 fail closed。
+该入口不接受调用者提供的 worktree、branch 或额外删除路径。`STATE_PATH` 是唯一
+外部删除目标；缺少“用户已授权清理”或“交付已应用且验证成功”状态时必须 fail
+closed。
 
 exclude 初始化和两阶段验证应由受控 worktree 管理接口提供；具体子命令拆分可以在
 实现计划中决定，但必须支持第 6 节的原子写入、诊断、调用顺序和 setup-error
@@ -586,7 +632,8 @@ exclude 初始化和两阶段验证应由受控 worktree 管理接口提供；�
 
 ### 10.1 迁移与兼容性
 
-新状态和自动清理只适用于包含这里所需 finalization/cleanup 字段的新周期。旧
+新状态和自动清理只适用于包含这里所需 prepared/delivery/cleanup 字段、使用单一
+原子 `STATE_PATH` 的新周期。旧
 worktree、旧周期状态、已结束分支和外部路径不自动迁移或清理，必须由用户检查后
 另行处理。
 
@@ -611,9 +658,11 @@ worktree、旧周期状态、已结束分支和外部路径不自动迁移或清
 ### 11.2 基线全部通过
 
 1. dev/validation 的全部计划槽位完成并通过；不生成候选、不运行 acceptance。
-2. 结果规范化为 `no_change_needed`，生成并提交独立简报和可交付评测资产。
+2. 结果规范化为 `no_change_needed`，生成独立简报并与可交付评测资产提交为
+   `prepared_commit`。
 3. 展示结论、简报路径和资产-only 交付集合，请求一次确认。
-4. 拒绝时保留整个周期；同意时只同步可交付评测目录。
+4. 拒绝时保留整个周期；同意时令 `delivery_commit == prepared_commit`，只同步
+   可交付评测目录，不创建空 commit。
 5. apply 和内容验证成功后，按顺序清理精确周期资源。
 
 ### 11.3 候选没有通过 validation 或轮次停止
@@ -629,9 +678,10 @@ acceptance 保持每周期一次，不编辑候选也不重跑。正式结果记
 
 ### 11.5 acceptance 通过
 
-结果记录所有适用门禁已通过。确认后在 worktree 建立包含冻结生产 Prompt、
-contract 非路径字段、精简历史、评测资产和简报的最终 commit；实时构建 success
-profile patch。同步和内容验证成功后再清理精确周期资源。
+结果记录所有适用门禁已通过，先把简报与可交付评测资产提交为
+`prepared_commit`。确认后在其上建立包含冻结生产 Prompt、contract 非路径字段和
+精简历史的子 `delivery_commit`；实时构建 success profile patch。同步和内容验证
+成功、`STATE_PATH` 原子记录完成后再清理精确周期资源。
 
 ### 11.6 setup、交付或清理失败
 
@@ -639,7 +689,8 @@ profile patch。同步和内容验证成功后再清理精确周期资源。
   路径验证失败只保留已创建 worktree/分支供检查。
 - patch preflight/apply/目标验证失败：恢复精确快照，原工作区无部分交付，保留
   worktree、分支和状态，不运行清理。
-- 清理失败：保留已验证交付，停止后续危险步骤并保留足够诊断状态。
+- 清理失败：保留已验证交付，停止后续危险步骤并保留单一 `STATE_PATH`；只有最终
+  状态文件删除自身失败时，报告该精确残留而不回滚已完成清理。
 
 ## 12. 测试与验收
 
@@ -670,6 +721,7 @@ profile patch。同步和内容验证成功后再清理精确周期资源。
 - 缺失、矛盾或不兼容证据 fail closed。
 - 简报不含 SHA/hash 字段、绝对 worktree 路径、Authorization、Token、raw
   response 或 patch 细节。
+- 简报只陈述正式业务结论和计划交付 profile，不声称已确认、已交付或已清理。
 - 用户输入和案例摘要经过安全、稳定的 Markdown 文本渲染。
 - 已存在同名文件停止 finalization，不覆盖或随机改名。
 
@@ -681,6 +733,8 @@ profile patch。同步和内容验证成功后再清理精确周期资源。
 - 每个结果的拒绝/含糊路径都保持原工作区不变并保留 worktree、分支和状态。
 - 每个结果的同意路径同步预期可交付评测资产；只有 acceptance 通过修改生产
   Prompt。
+- asset-only 结果令 `delivery_commit == prepared_commit` 且不创建空 commit；
+  acceptance-pass 从 `prepared_commit` 创建唯一子 `delivery_commit`。
 - `reports/`、`.runtime/`、raw response、`__pycache__` 和其他 prompt ID 永不
   进入 patch。
 
@@ -690,12 +744,19 @@ profile patch。同步和内容验证成功后再清理精确周期资源。
   逐字和状态不变。
 - 目标冲突、原工作区 `HEAD` 漂移、worktree 身份漂移、extra changed path、
   contract path 重定向或 hash 验证失败都会精确回滚，且不启动清理。
-- worktree 不干净时拒绝非强制删除，保留分支和状态并列出风险文件。
-- 成功交付后只移除精确周期 worktree，然后 prune、删除精确周期分支和状态。
+- 固定 Git cleanliness 检查强制显示所有非 ignored untracked 文件；staged、tracked
+  修改或非 ignored untracked 文件都拒绝非强制删除，预期 ignored 运行产物允许
+  随 worktree 删除。
+- 成功交付后只移除精确周期 worktree；周期目录和 Git 注册都消失后，删除空的
+  `stabilizing-prompts/`、精确周期分支和单一 `STATE_PATH`，始终保留
+  `.worktrees/`。
 - 当前/默认/远端分支、其他 worktree 和其他周期不受影响。
 - 每个清理步骤失败都停止后续危险步骤，并按第 9.3 节保留诊断状态和已交付资产。
-- 清理实现从不调用 reflog expire、Git GC 或任意目标递归删除。
+- 清理实现从不调用 `git worktree prune`、reflog expire、Git GC 或任意目标递归
+  删除。
 - 清理重试重新验证 Git 身份和交付证据，不信任过期路径。
+- `STATE_PATH` 位于 managed worktree 外并原子更新；patch 和 patch manifest 只能
+  输出到当前周期 `.runtime/`，cleanup 不接受额外文件删除目标。
 
 ### 12.5 文档和行为合同
 
@@ -726,8 +787,9 @@ profile patch。同步和内容验证成功后再清理精确周期资源。
    acceptance-pass 同步精确冻结生产 Prompt 和可交付评测目录。
 9. 同步保持 unstaged/uncommitted，不影响无关脏文件、当前分支或 index；失败时
    精确回滚且不清理。
-10. 同步验证成功后，按序清理精确周期 worktree、Git 注册、周期分支和临时
-    状态；局部清理失败不回滚交付并保留可诊断状态。
+10. 同步验证成功并原子记录状态后，按序清理精确周期 worktree、Git 注册、空的
+    `stabilizing-prompts/`、周期分支和单一 `STATE_PATH`；当前周期目录不得残留，
+    `.worktrees/` 始终保留，局部清理失败不回滚交付并保留可诊断状态。
 11. `reports/`、`.runtime/`、manifest、原始响应、凭据和 Token 既不会进入资产
     commit 的可交付集合，也不会进入 delivery patch。
 12. 单元、Git 行为、集成、结果矩阵、回滚、逐步清理失败和文档契约测试共同
@@ -738,7 +800,8 @@ profile patch。同步和内容验证成功后再清理精确周期资源。
 稳定架构边界要求实现至少影响以下组件；具体私有函数拆分由实现计划决定：
 
 - worktree 管理脚本：repository-local exclude 解析/原子初始化、两阶段验证、
-  finalization 状态、result-aware delivery 和受控 cleanup CLI；
+  prepared/delivery commit 状态、单一原子周期状态、result-aware delivery 和受控
+  cleanup CLI；
 - 独立确定性简报生成模块或脚本；
 - Skill 主状态机与 worktree 生命周期参考；
 - worktree、行为合同、`tune` 集成和文档契约测试及必要 fixture；
