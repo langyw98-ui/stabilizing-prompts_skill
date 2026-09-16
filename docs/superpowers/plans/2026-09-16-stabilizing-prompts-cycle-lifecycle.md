@@ -28,6 +28,7 @@
 - Old states missing current ownership/finalization/cleanup fields are never migrated or automatically cleaned.
 - Runtime reports, `.runtime/`, raw responses, manifests, credentials, tokens, temporary patches, and `__pycache__` never enter prepared/delivery commits or patches.
 - All repository commands are run through `rtk`.
+- Every Python command runs through `rtk conda run -n kds python`; do not use the ambient Python, `.venv`, uv, Poetry, or another environment.
 - If the plan is executed with subagents, the primary orchestrator must first obtain the required run-level confirmation; every implementer, reviewer, fix agent, and final reviewer must be spawned explicitly with `model: "gpt-5.6-luna"`, `reasoning_effort: "max"`, and non-`all` fork context.
 
 ---
@@ -86,7 +87,7 @@ def test_cleanup_loader_rejects_legacy_state(tmp_path: Path) -> None:
 
 - [ ] **Step 2: Run the focused state tests and verify failure**
 
-Run: `rtk python -m pytest tests/test_manage_worktree.py -k "branch_ownership or atomic_cycle_save or cleanup_loader" -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_manage_worktree.py -k "branch_ownership or atomic_cycle_save or cleanup_loader" -q`
 
 Expected: FAIL because the new state types, ownership fields, atomic writer, and current-state gate do not exist.
 
@@ -146,7 +147,7 @@ Set branch ownership only after `git worktree add -b` succeeds. Generated branch
 
 - [ ] **Step 5: Run state and existing create/load tests**
 
-Run: `rtk python -m pytest tests/test_manage_worktree.py -k "cycle or branch or state" -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_manage_worktree.py -k "cycle or branch or state" -q`
 
 Expected: PASS, including existing legacy-path rejection and CLI state-save failure reporting.
 
@@ -214,7 +215,7 @@ Add named tests for byte preservation without a trailing newline, second-call by
 
 - [ ] **Step 2: Run exclude tests and verify failure**
 
-Run: `rtk python -m pytest tests/test_manage_worktree.py -k "local_exclude or runtime_ignore or initializes_repository" -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_manage_worktree.py -k "local_exclude or runtime_ignore or initializes_repository" -q`
 
 Expected: FAIL because `create_cycle()` still requires pre-existing project ignore behavior.
 
@@ -263,7 +264,7 @@ Add an integration test that removes runtime ignore coverage, invokes verify, an
 
 - [ ] **Step 6: Run setup, verify, and ordering tests**
 
-Run: `rtk python -m pytest tests/test_manage_worktree.py tests/test_integration_verify.py tests/test_behavior_contract.py -k "ignore or exclude or before_model_call" -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_manage_worktree.py tests/test_integration_verify.py tests/test_behavior_contract.py -k "ignore or exclude or before_model_call" -q`
 
 Expected: PASS.
 
@@ -324,7 +325,7 @@ Add tests for missing evidence, contradictory acceptance data, invalid finished 
 
 - [ ] **Step 2: Run the new test module and verify import failure**
 
-Run: `rtk python -m pytest tests/test_evaluation_summary.py -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_evaluation_summary.py -q`
 
 Expected: FAIL because `scripts.evaluation_summary` does not exist.
 
@@ -378,7 +379,7 @@ Use a fixed section order matching Spec 7.3. Render only normalized evidence, so
 
 - [ ] **Step 5: Run summary tests**
 
-Run: `rtk python -m pytest tests/test_evaluation_summary.py -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_evaluation_summary.py -q`
 
 Expected: PASS.
 
@@ -438,7 +439,7 @@ Add tests for all seven formal results, declined/ambiguous confirmation preservi
 
 - [ ] **Step 2: Run finalization tests and verify failure**
 
-Run: `rtk python -m pytest tests/test_finalize_cycle.py -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_finalize_cycle.py -q`
 
 Expected: FAIL because the finalization module and APIs do not exist.
 
@@ -468,7 +469,7 @@ SHA-256. `approve` is called only after an explicit affirmative user answer and 
 both `delivery_confirmed=True` and `cleanup.authorized=True` while resolving the delivery commit.
 An ambiguous or negative answer does not call `approve` and leaves the prepared cycle unchanged.
 
-Run: `rtk python -m pytest tests/test_finalize_cycle.py tests/test_manage_worktree.py -k "finaliz or prepared or delivery_commit or allowlist" -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_finalize_cycle.py tests/test_manage_worktree.py -k "finaliz or prepared or delivery_commit or allowlist" -q`
 
 Expected: PASS.
 
@@ -529,7 +530,7 @@ def test_apply_rolls_back_when_verified_state_save_fails(
 
 - [ ] **Step 3: Run delivery tests and verify failure**
 
-Run: `rtk python -m pytest tests/test_manage_worktree.py tests/test_behavior_contract.py -k "summary or runtime_output or state_save_fails" -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_manage_worktree.py tests/test_behavior_contract.py -k "summary or runtime_output or state_save_fails" -q`
 
 Expected: FAIL because summary paths are not allowlisted, output locations are unrestricted, and verified callbacks do not participate in rollback.
 
@@ -543,7 +544,7 @@ After destination hash verification and before returning, invoke `on_verified(pr
 
 - [ ] **Step 6: Run all delivery tests**
 
-Run: `rtk python -m pytest tests/test_manage_worktree.py tests/test_behavior_contract.py -k "delivery or patch or allowlist or rollback" -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_manage_worktree.py tests/test_behavior_contract.py -k "delivery or patch or allowlist or rollback" -q`
 
 Expected: PASS.
 
@@ -620,7 +621,7 @@ Add one injected failure per checkpoint: worktree removal, directory/registratio
 
 - [ ] **Step 3: Run cleanup tests and verify failure**
 
-Run: `rtk python -m pytest tests/test_manage_worktree.py -k "cleanup" -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_manage_worktree.py -k "cleanup" -q`
 
 Expected: FAIL because cleanup types, implementation, and CLI do not exist.
 
@@ -655,7 +656,7 @@ When a saved flag is true, require the corresponding current postcondition inste
 
 - [ ] **Step 7: Run all worktree tests**
 
-Run: `rtk python -m pytest tests/test_manage_worktree.py -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_manage_worktree.py -q`
 
 Expected: PASS.
 
@@ -710,7 +711,7 @@ Parameterize scenarios for `no_change_needed`, `no_strict_improvement`, `validat
 
 - [ ] **Step 3: Run matrix tests and verify failure**
 
-Run: `rtk python -m pytest tests/test_integration_tune.py tests/test_behavior_contract.py -k "finaliz or formal_result or no_change or acceptance" -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_integration_tune.py tests/test_behavior_contract.py -k "finaliz or formal_result or no_change or acceptance" -q`
 
 Expected: FAIL because the harness still returns early for several scored outcomes and retains successful worktrees.
 
@@ -724,7 +725,7 @@ Inject removal of runtime ignore behavior after business confirmation and assert
 
 - [ ] **Step 6: Run integration suites**
 
-Run: `rtk python -m pytest tests/test_integration_tune.py tests/test_behavior_contract.py tests/test_integration_verify.py -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_integration_tune.py tests/test_behavior_contract.py tests/test_integration_verify.py -q`
 
 Expected: PASS.
 
@@ -774,7 +775,7 @@ Update the ordered tune-state assertion to include `repository-local exclude ini
 
 - [ ] **Step 2: Run documentation contract tests and verify failure**
 
-Run: `rtk python -m pytest tests/test_skill_instructions.py tests/test_skill_structure.py tests/test_behavior_contract.py -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_skill_instructions.py tests/test_skill_structure.py tests/test_behavior_contract.py -q`
 
 Expected: FAIL on obsolete manual-ignore, direct no-change exit, failure-only asset delivery, and retained-success-worktree text.
 
@@ -797,11 +798,11 @@ Delete claims that users must establish ignore rules, `no_change_needed` skips a
 
 - [ ] **Step 5: Run documentation and complete regression suites**
 
-Run: `rtk python -m pytest tests/test_skill_instructions.py tests/test_skill_structure.py tests/test_behavior_contract.py -q`
+Run: `rtk conda run -n kds python -m pytest tests/test_skill_instructions.py tests/test_skill_structure.py tests/test_behavior_contract.py -q`
 
 Expected: PASS.
 
-Run: `rtk python -m pytest -q`
+Run: `rtk conda run -n kds python -m pytest -q`
 
 Expected: PASS with zero failures.
 
@@ -826,7 +827,7 @@ rtk git commit -m "docs: align stabilizing prompts lifecycle"
 
 ## Final Verification
 
-- [ ] Run: `rtk python -m pytest -q`
+- [ ] Run: `rtk conda run -n kds python -m pytest -q`
 
   Expected: PASS with zero failures.
 
