@@ -13,7 +13,9 @@ import pytest
 from scripts import manage_worktree
 from scripts.manage_worktree import (
     AllowlistError,
+    CleanupProgress,
     FAILURE_ALLOWLIST,
+    FinalizationState,
     SUCCESS_ALLOWLIST,
     DeliveryConflict,
     DeliveryError,
@@ -25,6 +27,7 @@ from scripts.manage_worktree import (
     load_cycle,
     main,
     preflight_patch,
+    save_cycle_atomic,
 )
 
 
@@ -153,6 +156,65 @@ def test_cycle_base_is_original_head(repo: tuple[Path, str]) -> None:
     assert cycle.original_repo == original.resolve()
     assert cycle.worktree.is_dir()
     assert cycle.branch
+
+
+def test_new_cycle_records_branch_ownership(repo: tuple[Path, str]) -> None:
+    original, prompt_id = repo
+
+    generated = create_cycle(original, prompt_id)
+
+    assert generated.state_version == 2
+    assert generated.branch_ref == f"refs/heads/{generated.branch}"
+    assert generated.branch_origin == "generated"
+    assert generated.branch_created_by_cycle is True
+
+
+def test_custom_cycle_records_custom_branch_ownership(repo: tuple[Path, str]) -> None:
+    original, prompt_id = repo
+
+    cycle = create_cycle(original, prompt_id, branch="custom/cycle")
+
+    assert cycle.branch_ref == "refs/heads/custom/cycle"
+    assert cycle.branch_origin == "custom"
+    assert cycle.branch_created_by_cycle is True
+
+
+def test_atomic_cycle_save_preserves_previous_bytes_on_replace_failure(
+    completed_cycle: WorktreeCycle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "cycle.json"
+    state.write_bytes(b'{"sentinel": true}\n')
+    monkeypatch.setattr(
+        manage_worktree.os,
+        "replace",
+        lambda source, target: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(WorktreeError, match="replace failed"):
+        save_cycle_atomic(completed_cycle, state)
+
+    assert state.read_bytes() == b'{"sentinel": true}\n'
+    assert list(tmp_path.glob(f".{state.name}.*.tmp")) == []
+
+
+def test_cleanup_loader_rejects_legacy_state(tmp_path: Path) -> None:
+    state = tmp_path / "legacy.json"
+    state.write_text(
+        json.dumps(
+            {
+                "original_repo": "x",
+                "worktree": "y",
+                "branch": "z",
+                "cycle_base_commit": "a",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorktreeError, match="current lifecycle state"):
+        load_cycle(state, require_current=True)
 
 
 def _freeze_cycle_uuid(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -431,6 +431,121 @@ def _discover_prompt_path(cycle: "WorktreeCycle") -> str | None:
 
 
 @dataclass(frozen=True, slots=True)
+class CleanupProgress:
+    """Atomically persisted progress for the exact cleanup checkpoints."""
+
+    authorized: bool = False
+    worktree_removed: bool = False
+    managed_parent_handled: bool = False
+    branch_deleted: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "authorized": self.authorized,
+            "worktree_removed": self.worktree_removed,
+            "managed_parent_handled": self.managed_parent_handled,
+            "branch_deleted": self.branch_deleted,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "CleanupProgress":
+        if not isinstance(value, Mapping):
+            raise WorktreeError("cycle cleanup state must contain an object")
+        fields = (
+            "authorized",
+            "worktree_removed",
+            "managed_parent_handled",
+            "branch_deleted",
+        )
+        invalid = [name for name in fields if not isinstance(value.get(name, False), bool)]
+        if invalid:
+            raise WorktreeError(
+                "cycle cleanup state contains non-boolean fields: "
+                + ", ".join(invalid)
+            )
+        return cls(**{name: value.get(name, False) for name in fields})
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizationState:
+    """The final scored result and all delivery/cleanup state for a cycle."""
+
+    result_kind: str
+    stop_reason: str
+    finished_at_utc: str
+    summary_path: str
+    delivery_profile: str
+    prepared_commit: str
+    frozen_candidate_path: str | None = None
+    frozen_candidate_hash: str | None = None
+    delivery_commit: str | None = None
+    delivery_confirmed: bool = False
+    delivery_applied: bool = False
+    delivery_verified: bool = False
+    cleanup: CleanupProgress = field(default_factory=CleanupProgress)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "result_kind": self.result_kind,
+            "stop_reason": self.stop_reason,
+            "finished_at_utc": self.finished_at_utc,
+            "summary_path": self.summary_path,
+            "delivery_profile": self.delivery_profile,
+            "prepared_commit": self.prepared_commit,
+            "frozen_candidate_path": self.frozen_candidate_path,
+            "frozen_candidate_hash": self.frozen_candidate_hash,
+            "delivery_commit": self.delivery_commit,
+            "delivery_confirmed": self.delivery_confirmed,
+            "delivery_applied": self.delivery_applied,
+            "delivery_verified": self.delivery_verified,
+            "cleanup": self.cleanup.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "FinalizationState":
+        if not isinstance(value, Mapping):
+            raise WorktreeError("cycle finalization state must contain an object")
+        required = (
+            "result_kind",
+            "stop_reason",
+            "finished_at_utc",
+            "summary_path",
+            "delivery_profile",
+            "prepared_commit",
+        )
+        if any(not isinstance(value.get(name), str) or not value[name] for name in required):
+            raise WorktreeError("cycle finalization state is missing required fields")
+        optional = ("frozen_candidate_path", "frozen_candidate_hash", "delivery_commit")
+        if any(value.get(name) is not None and not isinstance(value.get(name), str) for name in optional):
+            raise WorktreeError("cycle finalization state contains invalid optional fields")
+        boolean_fields = (
+            "delivery_confirmed",
+            "delivery_applied",
+            "delivery_verified",
+        )
+        if any(not isinstance(value.get(name, False), bool) for name in boolean_fields):
+            raise WorktreeError("cycle finalization state contains non-boolean fields")
+        cleanup_value = value.get("cleanup", {})
+        if not isinstance(cleanup_value, Mapping):
+            raise WorktreeError("cycle finalization state cleanup must contain an object")
+        return cls(
+            result_kind=str(value["result_kind"]),
+            stop_reason=str(value["stop_reason"]),
+            finished_at_utc=str(value["finished_at_utc"]),
+            summary_path=str(value["summary_path"]),
+            delivery_profile=str(value["delivery_profile"]),
+            prepared_commit=str(value["prepared_commit"]),
+            frozen_candidate_path=value.get("frozen_candidate_path"),
+            frozen_candidate_hash=value.get("frozen_candidate_hash"),
+            delivery_commit=value.get("delivery_commit"),
+            delivery_confirmed=bool(value.get("delivery_confirmed", False)),
+            delivery_applied=bool(value.get("delivery_applied", False)),
+            delivery_verified=bool(value.get("delivery_verified", False)),
+            cleanup=CleanupProgress.from_dict(cleanup_value),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WorktreeCycle:
     """Identity of one isolated tuning cycle."""
 
@@ -441,6 +556,14 @@ class WorktreeCycle:
     prompt_id: str | None = None
     prompt_path: str | None = None
     final_worktree_commit: str | None = None
+    state_version: int = 2
+    branch_ref: str | None = None
+    branch_origin: str | None = None
+    branch_created_by_cycle: bool = False
+    exclude_initialized: bool = False
+    precreate_ignore_verified: bool = False
+    runtime_ignores_verified: bool = False
+    finalization: FinalizationState | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "original_repo", Path(self.original_repo).resolve(strict=False))
@@ -467,6 +590,16 @@ class WorktreeCycle:
             "prompt_id": self.prompt_id,
             "prompt_path": self.prompt_path,
             "final_worktree_commit": self.final_worktree_commit,
+            "state_version": self.state_version,
+            "branch_ref": self.branch_ref,
+            "branch_origin": self.branch_origin,
+            "branch_created_by_cycle": self.branch_created_by_cycle,
+            "exclude_initialized": self.exclude_initialized,
+            "precreate_ignore_verified": self.precreate_ignore_verified,
+            "runtime_ignores_verified": self.runtime_ignores_verified,
+            "finalization": (
+                self.finalization.to_dict() if self.finalization is not None else None
+            ),
         }
 
     @classmethod
@@ -474,13 +607,33 @@ class WorktreeCycle:
         required = ("original_repo", "worktree", "branch", "cycle_base_commit")
         if any(not isinstance(value.get(key), str) or not value[key] for key in required):
             raise WorktreeError("cycle state is missing required identity")
+        state_version_value = value.get("state_version", 1)
+        if type(state_version_value) is not int or state_version_value < 1:
+            raise WorktreeError("cycle state has an invalid state version")
+        finalization_value = value.get("finalization")
+        if finalization_value is not None and not isinstance(finalization_value, Mapping):
+            raise WorktreeError("cycle finalization state must contain an object")
+        finalization = (
+            FinalizationState.from_dict(finalization_value)
+            if isinstance(finalization_value, Mapping)
+            else None
+        )
+        original_repo = Path(str(value["original_repo"]))
+        worktree = Path(str(value["worktree"]))
+        # A cleanup retry may load the state after its exact worktree has been
+        # removed.  The saved checkpoint is the only condition that permits
+        # that missing path; all other states still require the directory.
+        require_worktree = not (
+            finalization is not None and finalization.cleanup.worktree_removed
+        )
         _validate_managed_worktree_path(
-            Path(str(value["original_repo"])),
-            Path(str(value["worktree"])),
+            original_repo,
+            worktree,
+            require_exists=require_worktree,
         )
         return cls(
-            original_repo=Path(str(value["original_repo"])),
-            worktree=Path(str(value["worktree"])),
+            original_repo=original_repo,
+            worktree=worktree,
             branch=str(value["branch"]),
             cycle_base_commit=str(value["cycle_base_commit"]),
             prompt_id=value.get("prompt_id") if isinstance(value.get("prompt_id"), str) else None,
@@ -490,6 +643,30 @@ class WorktreeCycle:
                 if isinstance(value.get("final_worktree_commit"), str)
                 else None
             ),
+            state_version=state_version_value,
+            branch_ref=value.get("branch_ref") if isinstance(value.get("branch_ref"), str) else None,
+            branch_origin=value.get("branch_origin") if isinstance(value.get("branch_origin"), str) else None,
+            branch_created_by_cycle=(
+                value.get("branch_created_by_cycle")
+                if isinstance(value.get("branch_created_by_cycle"), bool)
+                else False
+            ),
+            exclude_initialized=(
+                value.get("exclude_initialized")
+                if isinstance(value.get("exclude_initialized"), bool)
+                else False
+            ),
+            precreate_ignore_verified=(
+                value.get("precreate_ignore_verified")
+                if isinstance(value.get("precreate_ignore_verified"), bool)
+                else False
+            ),
+            runtime_ignores_verified=(
+                value.get("runtime_ignores_verified")
+                if isinstance(value.get("runtime_ignores_verified"), bool)
+                else False
+            ),
+            finalization=finalization,
         )
 
 
@@ -500,6 +677,43 @@ def _validate_managed_cycle(cycle: WorktreeCycle) -> None:
     if root != cycle.original_repo:
         raise WorktreeError("cycle original repository is not canonical")
     _validate_managed_worktree_path(root, cycle.worktree)
+
+
+def _validate_current_cycle(cycle: WorktreeCycle) -> None:
+    """Require ownership metadata before a lifecycle mutation can proceed."""
+
+    if cycle.state_version != 2:
+        raise WorktreeError("current lifecycle state requires state_version 2")
+    if not isinstance(cycle.branch_ref, str) or not cycle.branch_ref:
+        raise WorktreeError("current lifecycle state is missing branch ownership")
+    if cycle.branch_origin not in {"generated", "custom"}:
+        raise WorktreeError("current lifecycle state has invalid branch origin")
+    if cycle.branch_created_by_cycle is not True:
+        raise WorktreeError("current lifecycle state is missing branch creation record")
+    expected_ref = f"refs/heads/{cycle.branch}"
+    if cycle.branch_ref != expected_ref:
+        raise WorktreeError("current lifecycle state has a mismatched branch ref")
+    if not cycle.branch_ref.startswith("refs/heads/"):
+        raise WorktreeError("current lifecycle state has an invalid branch ref")
+    branch_name = cycle.branch_ref[len("refs/heads/") :]
+    if not branch_name:
+        raise WorktreeError("current lifecycle state has an invalid branch ref")
+    _validate_branch_name(branch_name)
+    ref_check = _git(cycle.original_repo, "check-ref-format", cycle.branch_ref, check=False)
+    if ref_check.returncode != 0:
+        raise WorktreeError("current lifecycle state has an invalid branch ref")
+
+
+def _validate_state_path(cycle: WorktreeCycle, path: Path) -> Path:
+    """Ensure the authoritative state file survives removal of the worktree."""
+
+    destination = Path(path).resolve(strict=False)
+    worktree = Path(cycle.worktree).resolve(strict=False)
+    if _path_is_within(destination, worktree):
+        raise WorktreeError(
+            "cycle state must remain outside the managed cycle worktree"
+        )
+    return destination
 
 
 def _safe_slug(value: str) -> str:
@@ -640,6 +854,9 @@ def create_cycle(
         cycle_base_commit=base,
         prompt_id=prompt_id,
         prompt_path=resolved_prompt,
+        branch_ref=f"refs/heads/{selected_branch}",
+        branch_origin="custom" if branch is not None else "generated",
+        branch_created_by_cycle=True,
     )
 
 
@@ -1418,23 +1635,57 @@ def apply_delivery_patch(
         raise
 
 
+def save_cycle_atomic(cycle: WorktreeCycle, path: Path) -> None:
+    """Persist cycle state with a same-directory durable replacement."""
+
+    destination = _validate_state_path(cycle, Path(path))
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise WorktreeError(f"unable to atomically save cycle state: {error}") from error
+    temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    payload = json.dumps(cycle.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    try:
+        with temporary.open("x", encoding="utf-8", newline="") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except OSError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise WorktreeError(f"unable to atomically save cycle state: {error}") from error
+
+
 def save_cycle(cycle: WorktreeCycle, path: Path) -> None:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(cycle.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    """Compatibility alias for the atomic state writer."""
+
+    save_cycle_atomic(cycle, path)
 
 
-def load_cycle(path: Path) -> WorktreeCycle:
+def load_cycle(path: Path, *, require_current: bool = False) -> WorktreeCycle:
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception as error:
         raise WorktreeError(f"cycle state is unreadable: {error}") from None
     if not isinstance(value, Mapping):
         raise WorktreeError("cycle state must contain an object")
-    return WorktreeCycle.from_dict(value)
+    if require_current:
+        ownership_fields = (
+            "state_version",
+            "branch_ref",
+            "branch_origin",
+            "branch_created_by_cycle",
+        )
+        if any(field_name not in value for field_name in ownership_fields):
+            raise WorktreeError("current lifecycle state is required")
+    cycle = WorktreeCycle.from_dict(value)
+    _validate_state_path(cycle, Path(path))
+    if require_current:
+        _validate_current_cycle(cycle)
+    return cycle
 
 
 def save_patch(patch: DeliveryPatch, patch_path: Path, manifest_path: Path) -> None:
@@ -1532,10 +1783,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "AllowlistError",
+    "CleanupProgress",
     "DeliveryConflict",
     "DeliveryError",
     "DeliveryPatch",
     "FAILURE_ALLOWLIST",
+    "FinalizationState",
     "Patch",
     "PatchError",
     "SUCCESS_ALLOWLIST",
@@ -1550,6 +1803,7 @@ __all__ = [
     "main",
     "preflight_patch",
     "save_cycle",
+    "save_cycle_atomic",
     "save_patch",
 ]
 
