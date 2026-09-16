@@ -7,6 +7,7 @@
 
 | 修订 | 日期 | 变更内容 |
 | --- | --- | --- |
+| 5 | 2026-09-16 | 明确所有正式结果的精简历史写入时机、交付状态写入失败的回滚语义，以及部分清理失败后的恢复门禁；澄清 cleanup 的状态路径参数。 |
 | 4 | 2026-09-16 | 明确自定义周期分支的创建所有权与清理门禁，并为 local exclude 初始化增加有限乐观并发保护。 |
 | 3 | 2026-09-16 | 新增文档内历史变更记录。 |
 | 2 | 2026-09-16 | 收紧 worktree 清理范围，明确双 commit、单一状态文件及确定性 cleanliness 合同。 |
@@ -217,7 +218,7 @@ preflight
   -> optional single acceptance activity
   -> scored terminal outcome
   -> normalize final result and render summary
-  -> commit summary and deliverable evaluation assets as prepared_commit
+  -> append compact history and commit summary/deliverable evaluation assets as prepared_commit
   -> show result, summary path, and delivery set
   -> delivery-and-cleanup confirmation
        -> declined/ambiguous: retain cycle unchanged
@@ -425,11 +426,12 @@ git check-ignore --no-index --quiet --
 
 ### 7.5 推荐设计及候选方案
 
-推荐使用独立的确定性生成器，将支持版本的报告与周期状态渲染为 Markdown，
-并在交付确认前把简报与可交付评测资产一起提交为 `prepared_commit`。该边界让
-相同证据产生稳定内容，使 Git 层只处理已经确定的文件，不让自然语言生成承担
-身份或路由职责。替代实现可以更换内部模块或模板，只要保持完整内容合同、
-确定性、fail-closed 证据校验和敏感信息排除。
+推荐使用独立的确定性生成器，将支持版本的报告与周期状态渲染为 Markdown。
+所有正式结果都必须先把本周期结论追加到精简历史，再在交付确认前把该历史、
+简报与其他可交付评测资产一起提交为 `prepared_commit`；用户随后拒绝交付不撤销
+这个 worktree 内的已提交结果。该边界让相同证据产生稳定内容，使 Git 层只处理
+已经确定的文件，不让自然语言生成承担身份或路由职责。替代实现可以更换内部
+模块或模板，只要保持完整内容合同、确定性、fail-closed 证据校验和敏感信息排除。
 
 - **让模型自由读取 raw response 并总结**：拒绝。它会产生新事实、非确定输出
   和敏感内容泄漏风险。
@@ -471,9 +473,10 @@ worktree/分支/状态，并保留已提交简报和证据。
 
 只有 acceptance 通过且用户确认时，才从 `prepared_commit` 把冻结候选作为
 worktree 中的生产 Prompt，更新 `prompt-contract.yaml` 当前 Prompt 的非路径字段，
-追加精简历史并创建子 `delivery_commit`。asset-only 结果不创建空 commit，直接令
-`delivery_commit == prepared_commit`。committed contract 必须继续指向周期开始时
-的 canonical Prompt path；任何路径重定向都拒绝交付。
+并创建子 `delivery_commit`；本周期精简历史已经属于 `prepared_commit`，不得在
+确认后重复追加。asset-only 结果不创建空 commit，直接令
+`delivery_commit == prepared_commit`。committed contract 必须继续指向周期开始
+时的 canonical Prompt path；任何路径重定向都拒绝交付。
 
 ### 8.3 交付前门禁
 
@@ -512,7 +515,8 @@ worktree 中的生产 Prompt，更新 `prompt-contract.yaml` 当前 Prompt 的�
    checkout。
 7. 现有 `--out` 和 `--out-manifest` CLI 形状保持不变，但两个输出必须经机械验证
    位于当前周期精确 `.runtime/` 下；apply 与目标验证成功后先原子更新
-   `STATE_PATH`，再允许开始清理。
+   `STATE_PATH`，再允许开始清理。该状态更新仍属于交付步骤；更新失败时恢复 apply
+   前的精确快照、不得报告交付成功，也不得进入清理。
 
 复用该责任边界是推荐默认设计，因为它继承现有 cycle-base 身份、stale-state
 guard、canonical prompt 约束、原生 Git patch 解析、精确 snapshot 和回滚行为。
@@ -539,7 +543,7 @@ guard、canonical prompt 约束、原生 Git patch 解析、精确 snapshot 和�
 
 ### 9.1 启动条件
 
-清理器只有在以下条件同时成立时运行：
+首次启动清理时，清理器只有在以下条件同时成立时运行：
 
 - 用户明确确认本次结果的交付及交付成功后的清理；
 - canonical patch 已应用；
@@ -550,6 +554,11 @@ guard、canonical prompt 约束、原生 Git patch 解析、精确 snapshot 和�
 - `STATE_PATH` 已原子记录交付应用、目标验证成功和 cleanup 授权。
 
 任何同步或验证错误发生在清理之前并阻止清理。
+
+这些是首次启动门禁，不用于否定已经进入清理后保存的部分完成状态。某一步清理
+失败后的再次调用按照第 9.3 节恢复：重新验证已完成步骤的后置条件，并只对仍存在
+的资源执行相应前置检查；已经按合同验证为移除的 worktree 或分支不需要重新满足
+本节的存在性或 cleanliness 条件。
 
 ### 9.2 推荐顺序与安全理由
 
@@ -612,7 +621,9 @@ verify fixed Git cleanliness
 
 失败后不猜测替代目标、不扩大范围、不执行仓库级破坏性命令。重试必须重新验证
 已完成交付证据以及每一步的当前后置条件；已经缺失的 worktree 或分支只有在精确
-身份和前置步骤状态一致时才能视为已完成，不能仅凭旧路径重放命令。
+身份、已原子保存的逐步完成状态和当前后置条件一致时才能视为已完成，不能仅凭
+旧路径重放命令。每个成功清理步骤必须在继续下一个破坏性步骤前原子更新
+`STATE_PATH`。
 
 ### 9.4 候选方案与取舍
 
@@ -624,8 +635,9 @@ verify fixed Git cleanliness
 - **使用 `git worktree remove --force`**：拒绝。它可能丢弃未提交或未跟踪内容。
 - **运行 `git worktree prune`**：拒绝。它扫描仓库级 worktree 注册，超出当前
   精确周期的清理授权；精确 `worktree remove` 已负责移除对应注册。
-- **使用调用者给出的任意 worktree、branch 或状态路径**：拒绝。清理目标必须
-  从经过验证的周期状态派生。
+- **使用调用者给出的任意 worktree、branch 或额外状态删除路径**：拒绝。CLI 的
+  `--state STATE_PATH` 只定位本周期唯一状态文件；worktree、branch 和其他清理目标
+  必须从该文件中经过验证的周期状态派生。
 - **使用安全分支删除 `-d`**：不采用为默认。周期 commit 有意不 merge，`-d`
   会阻止正常成功清理；受严格身份校验和明确用户授权保护的 `-D` 符合该生命周期。
 - **清理失败时回滚已验证交付**：拒绝。清理与交付不是同一原子事务，回滚会
@@ -696,8 +708,8 @@ exclude 初始化和两阶段验证应由受控 worktree 管理接口提供；�
 ### 11.2 基线全部通过
 
 1. dev/validation 的全部计划槽位完成并通过；不生成候选、不运行 acceptance。
-2. 结果规范化为 `no_change_needed`，生成独立简报并与可交付评测资产提交为
-   `prepared_commit`。
+2. 结果规范化为 `no_change_needed`，把本周期结论追加到精简历史，生成独立简报
+   并与可交付评测资产提交为 `prepared_commit`。
 3. 展示结论、简报路径和资产-only 交付集合，请求一次确认。
 4. 拒绝时保留整个周期；同意时令 `delivery_commit == prepared_commit`，只同步
    可交付评测目录，不创建空 commit。
@@ -717,9 +729,10 @@ acceptance 保持每周期一次，不编辑候选也不重跑。正式结果记
 ### 11.5 acceptance 通过
 
 结果记录所有适用门禁已通过，先把简报与可交付评测资产提交为
-`prepared_commit`。确认后在其上建立包含冻结生产 Prompt、contract 非路径字段和
-精简历史的子 `delivery_commit`；实时构建 success profile patch。同步和内容验证
-成功、`STATE_PATH` 原子记录完成后再清理精确周期资源。
+`prepared_commit`。确认后在其上建立包含冻结生产 Prompt 和 contract 非路径字段
+的子 `delivery_commit`；精简历史已经包含在 `prepared_commit`，不得重复追加。
+随后实时构建 success profile patch。同步和内容验证成功、`STATE_PATH` 原子记录
+完成后再清理精确周期资源。
 
 ### 11.6 setup、交付或清理失败
 
@@ -727,6 +740,8 @@ acceptance 保持每周期一次，不编辑候选也不重跑。正式结果记
   路径验证失败只保留已创建 worktree/分支供检查。
 - patch preflight/apply/目标验证失败：恢复精确快照，原工作区无部分交付，保留
   worktree、分支和状态，不运行清理。
+- apply 与目标验证成功、但交付完成状态无法原子写入 `STATE_PATH`：仍恢复 apply
+  前的精确快照，不宣告交付成功，也不运行清理。
 - 清理失败：保留已验证交付，停止后续危险步骤并保留单一 `STATE_PATH`；只有最终
   状态文件删除自身失败时，报告该精确残留而不回滚已完成清理。
 
@@ -775,6 +790,9 @@ acceptance 保持每周期一次，不编辑候选也不重跑。正式结果记
 - 每个结果的拒绝/含糊路径都保持原工作区不变并保留 worktree、分支和状态。
 - 每个结果的同意路径同步预期可交付评测资产；只有 acceptance 通过修改生产
   Prompt。
+- 每个正式结果都在 `prepared_commit` 前把本周期结论追加到精简历史；拒绝交付时
+  该提交保留在 worktree，asset-only 同意路径同步该历史，acceptance-pass 的子
+  `delivery_commit` 不重复追加。
 - asset-only 结果令 `delivery_commit == prepared_commit` 且不创建空 commit；
   acceptance-pass 从 `prepared_commit` 创建唯一子 `delivery_commit`。
 - `reports/`、`.runtime/`、raw response、`__pycache__` 和其他 prompt ID 永不
@@ -786,6 +804,8 @@ acceptance 保持每周期一次，不编辑候选也不重跑。正式结果记
   逐字和状态不变。
 - 目标冲突、原工作区 `HEAD` 漂移、worktree 身份漂移、extra changed path、
   contract path 重定向或 hash 验证失败都会精确回滚，且不启动清理。
+- apply 和目标验证成功后，若 `STATE_PATH` 的交付完成状态无法原子写入，则仍精确
+  回滚原工作区、不报告交付成功且不启动清理。
 - 固定 Git cleanliness 检查强制显示所有非 ignored untracked 文件；staged、tracked
   修改或非 ignored untracked 文件都拒绝非强制删除，预期 ignored 运行产物允许
   随 worktree 删除。
@@ -799,6 +819,8 @@ acceptance 保持每周期一次，不编辑候选也不重跑。正式结果记
   已成为当前/默认分支或被其他 worktree 使用的分支都拒绝删除并保留状态。
 - 当前/默认/远端分支、其他 worktree 和其他周期不受影响。
 - 每个清理步骤失败都停止后续危险步骤，并按第 9.3 节保留诊断状态和已交付资产。
+- worktree 已移除但后续容器或分支清理失败时，重试依据原子保存的逐步状态和当前
+  后置条件继续，不要求已移除 worktree 再次满足首次启动门禁，也不重复删除它。
 - 清理实现从不调用 `git worktree prune`、reflog expire、Git GC 或任意目标递归
   删除。
 - 清理重试重新验证 Git 身份和交付证据，不信任过期路径。
@@ -833,10 +855,11 @@ acceptance 保持每周期一次，不编辑候选也不重跑。正式结果记
 8. 非 acceptance-pass 结果只同步当前 prompt ID 的可交付评测内容；
    acceptance-pass 同步精确冻结生产 Prompt 和可交付评测目录。
 9. 同步保持 unstaged/uncommitted，不影响无关脏文件、当前分支或 index；失败时
-   精确回滚且不清理。
+   精确回滚且不清理；目标验证后的交付状态原子写入失败也遵循同一规则。
 10. 同步验证成功并原子记录状态后，按序清理精确周期 worktree、Git 注册、空的
     `stabilizing-prompts/`、周期分支和单一 `STATE_PATH`；当前周期目录不得残留，
-    `.worktrees/` 始终保留，局部清理失败不回滚交付并保留可诊断状态。
+    `.worktrees/` 始终保留，局部清理失败不回滚交付并保留可诊断状态；重试按已
+    原子保存的逐步状态恢复，而不重新要求已移除资源满足首次启动门禁。
 11. `reports/`、`.runtime/`、manifest、原始响应、凭据和 Token 既不会进入资产
     commit 的可交付集合，也不会进入 delivery patch。
 12. 单元、Git 行为、集成、结果矩阵、回滚、逐步清理失败和文档契约测试共同
