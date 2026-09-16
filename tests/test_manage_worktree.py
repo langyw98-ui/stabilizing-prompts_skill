@@ -400,6 +400,523 @@ def finalized_cycle(finalized_state: Path) -> WorktreeCycle:
 
 
 @pytest.fixture
+def delivered_state(finalized_state: Path) -> Path:
+    """Persist a finalized cycle after its real delivery has been verified."""
+
+    cycle = load_cycle(finalized_state, require_current=True)
+    patch = build_delivery_patch(cycle)
+    apply_delivery_patch(cycle, patch)
+    assert cycle.finalization is not None
+    delivered = replace(
+        cycle,
+        finalization=replace(
+            cycle.finalization,
+            delivery_applied=True,
+            delivery_verified=True,
+        ),
+    )
+    save_cycle_atomic(delivered, finalized_state)
+    return finalized_state
+
+
+def test_cleanup_removes_only_exact_verified_cycle(delivered_state: Path) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    original = cycle.original_repo
+    branch_ref = cycle.branch_ref
+    assert branch_ref is not None
+
+    outcome = manage_worktree.cleanup_cycle(delivered_state)
+
+    assert isinstance(outcome, manage_worktree.CleanupOutcome)
+    assert outcome.status == "complete"
+    assert not cycle.worktree.exists()
+    assert git(original, "show-ref", "--verify", branch_ref, check=False) == ""
+    assert not delivered_state.exists()
+    assert (original / ".worktrees").is_dir()
+
+
+@pytest.mark.parametrize("field", ["authorized", "delivery_applied", "delivery_verified"])
+def test_cleanup_rejects_missing_gate(delivered_state: Path, field: str) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    finalization = cycle.finalization
+    assert finalization is not None
+    cleanup = replace(finalization.cleanup, authorized=False) if field == "authorized" else finalization.cleanup
+    changed = replace(
+        finalization,
+        cleanup=cleanup,
+        **({field: False} if field != "authorized" else {}),
+    )
+    save_cycle_atomic(replace(cycle, finalization=changed), delivered_state)
+
+    with pytest.raises(WorktreeError, match="cleanup gate"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+
+@pytest.mark.parametrize("kind", ["tracked", "staged", "untracked"])
+def test_cleanup_rejects_nonignored_worktree_dirt(
+    delivered_state: Path, kind: str
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    if kind == "tracked":
+        target = cycle.worktree / "prompts" / "classify.md"
+        target.write_text("dirty tracked\n", encoding="utf-8")
+    elif kind == "staged":
+        target = cycle.worktree / "prompts" / "classify.md"
+        target.write_text("dirty staged\n", encoding="utf-8")
+        git(cycle.worktree, "add", str(target.relative_to(cycle.worktree)))
+    else:
+        target = cycle.worktree / "not-ignored.txt"
+        target.write_text("dirty untracked\n", encoding="utf-8")
+
+    with pytest.raises(WorktreeError, match="clean|dirty|untracked|tracked"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    assert cycle.worktree.exists()
+    assert delivered_state.exists()
+    assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
+
+
+def test_cleanup_allows_ignored_runtime_files(delivered_state: Path) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    runtime = cycle.worktree / ".prompt-evals" / cycle.prompt_id / ".runtime"
+    reports = cycle.worktree / ".prompt-evals" / cycle.prompt_id / "reports"
+    (runtime / "raw-response.json").write_text("runtime\n", encoding="utf-8")
+    (reports / "raw-report.json").write_text("report\n", encoding="utf-8")
+
+    outcome = manage_worktree.cleanup_cycle(delivered_state)
+
+    assert outcome.status == "complete"
+    assert not cycle.worktree.exists()
+    assert not delivered_state.exists()
+
+
+def test_cleanup_preserves_other_cycle_and_managed_parent(
+    delivered_state: Path,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    other = create_cycle(cycle.original_repo, cycle.prompt_id or "classify")
+
+    outcome = manage_worktree.cleanup_cycle(delivered_state)
+
+    assert outcome.status == "complete"
+    assert not cycle.worktree.exists()
+    assert other.worktree.is_dir()
+    assert other.branch in git(
+        cycle.original_repo, "branch", "--format=%(refname:short)"
+    ).splitlines()
+    assert (cycle.original_repo / ".worktrees" / "stabilizing-prompts").is_dir()
+    assert (cycle.original_repo / ".worktrees").is_dir()
+
+
+def test_cleanup_preserves_nonempty_managed_parent(
+    delivered_state: Path,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    parent = cycle.original_repo / ".worktrees" / "stabilizing-prompts"
+    keep = parent / "user-owned.txt"
+    keep.write_text("keep\n", encoding="utf-8")
+
+    outcome = manage_worktree.cleanup_cycle(delivered_state)
+
+    assert outcome.status == "complete"
+    assert outcome.managed_parent_removed is False
+    assert parent.is_dir()
+    assert keep.read_text(encoding="utf-8") == "keep\n"
+    assert (cycle.original_repo / ".worktrees").is_dir()
+
+
+def test_cleanup_retry_after_worktree_removed_does_not_reapply_first_start_gate(
+    delivered_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_delete = manage_worktree._delete_cycle_branch
+
+    def fail_delete(cycle: WorktreeCycle) -> None:
+        raise WorktreeError("branch delete failed")
+
+    monkeypatch.setattr(manage_worktree, "_delete_cycle_branch", fail_delete)
+    with pytest.raises(WorktreeError, match="branch delete failed"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    saved = load_cycle(delivered_state, require_current=True)
+    assert saved.finalization is not None
+    assert saved.finalization.cleanup.worktree_removed is True
+    assert not saved.worktree.exists()
+    assert saved.finalization.cleanup.managed_parent_handled is True
+
+    monkeypatch.setattr(manage_worktree, "_delete_cycle_branch", real_delete)
+    assert manage_worktree.cleanup_cycle(delivered_state).status == "complete"
+
+
+def test_cleanup_does_not_infer_worktree_checkpoint_from_missing_path(
+    delivered_state: Path,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    git(cycle.original_repo, "worktree", "remove", "--", str(cycle.worktree))
+
+    with pytest.raises(WorktreeError, match="worktree|checkpoint|registration"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    assert delivered_state.exists()
+    assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
+
+
+def test_cleanup_cli_reports_complete_and_removes_exact_state(
+    delivered_state: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = main(["cleanup", "--state", str(delivered_state)])
+
+    assert result == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "complete"
+    assert payload["worktree_removed"] is True
+    assert payload["branch_deleted"] is True
+    assert not delivered_state.exists()
+
+
+def _make_delivered_state_for_branch(
+    original: Path,
+    prompt_id: str,
+    state: Path,
+    *,
+    branch: str,
+) -> Path:
+    cycle = create_cycle(original, prompt_id, branch=branch)
+    eval_dir = cycle.worktree / ".prompt-evals" / prompt_id
+    for name in (
+        "eval-config.yaml",
+        "dev-cases.yaml",
+        "validation-cases.yaml",
+        "acceptance-cases.yaml",
+        "coverage-obligations.yaml",
+        "adapter.py",
+        "optimization-history.yaml",
+    ):
+        (eval_dir / name).write_text(f"name: {name}\n", encoding="utf-8")
+    summary = eval_dir / "evaluation-summaries" / "2026-09-16-080910-no_change_needed.md"
+    summary.parent.mkdir(parents=True)
+    summary.write_text("# Evaluation summary\n", encoding="utf-8")
+    (eval_dir / "reports").mkdir()
+    (eval_dir / ".runtime").mkdir()
+    git(cycle.worktree, "add", "-A")
+    git(cycle.worktree, "commit", "-m", "prepare finalized result")
+    prepared_commit = git(cycle.worktree, "rev-parse", "HEAD")
+    finalization = FinalizationState(
+        result_kind="no_change_needed",
+        stop_reason="all baseline slots passed",
+        finished_at_utc="2026-09-16T08:09:10Z",
+        summary_path=summary.relative_to(cycle.worktree).as_posix(),
+        delivery_profile="assets",
+        prepared_commit=prepared_commit,
+        delivery_commit=prepared_commit,
+        delivery_confirmed=True,
+        cleanup=CleanupProgress(authorized=True),
+    )
+    finalized = replace(
+        cycle,
+        final_worktree_commit=prepared_commit,
+        finalization=finalization,
+    )
+    save_cycle_atomic(finalized, state)
+    apply_delivery_patch(finalized, build_delivery_patch(finalized))
+    delivered = replace(
+        finalized,
+        finalization=replace(
+            finalization,
+            delivery_applied=True,
+            delivery_verified=True,
+        ),
+    )
+    save_cycle_atomic(delivered, state)
+    return state
+
+
+def _save_after_manual_worktree_removal(
+    cycle: WorktreeCycle, state: Path
+) -> WorktreeCycle:
+    git(cycle.original_repo, "worktree", "remove", "--", str(cycle.worktree))
+    parent = cycle.original_repo / ".worktrees" / "stabilizing-prompts"
+    if parent.exists():
+        parent.rmdir()
+    assert cycle.finalization is not None
+    progressed = replace(
+        cycle.finalization,
+        cleanup=replace(
+            cycle.finalization.cleanup,
+            worktree_removed=True,
+            managed_parent_handled=True,
+        ),
+    )
+    updated = replace(cycle, finalization=progressed)
+    save_cycle_atomic(updated, state)
+    return updated
+
+
+def test_cleanup_rejects_external_worktree_path(
+    delivered_state: Path, tmp_path: Path
+) -> None:
+    value = json.loads(delivered_state.read_text(encoding="utf-8"))
+    value["worktree"] = str(tmp_path / "external-worktree")
+    delivered_state.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(WorktreeError, match="managed|external"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+
+def test_cleanup_rejects_symlink_worktree_alias(
+    delivered_state: Path,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    alias = cycle.worktree.parent / "cleanup-alias"
+    _make_directory_symlink(alias, cycle.worktree)
+    value = json.loads(delivered_state.read_text(encoding="utf-8"))
+    value["worktree"] = str(alias)
+    delivered_state.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(WorktreeError, match="symlink|junction|managed"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+
+def test_cleanup_rejects_missing_ownership_metadata(
+    delivered_state: Path,
+) -> None:
+    value = json.loads(delivered_state.read_text(encoding="utf-8"))
+    value.pop("branch_ref")
+    delivered_state.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(WorktreeError, match="current lifecycle state"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+
+def test_cleanup_rejects_delivery_commit_drift(
+    delivered_state: Path,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    assert cycle.finalization is not None
+    tampered = replace(
+        cycle,
+        finalization=replace(
+            cycle.finalization,
+            delivery_commit=cycle.cycle_base_commit,
+        ),
+    )
+    save_cycle_atomic(tampered, delivered_state)
+
+    with pytest.raises(WorktreeError, match="cleanup gate|delivery|commit"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+
+def test_cleanup_rejects_branch_ref_drift_before_worktree_removal(
+    delivered_state: Path,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    git(cycle.original_repo, "update-ref", cycle.branch_ref or "", cycle.cycle_base_commit)
+
+    with pytest.raises(WorktreeError, match="cleanup gate|branch ref|delivery"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    assert cycle.worktree.exists()
+    assert delivered_state.exists()
+
+
+def test_cleanup_rejects_branch_used_by_another_worktree(
+    delivered_state: Path, tmp_path: Path
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    other = tmp_path / "other-worktree"
+    git(cycle.original_repo, "worktree", "add", "--detach", str(other), cycle.cycle_base_commit)
+    git(other, "symbolic-ref", "HEAD", cycle.branch_ref or "")
+
+    with pytest.raises(WorktreeError, match="used by another worktree|worktree"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    assert other.is_dir()
+    assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
+
+
+def test_cleanup_rejects_primary_current_branch(
+    delivered_state: Path,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    updated = _save_after_manual_worktree_removal(cycle, delivered_state)
+    git(updated.original_repo, "symbolic-ref", "HEAD", updated.branch_ref or "")
+
+    with pytest.raises(WorktreeError, match="current branch"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+
+def test_cleanup_rejects_symbolic_remote_default_target(
+    delivered_state: Path,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    updated = _save_after_manual_worktree_removal(cycle, delivered_state)
+    remote_target = f"refs/remotes/origin/{updated.branch}"
+    git(updated.original_repo, "update-ref", remote_target, updated.finalization.delivery_commit)  # type: ignore[union-attr]
+    git(updated.original_repo, "symbolic-ref", "refs/remotes/origin/HEAD", remote_target)
+
+    with pytest.raises(WorktreeError, match="remote default|symbolic"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+
+def test_cleanup_leaves_remote_refs_untouched(
+    delivered_state: Path,
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    remote_ref = "refs/remotes/origin/retained"
+    git(cycle.original_repo, "update-ref", remote_ref, cycle.finalization.delivery_commit)  # type: ignore[union-attr]
+
+    outcome = manage_worktree.cleanup_cycle(delivered_state)
+
+    assert outcome.status == "complete"
+    assert git(cycle.original_repo, "rev-parse", "--verify", remote_ref) == cycle.finalization.delivery_commit  # type: ignore[union-attr]
+
+
+def test_cleanup_deletes_custom_cycle_created_branch(
+    repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    original, prompt_id = repo
+    state = tmp_path / "custom-state.json"
+    _make_delivered_state_for_branch(
+        original,
+        prompt_id,
+        state,
+        branch="custom/tuning-cycle",
+    )
+    cycle = load_cycle(state, require_current=True)
+
+    outcome = manage_worktree.cleanup_cycle(state)
+
+    assert outcome.status == "complete"
+    assert git(original, "show-ref", "--verify", cycle.branch_ref or "", check=False) == ""
+
+
+def test_cleanup_stops_after_worktree_remove_failure(
+    delivered_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_remove(cycle: WorktreeCycle) -> None:
+        raise WorktreeError("worktree remove failed")
+
+    monkeypatch.setattr(manage_worktree, "_remove_cycle_worktree", fail_remove)
+    cycle = load_cycle(delivered_state, require_current=True)
+    with pytest.raises(WorktreeError, match="worktree remove failed"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    assert cycle.worktree.exists()
+    assert delivered_state.exists()
+    assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
+
+
+def test_cleanup_stops_after_worktree_registration_postcondition_failure(
+    delivered_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_postcondition(cycle: WorktreeCycle) -> None:
+        raise WorktreeError("registration postcondition failed")
+
+    monkeypatch.setattr(
+        manage_worktree,
+        "_assert_cycle_worktree_absent",
+        fail_postcondition,
+    )
+    cycle = load_cycle(delivered_state, require_current=True)
+    with pytest.raises(WorktreeError, match="registration postcondition failed"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    assert not cycle.worktree.exists()
+    saved = json.loads(delivered_state.read_text(encoding="utf-8"))
+    assert saved["finalization"]["cleanup"]["worktree_removed"] is False
+    assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
+
+
+def test_cleanup_stops_when_worktree_checkpoint_save_fails(
+    delivered_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_save = manage_worktree.save_cycle_atomic
+
+    def fail_first_save(cycle: WorktreeCycle, path: Path) -> None:
+        raise WorktreeError("worktree checkpoint save failed")
+
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", fail_first_save)
+    cycle = load_cycle(delivered_state, require_current=True)
+    with pytest.raises(WorktreeError, match="worktree checkpoint save failed"):
+        manage_worktree.cleanup_cycle(delivered_state)
+    monkeypatch.setattr(manage_worktree, "save_cycle_atomic", real_save)
+
+    assert not cycle.worktree.exists()
+    saved = json.loads(delivered_state.read_text(encoding="utf-8"))
+    assert saved["finalization"]["cleanup"]["worktree_removed"] is False
+    assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
+
+
+def test_cleanup_stops_after_managed_parent_removal_failure(
+    delivered_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cycle = load_cycle(delivered_state, require_current=True)
+    parent = cycle.original_repo / ".worktrees" / "stabilizing-prompts"
+    real_rmdir = Path.rmdir
+
+    def fail_parent(path: Path) -> None:
+        if path == parent:
+            raise OSError("managed parent rmdir failed")
+        real_rmdir(path)
+
+    monkeypatch.setattr(Path, "rmdir", fail_parent)
+    with pytest.raises(WorktreeError, match="managed parent rmdir failed"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    saved = load_cycle(delivered_state, require_current=True)
+    assert saved.finalization is not None
+    assert saved.finalization.cleanup.worktree_removed is True
+    assert saved.finalization.cleanup.managed_parent_handled is False
+    assert saved.finalization.cleanup.branch_deleted is False
+    assert parent.is_dir()
+    assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False)
+
+
+def test_cleanup_state_unlink_failure_preserves_completed_checkpoints(
+    delivered_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_unlink(path: Path) -> None:
+        raise WorktreeError("state unlink failed")
+
+    monkeypatch.setattr(manage_worktree, "_unlink_cycle_state", fail_unlink)
+    cycle = load_cycle(delivered_state, require_current=True)
+    with pytest.raises(WorktreeError, match="state unlink failed"):
+        manage_worktree.cleanup_cycle(delivered_state)
+
+    saved = load_cycle(delivered_state, require_current=True)
+    assert saved.finalization is not None
+    assert saved.finalization.cleanup.worktree_removed is True
+    assert saved.finalization.cleanup.managed_parent_handled is True
+    assert saved.finalization.cleanup.branch_deleted is True
+    assert not saved.worktree.exists()
+    assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False) == ""
+
+
+def test_cleanup_uses_fixed_status_cleanliness_command(
+    delivered_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_git = manage_worktree._git
+    calls: list[tuple[str, ...]] = []
+
+    def record_git(repo: Path, *arguments: str, **kwargs: object):
+        calls.append(arguments)
+        return real_git(repo, *arguments, **kwargs)
+
+    monkeypatch.setattr(manage_worktree, "_git", record_git)
+
+    assert manage_worktree.cleanup_cycle(delivered_state).status == "complete"
+    assert (
+        "-c",
+        "status.showUntrackedFiles=all",
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    ) in calls
+
+
+@pytest.fixture
 def spaced_path_cycle(repo: tuple[Path, str]) -> WorktreeCycle:
     original, prompt_id = repo
     git(original, "mv", "prompts/classify.md", "prompts/classify prompt.md")

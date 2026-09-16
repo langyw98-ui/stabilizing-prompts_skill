@@ -6,8 +6,8 @@ worktree result.  Before applying it, the original workspace is checked for
 target collisions and exact source hashes; after applying it, destination
 hashes are checked and the exact target snapshots are restored on failure.
 
-No function in this module removes a worktree or branch.  Users can inspect a
-failed cycle and clean it up explicitly when they are ready.
+Cleanup is deliberately limited to a verified cycle's exact managed worktree,
+cycle-created branch, empty managed parent, and authoritative state path.
 """
 
 from __future__ import annotations
@@ -498,6 +498,16 @@ class CleanupProgress:
 
 
 @dataclass(frozen=True, slots=True)
+class CleanupOutcome:
+    """The externally visible result of an exact cycle cleanup."""
+
+    status: str
+    worktree_removed: bool
+    managed_parent_removed: bool
+    branch_deleted: bool
+
+
+@dataclass(frozen=True, slots=True)
 class FinalizationState:
     """The final scored result and all delivery/cleanup state for a cycle."""
 
@@ -721,6 +731,13 @@ def _validate_current_cycle(cycle: WorktreeCycle) -> None:
         raise WorktreeError("current lifecycle state has invalid branch origin")
     if cycle.branch_created_by_cycle is not True:
         raise WorktreeError("current lifecycle state is missing branch creation record")
+    if (
+        cycle.branch_origin == "generated"
+        and not cycle.branch.startswith("stabilizing-prompts/")
+    ):
+        raise WorktreeError(
+            "current lifecycle state has an out-of-namespace generated branch"
+        )
     expected_ref = f"refs/heads/{cycle.branch}"
     if cycle.branch_ref != expected_ref:
         raise WorktreeError("current lifecycle state has a mismatched branch ref")
@@ -1628,6 +1645,519 @@ def _assert_worktree_clean(cycle: WorktreeCycle, final: str) -> None:
         )
 
 
+_CLEANUP_STATUS_ARGUMENTS = (
+    "-c",
+    "status.showUntrackedFiles=all",
+    "status",
+    "--porcelain",
+    "--untracked-files=all",
+    "--ignore-submodules=none",
+)
+
+
+def _path_present(path: Path) -> bool:
+    """Return true for ordinary paths and broken symlink/reparse aliases."""
+
+    return path.exists() or path.is_symlink()
+
+
+def _worktree_records(root: Path) -> tuple[dict[str, str], ...]:
+    """Read every worktree registration without pruning or mutating Git."""
+
+    result = _git(root, "worktree", "list", "--porcelain", "-z", check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+        raise WorktreeError(
+            "unable to inspect Git worktree registrations: "
+            f"{detail or 'git worktree list failed'}"
+        )
+    records: list[dict[str, str]] = []
+    for raw_record in result.stdout.split(b"\x00\x00"):
+        if not raw_record:
+            continue
+        record: dict[str, str] = {}
+        for raw_field in raw_record.split(b"\x00"):
+            if not raw_field:
+                continue
+            key, separator, raw_value = raw_field.partition(b" ")
+            if not separator:
+                continue
+            record[os.fsdecode(key)] = os.fsdecode(raw_value)
+        if record:
+            records.append(record)
+    return tuple(records)
+
+
+def _registration_path(root: Path, value: str) -> Path:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    # Compare the registration's lexical absolute spelling.  Resolving here
+    # would turn a stale symlink alias into the recorded target and weaken the
+    # exact-registration postcondition.
+    return candidate.absolute()
+
+
+def _same_worktree_path(root: Path, left: Path, right: Path) -> bool:
+    try:
+        return _path_key(_registration_path(root, str(left))) == _path_key(
+            _registration_path(root, str(right))
+        )
+    except OSError as error:
+        raise WorktreeError(f"unable to inspect worktree registration path: {error}") from error
+
+
+def _cycle_registration(cycle: WorktreeCycle) -> dict[str, str]:
+    records = _worktree_records(cycle.original_repo)
+    matches = [
+        record
+        for record in records
+        if "worktree" in record
+        and _same_worktree_path(cycle.original_repo, cycle.worktree, Path(record["worktree"]))
+    ]
+    if len(matches) != 1:
+        raise WorktreeError(
+            "cleanup gate requires exactly one Git registration for the recorded "
+            f"worktree (found {len(matches)})"
+        )
+    return matches[0]
+
+
+def _assert_cycle_registration(cycle: WorktreeCycle, delivery_commit: str) -> None:
+    record = _cycle_registration(cycle)
+    if record.get("branch") != cycle.branch_ref:
+        raise WorktreeError(
+            "cleanup gate worktree registration branch does not match cycle branch ref"
+        )
+    if record.get("HEAD") != delivery_commit:
+        raise WorktreeError(
+            "cleanup gate worktree registration HEAD does not match delivery_commit"
+        )
+
+
+def _assert_cycle_registration_absent(cycle: WorktreeCycle) -> None:
+    records = _worktree_records(cycle.original_repo)
+    matches = [
+        record
+        for record in records
+        if "worktree" in record
+        and _same_worktree_path(cycle.original_repo, cycle.worktree, Path(record["worktree"]))
+    ]
+    if matches:
+        raise WorktreeError(
+            "cycle worktree Git registration remains after exact removal"
+        )
+
+
+def _assert_cycle_worktree_absent(cycle: WorktreeCycle) -> None:
+    if _path_present(cycle.worktree):
+        raise WorktreeError(
+            "cycle worktree directory remains after exact removal: "
+            f"{cycle.worktree}"
+        )
+    _assert_cycle_registration_absent(cycle)
+
+
+def _remove_cycle_worktree(cycle: WorktreeCycle) -> None:
+    """Remove only the exact recorded worktree with Git's non-forced command."""
+
+    _git(
+        cycle.original_repo,
+        "worktree",
+        "remove",
+        "--",
+        str(cycle.worktree),
+    )
+
+
+def _assert_cleanup_clean(cycle: WorktreeCycle) -> None:
+    """Apply the fixed, non-force cleanliness contract before removal."""
+
+    result = _git(cycle.worktree, *_CLEANUP_STATUS_ARGUMENTS, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+        raise WorktreeError(
+            "cleanup gate cleanliness check failed: "
+            f"{detail or 'git status failed'}"
+        )
+    if result.stderr:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise WorktreeError(
+            "cleanup gate cleanliness check emitted diagnostics: "
+            f"{detail or 'git status warning'}"
+        )
+    if result.stdout:
+        detail = result.stdout.decode("utf-8", "replace").strip()
+        raise WorktreeError(
+            "cleanup gate worktree is not clean; nonignored staged, tracked, or "
+            f"untracked files remain: {detail}"
+        )
+
+
+def _verify_delivered_hashes(
+    cycle: WorktreeCycle,
+    delivery_commit: str,
+    allowed_paths: frozenset[str],
+    summary_path: str,
+) -> None:
+    """Recompute destination hashes and compare them with applied targets."""
+
+    changed = _changed_paths(cycle, delivery_commit)
+    unexpected = sorted(set(changed) - set(allowed_paths))
+    if unexpected:
+        raise WorktreeError(
+            "cleanup gate delivery contains paths outside its verified allowlist: "
+            + ", ".join(unexpected)
+        )
+    if summary_path not in changed:
+        raise WorktreeError(
+            "cleanup gate recorded evaluation summary is not in delivery commit"
+        )
+    for path in changed:
+        expected = _build_destination_hash(cycle, delivery_commit, path)
+        if expected is None:
+            raise WorktreeError(
+                f"cleanup gate cannot verify deleted delivery target: {path}"
+            )
+        actual = _current_hash(cycle.original_repo, path)
+        if actual != expected:
+            raise WorktreeError(
+                "cleanup gate delivery hash mismatch for "
+                f"{path}: expected {expected}, got {actual}"
+            )
+        if _index_changed(cycle.original_repo, path):
+            raise WorktreeError(
+                f"cleanup gate delivered target is staged in the original workspace: {path}"
+            )
+
+
+def _cleanup_first_start_gates(cycle: WorktreeCycle) -> str:
+    """Validate all gates that are required only before the first removal."""
+
+    finalization = cycle.finalization
+    if finalization is None:
+        raise WorktreeError("cleanup gate requires current finalization state")
+    if finalization.cleanup.authorized is not True:
+        raise WorktreeError("cleanup gate requires explicit cleanup authorization")
+    if finalization.delivery_applied is not True:
+        raise WorktreeError("cleanup gate requires delivery_applied=True")
+    if finalization.delivery_verified is not True:
+        raise WorktreeError("cleanup gate requires delivery_verified=True")
+
+    try:
+        _validate_managed_cycle(cycle)
+        if _path_is_within(Path.cwd().resolve(strict=False), cycle.worktree.resolve(strict=False)):
+            raise WorktreeError(
+                "cleanup gate must run from outside the cycle worktree"
+            )
+        if _primary_workspace_head(cycle.original_repo) != cycle.cycle_base_commit:
+            raise WorktreeError(
+                "cleanup gate original repository HEAD is not the cycle base commit"
+            )
+        _assert_cycle_base(cycle)
+        result, delivery_commit, allowed, summary, _prepared = _finalization_delivery_metadata(
+            cycle
+        )
+        del result
+        _assert_cycle_registration(cycle, delivery_commit)
+        branch_sha = _branch_sha(cycle.original_repo, cycle.branch_ref or "")
+        if branch_sha != delivery_commit:
+            raise WorktreeError(
+                "cleanup gate exact branch ref does not match delivery_commit"
+            )
+        if cycle.final_worktree_commit != delivery_commit:
+            raise WorktreeError(
+                "cleanup gate cycle final_worktree_commit does not match delivery_commit"
+            )
+        _verify_delivered_hashes(cycle, delivery_commit, allowed, summary)
+        _assert_cleanup_clean(cycle)
+    except WorktreeError as error:
+        if str(error).startswith("cleanup gate"):
+            raise
+        raise WorktreeError(f"cleanup gate identity verification failed: {error}") from error
+    except DeliveryError as error:
+        raise WorktreeError(f"cleanup gate delivery verification failed: {error}") from error
+    return delivery_commit
+
+
+def _managed_worktrees_root(cycle: WorktreeCycle) -> Path:
+    root = _repo_root(cycle.original_repo)
+    container = root / ".worktrees"
+    if _is_link_or_junction(container) or not container.exists() or not container.is_dir():
+        raise WorktreeError(f"managed .worktrees container is not a directory: {container}")
+    parent = container / "stabilizing-prompts"
+    if _is_link_or_junction(parent) or (
+        _path_present(parent) and not parent.is_dir()
+    ):
+        raise WorktreeError(
+            "managed worktree parent is not a regular directory: " f"{parent}"
+        )
+    return parent
+
+
+def _directory_has_entries(path: Path) -> bool:
+    try:
+        next(path.iterdir())
+    except StopIteration:
+        return False
+    except OSError as error:
+        raise WorktreeError(f"unable to inspect managed worktree parent {path}: {error}") from error
+    return True
+
+
+def _remove_managed_parent(cycle: WorktreeCycle) -> bool:
+    """Remove only an empty managed parent; retain it when nonempty."""
+
+    parent = _managed_worktrees_root(cycle)
+    if not _path_present(parent):
+        raise WorktreeError(
+            "managed worktree parent is missing before its cleanup checkpoint"
+        )
+    if _directory_has_entries(parent):
+        return False
+    try:
+        parent.rmdir()
+    except OSError as error:
+        # A concurrent cycle/user file makes the directory nonempty.  That is
+        # a successful preserved condition; all other failures stop cleanup.
+        if _path_present(parent) and _directory_has_entries(parent):
+            return False
+        raise WorktreeError(
+            f"unable to remove empty managed worktree parent {parent}: {error}"
+        ) from error
+    if _path_present(parent):
+        raise WorktreeError(
+            f"managed worktree parent remains after empty-directory removal: {parent}"
+        )
+    return True
+
+
+def _assert_managed_parent_handled(cycle: WorktreeCycle) -> bool:
+    """Validate a saved parent checkpoint without repeating ``rmdir``."""
+
+    parent = _managed_worktrees_root(cycle)
+    if not _path_present(parent):
+        return True
+    if _directory_has_entries(parent):
+        return False
+    raise WorktreeError(
+        "managed worktree parent checkpoint is invalid: empty directory remains"
+    )
+
+
+def _delivery_commit_for_cleanup(cycle: WorktreeCycle) -> str:
+    finalization = cycle.finalization
+    if finalization is None or not isinstance(finalization.delivery_commit, str):
+        raise WorktreeError("cleanup branch checkpoint requires delivery_commit")
+    delivery = finalization.delivery_commit
+    if cycle.final_worktree_commit != delivery:
+        raise WorktreeError(
+            "cleanup branch checkpoint delivery_commit does not match cycle final_worktree_commit"
+        )
+    try:
+        resolved = _git_text(
+            cycle.original_repo,
+            "rev-parse",
+            "--verify",
+            f"{delivery}^{{commit}}",
+        )
+    except WorktreeError as error:
+        raise WorktreeError("cleanup branch checkpoint delivery_commit is invalid") from error
+    if resolved != delivery:
+        raise WorktreeError(
+            "cleanup branch checkpoint delivery_commit is not canonical"
+        )
+    return delivery
+
+
+def _branch_sha(root: Path, branch_ref: str) -> str | None:
+    result = _git(root, "show-ref", "--verify", "--quiet", branch_ref, check=False)
+    if result.returncode == 1:
+        return None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+        raise WorktreeError(
+            f"unable to inspect exact local branch ref {branch_ref}: "
+            f"{detail or 'git show-ref failed'}"
+        )
+    try:
+        return _git_text(root, "rev-parse", "--verify", f"{branch_ref}^{{commit}}")
+    except WorktreeError as error:
+        raise WorktreeError(f"unable to resolve exact local branch ref {branch_ref}") from error
+
+
+def _symbolic_remote_default_targets(root: Path) -> frozenset[str]:
+    result = _git(
+        root,
+        "for-each-ref",
+        "--format=%(refname)\t%(symref)",
+        "refs/remotes",
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+        raise WorktreeError(
+            "unable to inspect symbolic remote default branches: "
+            f"{detail or 'git for-each-ref failed'}"
+        )
+    targets: set[str] = set()
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        ref, separator, symref = line.partition("\t")
+        if not separator or not ref or not symref:
+            continue
+        if not ref.endswith("/HEAD") or not symref.startswith("refs/remotes/"):
+            continue
+        remote_parts = ref[len("refs/remotes/") :].split("/")
+        target_parts = symref[len("refs/remotes/") :].split("/")
+        if len(remote_parts) < 2 or len(target_parts) < 2:
+            continue
+        if remote_parts[0] != target_parts[0]:
+            continue
+        targets.add("refs/heads/" + "/".join(target_parts[1:]))
+    return frozenset(targets)
+
+
+def _delete_cycle_branch(cycle: WorktreeCycle) -> None:
+    """Delete only the owned local branch after all branch protections pass."""
+
+    branch_ref = cycle.branch_ref
+    if not isinstance(branch_ref, str) or branch_ref != f"refs/heads/{cycle.branch}":
+        raise WorktreeError("cleanup branch checkpoint has an invalid exact branch ref")
+    delivery = _delivery_commit_for_cleanup(cycle)
+    branch_sha = _branch_sha(cycle.original_repo, branch_ref)
+    if branch_sha is None:
+        raise WorktreeError(
+            f"cleanup branch checkpoint exact local branch ref is missing: {branch_ref}"
+        )
+    if branch_sha != delivery:
+        raise WorktreeError(
+            "cleanup branch checkpoint ref does not equal delivery_commit: "
+            f"{branch_ref} -> {branch_sha} (expected {delivery})"
+        )
+    current = _git_text(cycle.original_repo, "branch", "--show-current")
+    if current == cycle.branch:
+        raise WorktreeError("cleanup refuses to delete the primary current branch")
+    for record in _worktree_records(cycle.original_repo):
+        if record.get("branch") == branch_ref:
+            raise WorktreeError(
+                "cleanup refuses to delete a branch used by another worktree: "
+                f"{branch_ref}"
+            )
+    if branch_ref in _symbolic_remote_default_targets(cycle.original_repo):
+        raise WorktreeError(
+            "cleanup refuses to delete the local target of a symbolic remote default: "
+            f"{branch_ref}"
+        )
+    _git(cycle.original_repo, "branch", "-D", "--", cycle.branch)
+    if _branch_sha(cycle.original_repo, branch_ref) is not None:
+        raise WorktreeError(
+            f"exact local branch ref remains after deletion: {branch_ref}"
+        )
+
+
+def _assert_branch_deleted(cycle: WorktreeCycle) -> None:
+    branch_ref = cycle.branch_ref
+    if not isinstance(branch_ref, str) or branch_ref != f"refs/heads/{cycle.branch}":
+        raise WorktreeError("cleanup branch checkpoint has an invalid exact branch ref")
+    if _branch_sha(cycle.original_repo, branch_ref) is not None:
+        raise WorktreeError(
+            f"branch deletion checkpoint is invalid; branch still exists: {branch_ref}"
+        )
+
+
+def _unlink_cycle_state(path: Path) -> None:
+    """Unlink only the exact authoritative state path."""
+
+    try:
+        path.unlink()
+    except OSError as error:
+        raise WorktreeError(f"unable to remove exact cycle state {path}: {error}") from error
+
+
+def cleanup_cycle(state_path: Path) -> CleanupOutcome:
+    """Safely remove one verified cycle with atomic, resumable checkpoints."""
+
+    state = Path(state_path).absolute()
+    if state.is_symlink():
+        raise WorktreeError("cleanup state path must not be a symlink")
+    cycle = load_cycle(state, require_current=True)
+    finalization = cycle.finalization
+    if finalization is None:
+        raise WorktreeError("cleanup requires current finalization state")
+    progress = finalization.cleanup
+    if progress.managed_parent_handled and not progress.worktree_removed:
+        raise WorktreeError("cleanup checkpoints are out of order")
+    if progress.branch_deleted and not progress.managed_parent_handled:
+        raise WorktreeError("cleanup checkpoints are out of order")
+
+    _validate_current_cycle(cycle)
+    worktree_removed = progress.worktree_removed
+    if not worktree_removed:
+        delivery_commit = _cleanup_first_start_gates(cycle)
+        del delivery_commit
+        _remove_cycle_worktree(cycle)
+        _assert_cycle_worktree_absent(cycle)
+        finalization = cycle.finalization
+        assert finalization is not None
+        cycle = replace(
+            cycle,
+            finalization=replace(
+                finalization,
+                cleanup=replace(finalization.cleanup, worktree_removed=True),
+            ),
+        )
+        save_cycle_atomic(cycle, state)
+        progress = cycle.finalization.cleanup  # type: ignore[union-attr]
+        worktree_removed = True
+    else:
+        _validate_managed_worktree_path(
+            cycle.original_repo,
+            cycle.worktree,
+            require_exists=False,
+        )
+        _assert_cycle_worktree_absent(cycle)
+
+    parent_removed = False
+    if not progress.managed_parent_handled:
+        parent_removed = _remove_managed_parent(cycle)
+        finalization = cycle.finalization
+        assert finalization is not None
+        cycle = replace(
+            cycle,
+            finalization=replace(
+                finalization,
+                cleanup=replace(finalization.cleanup, managed_parent_handled=True),
+            ),
+        )
+        save_cycle_atomic(cycle, state)
+        progress = cycle.finalization.cleanup  # type: ignore[union-attr]
+    else:
+        parent_removed = _assert_managed_parent_handled(cycle)
+
+    if not progress.branch_deleted:
+        _delete_cycle_branch(cycle)
+        finalization = cycle.finalization
+        assert finalization is not None
+        cycle = replace(
+            cycle,
+            finalization=replace(
+                finalization,
+                cleanup=replace(finalization.cleanup, branch_deleted=True),
+            ),
+        )
+        save_cycle_atomic(cycle, state)
+    else:
+        _assert_branch_deleted(cycle)
+
+    _unlink_cycle_state(state)
+    return CleanupOutcome(
+        status="complete",
+        worktree_removed=worktree_removed,
+        managed_parent_removed=parent_removed,
+        branch_deleted=True,
+    )
+
+
 def _assert_worktree_snapshot(cycle: WorktreeCycle, patch: "DeliveryPatch") -> None:
     """Check the cycle HEAD and every delivered target immediately around apply."""
 
@@ -2363,6 +2893,9 @@ def _parser() -> argparse.ArgumentParser:
     apply.add_argument("--state", type=Path, required=True)
     apply.add_argument("--patch", type=Path, required=True)
     apply.add_argument("--patch-manifest", type=Path, required=True)
+
+    cleanup = commands.add_parser("cleanup")
+    cleanup.add_argument("--state", type=Path, required=True)
     return parser
 
 
@@ -2418,6 +2951,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0
+        if args.command == "cleanup":
+            outcome = cleanup_cycle(args.state)
+            print(
+                json.dumps(
+                    {
+                        "status": outcome.status,
+                        "worktree_removed": outcome.worktree_removed,
+                        "managed_parent_removed": outcome.managed_parent_removed,
+                        "branch_deleted": outcome.branch_deleted,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
         cycle = load_cycle(args.state, require_current=True)
         _require_current_delivery_state(cycle)
         if args.command == "build-patch":
@@ -2465,6 +3013,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "AllowlistError",
+    "CleanupOutcome",
     "CleanupProgress",
     "DeliveryConflict",
     "DeliveryError",
@@ -2484,6 +3033,7 @@ __all__ = [
     "build_delivery_patch",
     "canonical_prompt_path",
     "create_cycle",
+    "cleanup_cycle",
     "initialize_local_excludes",
     "git_text",
     "load_cycle",
