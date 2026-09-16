@@ -2047,6 +2047,17 @@ def load_patch(patch_path: Path, manifest_path: Path) -> DeliveryPatch:
     return DeliveryPatch.from_dict(value, text=text)
 
 
+# Narrow read-only helpers used by ``finalize_cycle``.  Keep the identity and
+# contract parsing rules in this module so finalization cannot create a second,
+# weaker interpretation of cycle paths or canonical Prompt identity.
+git_text = _git_text
+normalize_relative_path = _normalize_relative
+validate_managed_cycle = _validate_managed_cycle
+canonical_prompt_path = _discover_prompt_path
+parse_prompt_contract_path = _parse_contract_prompt_path
+assert_prompt_contract_identity = _assert_prompt_contract_identity
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -2162,16 +2173,22 @@ __all__ = [
     "WorktreeDeliveryError",
     "WorktreeError",
     "apply_delivery_patch",
+    "assert_prompt_contract_identity",
     "build_delivery_patch",
+    "canonical_prompt_path",
     "create_cycle",
     "initialize_local_excludes",
+    "git_text",
     "load_cycle",
     "load_patch",
     "main",
+    "normalize_relative_path",
+    "parse_prompt_contract_path",
     "preflight_patch",
     "save_cycle",
     "save_cycle_atomic",
     "save_patch",
+    "validate_managed_cycle",
     "verify_runtime_ignores",
 ]
 
