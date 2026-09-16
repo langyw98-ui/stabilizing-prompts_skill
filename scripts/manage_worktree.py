@@ -756,17 +756,11 @@ def _validate_state_path(cycle: WorktreeCycle, path: Path) -> Path:
     """Ensure the authoritative state file survives removal of the worktree."""
 
     lexical = Path(path).absolute()
-    current = lexical
-    while True:
-        if _is_link_or_junction(current):
-            raise WorktreeError(
-                "cycle state path contains a symlink, junction, or reparse point: "
-                f"{current}"
-            )
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
+    if _is_link_or_junction(lexical):
+        raise WorktreeError(
+            "cycle state path must not be a symlink, junction, or reparse point: "
+            f"{lexical}"
+        )
 
     destination = lexical.resolve(strict=False)
     worktree = Path(cycle.worktree).resolve(strict=False)
@@ -2094,6 +2088,7 @@ def cleanup_cycle(state_path: Path) -> CleanupOutcome:
     if state.is_symlink():
         raise WorktreeError("cleanup state path must not be a symlink")
     cycle = load_cycle(state, require_current=True)
+    fixed_state_target = _validate_state_path(cycle, state)
     finalization = cycle.finalization
     if finalization is None:
         raise WorktreeError("cleanup requires current finalization state")
@@ -2162,12 +2157,12 @@ def cleanup_cycle(state_path: Path) -> CleanupOutcome:
     else:
         _assert_branch_deleted(cycle)
 
-    state_target = _validate_state_path(cycle, state)
-    if _path_key(state_target) != _path_key(state):
+    final_state_target = _validate_state_path(cycle, state)
+    if _path_key(final_state_target) != _path_key(fixed_state_target):
         raise WorktreeError(
-            "cycle state path changed before unlink; refusing to remove an alias"
+            "cycle state target changed before unlink; refusing to remove an alias"
         )
-    _unlink_cycle_state(state_target)
+    _unlink_cycle_state(state)
     return CleanupOutcome(
         status="complete",
         worktree_removed=worktree_removed,

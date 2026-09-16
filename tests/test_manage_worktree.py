@@ -893,7 +893,7 @@ def test_cleanup_state_unlink_failure_preserves_completed_checkpoints(
     assert git(cycle.original_repo, "show-ref", "--verify", cycle.branch_ref or "", check=False) == ""
 
 
-def test_cleanup_rejects_state_parent_alias_before_unlink_and_retry_is_safe(
+def test_cleanup_rejects_state_parent_alias_retarget_before_unlink_and_retry_is_safe(
     delivered_state: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -936,6 +936,26 @@ def test_cleanup_rejects_state_parent_alias_before_unlink_and_retry_is_safe(
 
     assert manage_worktree.cleanup_cycle(state).status == "complete"
     assert not state.exists()
+
+
+def test_cleanup_allows_stable_external_state_parent_alias(
+    delivered_state: Path,
+    tmp_path: Path,
+) -> None:
+    real_holder = tmp_path / "state-holder-real"
+    real_holder.mkdir()
+    real_state = real_holder / "cycle.json"
+    delivered_state.rename(real_state)
+    alias_holder = tmp_path / "state-holder-alias"
+    _make_directory_symlink(alias_holder, real_holder)
+    aliased_state = alias_holder / real_state.name
+
+    outcome = manage_worktree.cleanup_cycle(aliased_state)
+
+    assert outcome.status == "complete"
+    assert not aliased_state.exists()
+    assert not real_state.exists()
+    assert manage_worktree._is_link_or_junction(alias_holder)
 
 
 def test_cleanup_rejects_reparse_alias_in_worktree_absence_postcondition(
