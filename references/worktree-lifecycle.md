@@ -227,16 +227,9 @@ hash、内部绝对 worktree 路径、patch 细节、Authorization、Token 或 r
 也不得声称已经确认、交付或清理。同名简报不能覆盖或随机改名。
 
 `reports/` 中的原始响应和完整运行报告只保留在 worktree，不提交、不默认同步。
-可交付的 `optimization-history.yaml` 按周期追加以下精简信息，并在简报之后、
-delivery confirmation 之前与可交付评测资产一起提交为 `prepared_commit`：
-
-- 周期、基线 Prompt、数据集、配置和 manifest 哈希；
-- 失败簇、案例 ID、错误分类和字段差异；
-- 每轮修改意图、指标变化、修复与回归案例和淘汰原因；
-- 最终停止原因和尚未解决的问题；
-- 经用户确认、应在下一周期转入开发集的真实故障。
-
-`optimization-history.yaml` 的每条 compact entry 严格只包含以下四个字段：
+可交付的 `optimization-history.yaml` 按周期追加精简记录，并在简报之后、
+delivery confirmation 之前与可交付评测资产一起提交为 `prepared_commit`。
+每条 compact entry 严格只包含以下四个字段：
 `finished_at_utc`、`result`、`stop_reason` 和按字典序排序的
 `failure_categories`。它不保存中间候选全文、原始响应或 Token。新周期必须读取历史记录以避免重复无效策略，但当前已确认的契约和案例始终是业务真值来源。基础设施故障只进入运行报告，不作为 Prompt 优化经验。只有 `acceptance_passed` 的确认路径会在 `prepared_commit` 上创建包含冻结 Prompt 的 child `delivery_commit`；其他正式结果复用 `prepared_commit`，不创建空提交。
 

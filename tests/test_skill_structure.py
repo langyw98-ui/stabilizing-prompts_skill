@@ -51,3 +51,25 @@ def test_workflow_documents_only_fixed_runtime_inputs():
     assert "verify-ignores --state STATE_PATH" in skill
     assert "cleanup --state STATE_PATH" in skill
     assert "verified cleanup" in skill
+    reference = (ROOT / "references" / "worktree-lifecycle.md").read_text(
+        encoding="utf-8"
+    )
+    history = reference.split("`reports/` 中的原始响应", 1)[1].split(
+        "## 15. 错误处理", 1
+    )[0]
+    assert "每条 compact entry 严格只包含以下四个字段" in history
+    for field in (
+        "`finished_at_utc`",
+        "`result`",
+        "`stop_reason`",
+        "`failure_categories`",
+    ):
+        assert field in history
+    for obsolete in (
+        "周期、基线 Prompt、数据集、配置和 manifest 哈希",
+        "失败簇、案例 ID、错误分类和字段差异",
+        "每轮修改意图、指标变化、修复与回归案例和淘汰原因",
+        "最终停止原因和尚未解决的问题",
+        "经用户确认、应在下一周期转入开发集的真实故障",
+    ):
+        assert obsolete not in history

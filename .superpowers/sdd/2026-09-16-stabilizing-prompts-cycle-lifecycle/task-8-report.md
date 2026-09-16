@@ -58,3 +58,21 @@ Fix-round verification:
 - `rtk git diff --check`: passed with no output.
 - No full-suite rerun; the prior single full run remains `494 passed, 2
   skipped`.
+
+## Fix round 2
+
+Removed the stale five-item history bullet list from the lifecycle reference;
+the compact history contract now describes only the implemented fields:
+`finished_at_utc`, `result`, `stop_reason`, and sorted `failure_categories`.
+Folded a scoped regression check into the existing structure test so it asserts
+those four fields and rejects all five obsolete history promises.
+
+Fix-round verification:
+
+- `tests/test_skill_instructions.py tests/test_skill_structure.py`: `22 passed`
+  in `0.26s`.
+- A targeted search found no obsolete history-entry phrases in
+  `references/worktree-lifecycle.md`.
+- `rtk git diff --check`: passed with no output.
+- No full-suite rerun; the prior single full run remains `494 passed, 2
+  skipped`.
